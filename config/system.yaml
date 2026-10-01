@@ -1,0 +1,15 @@
+ros_distro: humble
+preset: jetson_cpu
+loop_closure:
+  enabled: false
+preview:
+  hz: 3
+  max_points: 50000
+  voxel_size: 0.10
+storage:
+  minimum_free_gb: 5
+shutdown:
+  recording_timeout: 60
+  glim_timeout: 180
+camera:
+  enabled: false

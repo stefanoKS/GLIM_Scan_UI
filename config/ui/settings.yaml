@@ -1,0 +1,4 @@
+bind: 127.0.0.1
+port: 8080
+# LAN binding is enabled with scripts/run_system.sh --host 0.0.0.0
+# A locally generated operator token is required for controls and preview.
