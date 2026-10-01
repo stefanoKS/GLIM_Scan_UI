@@ -13,6 +13,7 @@ for preset in ['jetson_cpu','jetson_gpu','offline_quality']:
             obj['global'].update(config_odometry='config_odometry_cpu.json',config_sub_mapping='config_sub_mapping_passthrough.json',config_global_mapping='config_global_mapping_pose_graph.json')
         if src.name=='config_ros.json':
             obj['glim_ros'].update(points_topic=sensor['points_topic'],imu_topic=sensor['imu_topic'],acc_scale=9.80665,extension_modules=[],publish_imu2lidar=False)
+        if src.name=='config_logging.json': obj['logging']['save_logs']=False
         if src.name=='config_sensors.json':
             obj['sensors']['T_lidar_imu']=sensor['T_lidar_imu']
             obj['sensors'].update(autoconf_perpoint_times=False,perpoint_relative_time=True,perpoint_time_scale=1e-9)

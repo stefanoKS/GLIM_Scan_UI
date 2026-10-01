@@ -4,37 +4,44 @@
     "gtsam": {
       "url": "https://github.com/borglab/gtsam.git",
       "sha": "3ad4b4c3cb28394c9597f48fa02dad361c8450e3",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     },
     "glim": {
       "url": "https://github.com/koide3/glim.git",
       "sha": "2262aafa2369acff6afab2268a7743aec7a7fa49",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     },
     "Livox-SDK2": {
       "url": "https://github.com/Livox-SDK/Livox-SDK2.git",
       "sha": "c0796f04c143143899c87a773d9f6b7136453c0b",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     },
     "livox_ros_driver2": {
       "url": "https://github.com/Livox-SDK/livox_ros_driver2.git",
       "sha": "21445540f0d100dc86a7e6df312dd70bbdb4afdf",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     },
     "iridescence": {
       "url": "https://github.com/koide3/iridescence.git",
       "sha": "cfb82c631a42392454395545e87a9c28f97ef84a",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     },
     "glim_ros2": {
       "url": "https://github.com/koide3/glim_ros2.git",
       "sha": "4d4ec524ccf1b02aa09b0af2af767ecc54343798",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     },
     "gtsam_points": {
       "url": "https://github.com/koide3/gtsam_points.git",
       "sha": "76437e4ddb03df98a4f8a875c8de28edb0394c7c",
-      "validation": "source_inspected_not_yet_built"
+      "validation": "built_on_x86_64",
+      "arm64_validated": false
     }
   }
 }

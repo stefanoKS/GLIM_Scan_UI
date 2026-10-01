@@ -11,7 +11,7 @@ def atomic_json(path, value):
     tmp.replace(path)
 def read_json(path, default=None):
     try: return json.loads(Path(path).read_text())
-    except (FileNotFoundError, ValueError): return default
+    except (OSError, ValueError): return default
 
 def size(path):
     return sum(p.stat().st_size for p in Path(path).rglob('*') if p.is_file() and not p.is_symlink()) if Path(path).exists() else 0
@@ -54,6 +54,7 @@ class Sessions:
     def list(self):
         result=[]
         for p in sorted(self.base.iterdir(),reverse=True):
+            if not p.is_dir() or p.is_symlink(): continue
             m=read_json(p/'metadata.json')
             if m and m.get('mock',False)==self.mock:
                 m['bag_size_bytes']=size(p/'raw_bag'); m['processing']=[read_json(f) for f in sorted((p/'processing').glob('*/job.json'))]; m['exports']=[str(f.relative_to(p)) for f in (p/'exports').glob('*') if f.is_file()]; result.append(m)

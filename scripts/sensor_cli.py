@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Terminal-only acquisition proof before UI development."""
-import argparse, asyncio, os, signal, time
+import argparse, asyncio, os, signal, time, fcntl
 from factory_mapping.config import ROOT,load
 from factory_mapping import commands
 from factory_mapping.processes import ProcessManager
@@ -29,4 +29,6 @@ async def main(args):
 
 if __name__=='__main__':
  p=argparse.ArgumentParser(); p.add_argument('--name',default='terminal_test'); p.add_argument('--seconds',type=int,default=30)
- asyncio.run(main(p.parse_args()))
+ with (ROOT/'.state/backend.lock').open('w') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  asyncio.run(main(p.parse_args()))
