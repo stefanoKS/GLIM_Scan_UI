@@ -1,6 +1,7 @@
 from pathlib import Path
 import ipaddress, os, re, math
 import yaml
+from .camera_config import validate_camera, config_path
 
 ROOT = Path(os.environ.get('FACTORY_MAPPING_ROOT', Path(__file__).resolve().parents[3])).resolve()
 PRESETS = ('jetson_cpu', 'jetson_gpu', 'offline_quality')
@@ -12,11 +13,19 @@ def load(root=ROOT):
     if not 0 <= system.get('offline_ros_domain_id',230) <= 232 or system.get('offline_ros_domain_id',230)==sensor['ros_domain_id']: raise ValueError('Offline ROS domain must be valid and different from acquisition')
     if system['preset'] not in PRESETS: raise ValueError('Unknown GLIM preset')
     if system['loop_closure']['enabled'] not in (False, 'scan_context'): raise ValueError('Invalid loop closure mode')
-    if system['camera']['enabled']: raise ValueError('Camera pipeline is not implemented in Phase 1')
+    if type(system['camera']['enabled']) is not bool: raise ValueError('camera.enabled must be boolean')
     p = system['preview']
     if not 1 <= p['hz'] <= 5 or not 100 <= p['max_points'] <= 100000 or not 0.01 <= p['voxel_size'] <= 5:
         raise ValueError('Preview limits: 1–5 Hz, 100–100000 points, 0.01–5 m voxels')
-    return {'system': system, 'sensor': sensor}
+    result={'system': system, 'sensor': sensor}
+    camera_file=root/'config/camera/dfk33ux287.yaml'
+    if camera_file.exists():
+        camera=yaml.safe_load(camera_file.read_text())
+        validate_camera(camera,sensor)
+        for key in ('intrinsics_file','extrinsics_file'): config_path(root,camera[key])
+        result['camera']=camera
+    elif system['camera']['enabled']: raise ValueError('Camera configuration is missing')
+    return result
 
 def validate_sensor(s):
     for key in ('lidar_ip', 'host_ip'): ipaddress.IPv4Address(s[key])

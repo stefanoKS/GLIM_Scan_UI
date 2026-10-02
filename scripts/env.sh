@@ -7,7 +7,7 @@ fi
 export BUILD_JOBS
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 if [[ -x /usr/local/cuda/bin/nvcc ]]; then export PATH="/usr/local/cuda/bin:$PATH"; fi
-export PATH="$ROOT/.venv/bin:/usr/bin:/bin:$PATH"
+export PATH="$ROOT/.venv/bin:$ROOT/.local/bin:/usr/bin:/bin:$PATH"
 # ROS setup scripts are not nounset safe.
 set +u
 source "/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
@@ -19,3 +19,8 @@ export CMAKE_PREFIX_PATH="$ROOT/.local:$ROOT/.local/usr:${CMAKE_PREFIX_PATH:-}"
 export PYTHONPATH="$ROOT/ui/backend:${PYTHONPATH:-}"
 export ROS_LOG_DIR="$ROOT/.state/ros_logs"
 mkdir -p "$ROS_LOG_DIR"
+
+# Optional project-local GStreamer plugins; does not replace system plugins.
+export GST_PLUGIN_PATH="$ROOT/.local/lib/gstreamer-1.0:$ROOT/.local/lib/$(gcc -dumpmachine)/gstreamer-1.0:${GST_PLUGIN_PATH:-}"
+export GI_TYPELIB_PATH="$ROOT/.local/lib/girepository-1.0:$ROOT/.local/lib/$(gcc -dumpmachine)/girepository-1.0:${GI_TYPELIB_PATH:-}"
+export PKG_CONFIG_PATH="$ROOT/.local/lib/pkgconfig:$ROOT/.local/lib/$(gcc -dumpmachine)/pkgconfig:${PKG_CONFIG_PATH:-}"

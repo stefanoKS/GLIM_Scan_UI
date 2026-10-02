@@ -1,0 +1,2 @@
+# Replace by an actual ROS camera_calibration YAML. No invented matrices.
+calibrated: false

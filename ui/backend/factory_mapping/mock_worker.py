@@ -13,7 +13,7 @@ start=time.time()
 while running and (a.role not in ('offline','export') or time.time()-start<4):
  print('MOCK elapsed %.1fs'%(time.time()-start),flush=True);time.sleep(.5)
 out=Path(a.out)
-if a.role=='recording':
+if a.role in ('recording','calibration_record'):
  out.mkdir(parents=True,exist_ok=True);(out/'MOCK_ONLY.txt').write_text('Not a ROS bag. No production sensor data.\n')
 if a.role in ('offline','glim'):
  out.mkdir(parents=True,exist_ok=True);atomic_json(out/'mock_result.json',{'mock':True})

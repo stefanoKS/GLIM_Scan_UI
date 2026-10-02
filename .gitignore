@@ -18,3 +18,7 @@ data/sessions/*
 imgui.ini
 core
 core.*
+
+data/calibrations/*
+!data/calibrations/.gitkeep
+config/calibration/history/

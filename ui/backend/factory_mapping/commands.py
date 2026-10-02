@@ -20,8 +20,17 @@ def driver(root,config):
     args+=['-r',f"/livox/lidar:={sensor['points_topic']}",'-r',f"/livox/imu:={sensor['imu_topic']}"]
     return args
 
-def record(session,config):
-    qos={config['sensor'][key]:dict(reliability='best_effort',durability='volatile',history='keep_last',depth=1000) for key in ('points_topic','imu_topic')}
+def acquisition_topics(config,calibration=False):
+    topics={'points_topic':config['sensor']['points_topic']}
+    if not calibration:topics['imu_topic']=config['sensor']['imu_topic']
+    if config['system']['camera']['enabled']:
+        topics.update({k:config['camera'][k] for k in ('image_topic','camera_info_topic')})
+    return topics
+
+
+def record(session,config,calibration=False):
+    topics=acquisition_topics(config,calibration)
+    qos={value:dict(reliability='best_effort',durability='volatile',history='keep_last',depth=10 if key in ('image_topic','camera_info_topic') else 1000) for key,value in topics.items()}
     import yaml
     path=session/'config_snapshot/record_qos.yaml'; path.write_text(yaml.safe_dump(qos))
     return ['ros2','bag','record','--storage','sqlite3','--output',str(session/'raw_bag'),'--qos-profile-overrides-path',str(path),*qos.keys()]
@@ -53,3 +62,16 @@ def glim(config_path,dump,bag=None):
 def export(dump,target,config_path):
     # This upstream binary requires an OpenGL display even with --export_path.
     return ['ros2','run','glim_ros','offline_viewer',str(dump),'--export_path',str(target),'--config_path',str(config_path)]
+
+
+def camera(root,config):
+    from .camera_config import validate_camera,config_path
+    from .calibration_data import intrinsics_status
+    c=config['camera'];validate_camera(c,config['sensor'])
+    if not c['pipeline_validated'] or not c.get('gstreamer_pipeline'): raise ValueError('Camera pipeline is not hardware-validated. Probe the DFK and set trusted local camera YAML first.')
+    params=dict(gscam_config=c['gstreamer_pipeline'],use_gst_timestamps=c['use_gst_timestamps'],camera_name=c['camera_name'],frame_id=c['frame_id'],image_encoding='rgb8')
+    if intrinsics_status(root,c)['status']=='VALID': params['camera_info_url']=config_path(root,c['intrinsics_file']).resolve().as_uri()
+    else:params['camera_info_url']=''
+    import yaml
+    path=root/'.state/camera.params.yaml';path.write_text(yaml.safe_dump({'/**':{'ros__parameters':params}}))
+    return ['ros2','run','gscam2','gscam_main','--ros-args','--params-file',str(path),'-r','image_raw:='+c['image_topic'],'-r','camera_info:='+c['camera_info_topic']]

@@ -47,6 +47,8 @@ class Sessions:
         shutil.copytree(self.root/'config',p/'config_snapshot')
         atomic_json(p/'active_config.json',config)
         meta=dict(id=sid,name=name,notes=notes,created_at=now(),start_time=None,end_time=None,duration=0,state='created',mock=self.mock,**machine(),ros_version=config['system']['ros_distro'],glim_sha=sha(self.root/'external/glim'),livox_sha=sha(self.root/'external/livox_ros_driver2'),repository_sha=sha(self.root),lidar_serial=config['sensor'].get('serial_number'),lidar_ip=config['sensor']['lidar_ip'],topics={k:config['sensor'][k] for k in ('points_topic','imu_topic')},average_lidar_hz=None,average_imu_hz=None,disk_usage_bytes=0,glim_live=False,loop_closure=config['system']['loop_closure']['enabled'])
+        from .calibration_data import camera_metadata
+        meta['camera']=camera_metadata(self.root,config)
         atomic_json(p/'metadata.json',meta)
         return meta
     def update(self,p,**fields):

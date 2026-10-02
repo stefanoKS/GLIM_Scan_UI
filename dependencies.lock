@@ -59,6 +59,27 @@
       "sha": "2dd2193a45d36785168600cc17a31a17e0102d36",
       "validation": "optional_source_inspected_not_built",
       "arm64_validated": false
+    },
+    "gscam2": {
+      "url": "https://github.com/clydemcqueen/gscam2.git",
+      "sha": "ce26ab6945630e0a01e56b0e14236ff65be554be",
+      "optional": true,
+      "validation": "source_interfaces_inspected_not_built",
+      "arm64_validated": false
+    },
+    "tiscamera": {
+      "url": "https://github.com/TheImagingSource/tiscamera.git",
+      "sha": "b53d8d80e5026c3bc71ba7207c3b2fcd7c0557ff",
+      "optional": true,
+      "validation": "source_interfaces_inspected_not_built",
+      "arm64_validated": false
+    },
+    "direct_visual_lidar_calibration": {
+      "url": "https://github.com/koide3/direct_visual_lidar_calibration.git",
+      "sha": "02a0dc039f5509708f384be4ff3228e0ae09352d",
+      "optional": true,
+      "validation": "source_interfaces_inspected_not_built",
+      "arm64_validated": false
     }
   },
   "frontend": {

@@ -10,6 +10,7 @@ parser.add_argument('--only',nargs='+',choices=list(dependencies),help='Fetch on
 args=parser.parse_args()
 for name,dep in dependencies.items():
  if args.only and name not in args.only: continue
+ if not args.only and dep.get('optional',False): continue
  p=root/'external'/name
  fresh=not p.exists()
  if fresh: run('git','clone','--no-checkout',dep['url'],str(p))

@@ -33,6 +33,13 @@ class ToolRequest(BaseModel):
     run: str
     tool: str
     additional: list[ToolSource]=Field(default_factory=list,max_length=10)
+class IntrinsicsImport(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    yaml_text: str=Field(min_length=1,max_length=65536)
+class CalibrationAction(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    action: str
+    notes: str=Field(default='',max_length=8000)
 class Network(BaseModel):
     model_config=ConfigDict(extra='forbid')
     lidar_ip: str
@@ -69,6 +76,13 @@ def make_app(root=ROOT,mock=None):
     async def bad_request(request,e): return JSONResponse({'detail':str(e)},status_code=409)
     @app.get('/api/status')
     async def status(): return await asyncio.to_thread(app.state.service.status)
+    @app.get('/api/camera/preview')
+    async def camera_preview():
+        s=app.state.service
+        if not s.config['system']['camera']['enabled'] or not s.pm.active('camera'): raise HTTPException(404,'Camera preview is unavailable')
+        p=Path(__file__).with_name('mock_camera.jpg') if s.mock else root/'.state/camera_preview.jpg'
+        if not s.mock and (not s.pm.active('camera_preview') or not p.is_file() or time.time()-p.stat().st_mtime>3): raise HTTPException(404,'Camera preview is stale or unavailable; recording is independent')
+        return Response(await asyncio.to_thread(p.read_bytes),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
     @app.post('/api/sessions')
@@ -82,6 +96,8 @@ def make_app(root=ROOT,mock=None):
             a=body.action
             if a=='driver_start': return await s.start_driver()
             if a=='driver_stop': await s.stop_driver()
+            elif a=='camera_start': return await s.start_camera()
+            elif a=='camera_stop': await s.stop_camera()
             elif a=='record_start': return await s.start_recording(body.session or '')
             elif a=='record_stop': await s.stop_recording()
             elif a=='glim_start': return await s.start_glim(body.session or '',body.preset)
@@ -91,6 +107,7 @@ def make_app(root=ROOT,mock=None):
                 s.sessions.get(body.session or '')
                 if a=='session_start': s.check_preset(body.preset)
                 elif s.pm.active('glim'): raise ValueError('Stop live GLIM before starting a record-only session')
+                if s.config['system']['camera']['enabled'] and s.config['camera']['required_for_mapping'] and not s.pm.active('camera'): await s.start_camera()
                 if not s.pm.active('driver'): await s.start_driver()
                 for _ in range(15):
                     try: s.require_health(); break
@@ -123,6 +140,60 @@ def make_app(root=ROOT,mock=None):
             import yaml
             p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump(sensor,sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor
             s.event('network_config_updated'); return {'ok':True}
+    @app.post('/api/camera/intrinsics')
+    async def import_intrinsics(body:IntrinsicsImport):
+        import yaml,shutil,uuid
+        from .calibration_data import parse_intrinsics,atomic_yaml
+        from .camera_config import config_path
+        s=app.state.service
+        async with s.lock:
+            if s.active or any(s.pm.active(k) for k in s.pm.items): raise ValueError('Stop active processes before replacing intrinsics')
+            if not s.config.get('camera'):raise ValueError('Camera configuration is missing')
+            try:obj=yaml.safe_load(body.yaml_text);parse_intrinsics(obj,s.config['camera'])
+            except (yaml.YAMLError,TypeError,AttributeError) as e:raise ValueError('Invalid ROS intrinsic calibration YAML') from e
+            target=config_path(root,s.config['camera']['intrinsics_file'])
+            if target.exists():
+                history=target.parent/'history';history.mkdir(exist_ok=True);shutil.copy2(target,history/(uuid.uuid4().hex+'_'+target.name))
+            atomic_yaml(target,obj)
+            # A new intrinsic model invalidates the active extrinsic association.
+            ext=config_path(root,s.config['camera']['extrinsics_file'])
+            if ext.exists():
+                history=ext.parent/'history';history.mkdir(exist_ok=True);shutil.copy2(ext,history/(uuid.uuid4().hex+'_'+ext.name))
+                atomic_yaml(ext,{'version':1,'calibrated':False,'validated':False,'reason':'Intrinsics changed; previous result retained in history and source dataset'})
+            return s.camera_calibration()
+    @app.get('/api/calibrations')
+    async def calibrations():return await asyncio.to_thread(app.state.service.calibrations.list)
+    @app.post('/api/calibrations')
+    async def create_calibration(body:Create):
+        s=app.state.service
+        async with s.lock:return await asyncio.to_thread(s.calibrations.create,body.name)
+    @app.get('/api/calibrations/{cid}')
+    async def calibration_detail(cid:str):return await asyncio.to_thread(app.state.service.calibrations.detail,cid)
+    @app.post('/api/calibrations/{cid}/action')
+    async def calibration_action(cid:str,body:CalibrationAction):
+        s=app.state.service
+        async with s.lock:
+            cal=s.calibrations
+            if body.action=='capture_start':return await cal.capture_start(cid)
+            if body.action=='capture_stop':return await cal.capture_stop(cid)
+            if body.action in ('preprocess','initial_guess_manual','calibrate'):return await cal.run(cid,body.action)
+            if body.action=='import':return await asyncio.to_thread(cal.import_result,cid)
+            if body.action=='validate':return await asyncio.to_thread(cal.validate,cid,body.notes)
+            if body.action=='cancel':
+                p=cal.get(cid)
+                item=s.pm.items.get('calibration_tool',{})
+                if item and not Path(item['log']).is_relative_to(p):raise ValueError('Another calibration owns the active tool')
+                await s.pm.stop('calibration_tool',20,cancel=True);return cal.detail(cid)
+            raise ValueError('Unknown fixed calibration action')
+    @app.get('/api/calibrations/{cid}/logs/{jid}')
+    async def calibration_log(cid:str,jid:str):
+        import re
+        p=app.state.service.calibrations.get(cid)
+        if not re.fullmatch(r'job_[a-f0-9]{12}',jid):raise ValueError('Invalid calibration job')
+        log=p/'jobs'/jid/'tool.log'
+        if not log.is_file() or log.is_symlink():raise ValueError('Calibration log not found')
+        with log.open('rb') as f:
+            f.seek(max(0,log.stat().st_size-60000));return Response(f.read(),media_type='text/plain')
     @app.get('/api/tools')
     async def tools_catalog(): return capabilities(root)
     @app.post('/api/tools/open')
