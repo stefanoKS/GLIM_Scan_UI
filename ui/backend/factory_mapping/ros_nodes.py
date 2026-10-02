@@ -53,7 +53,7 @@ def run_camera(kind):
     config=load();c=config['camera']
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import qos_profile_sensor_data, QoSProfile
     from sensor_msgs.msg import Image,CameraInfo
     from .camera import CameraMetrics
     rclpy.init();node=Node('factory_mapping_'+kind);metrics=CameraMetrics(c);last=[0.0]
@@ -74,9 +74,9 @@ def run_camera(kind):
             if not ok:raise ValueError('JPEG encoding failed')
             out=ROOT/'.state/camera_preview.jpg';tmp=out.with_suffix('.tmp');tmp.write_bytes(encoded.tobytes());tmp.replace(out)
         except Exception as e:node.get_logger().warning('Preview unavailable: '+str(e))
-    node.create_subscription(Image,c['image_topic'],image,qos_profile_sensor_data)
+    node.create_subscription(Image,c['image_topic'],image,QoSProfile(depth=5) if kind=='camera_monitor' else qos_profile_sensor_data)
     if kind=='camera_monitor':
-        node.create_subscription(CameraInfo,c['camera_info_topic'],lambda m:metrics.info(m.width,m.height,m.k,m.d,m.distortion_model,m.header.frame_id),qos_profile_sensor_data)
+        node.create_subscription(CameraInfo,c['camera_info_topic'],lambda m:metrics.info(m.width,m.height,m.k,m.d,m.distortion_model,m.header.frame_id),QoSProfile(depth=5))
         node.create_timer(.5,lambda:atomic_json(ROOT/'.state/camera_health.json',dict(updated_at=time.time(),**metrics.view())))
     try:rclpy.spin(node)
     except KeyboardInterrupt:pass

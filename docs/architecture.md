@@ -21,3 +21,9 @@ Backend restart marks unfinished sessions/jobs interrupted. PID records include 
 A bounded latest-frame file is shared between preview and HTTP server; slow WebSocket consumers cannot grow an unbounded queue. FMPC v1 has `<4sId` magic/count/seconds followed by little-endian float32 XYZI. Preview max defaults to 50,000 at 3 Hz and 0.1 m voxels. The raw bag and archival GLIM export never use these preview parameters.
 
 Optional future plugins belong after stable acquisition. ScanContext is currently UNAVAILABLE when selected. `false` disables extra place recognition, not GLIM's existing geometric constraints. No camera runtime dependency is enabled.
+
+## Optional parallel camera acquisition
+
+`camera_config.py` validates trusted local camera YAML. `commands.camera` writes fixed gscam2 ROS parameters; camera, camera_monitor and camera_preview are separately managed subprocesses. FastAPI never imports rclpy/cv_bridge. Camera health uses its own atomic state file and JPEG preview uses its own endpoint, separate from the cloud WebSocket. The recorder includes image and CameraInfo topics only when enabled; GLIM RGB subscriptions are assigned an unused name for camera-enabled sessions.
+
+`calibration_data.py` owns intrinsic/transform validation; `calibration.py` owns persistent independent calibration datasets and fixed manual tool commands. Calibration bags are hashed, originals are never passed to preprocess, and every tool stage copies the prior derived output. Imported results retain intrinsic hashes, transform convention and time offset for a future independent projection/colorization subsystem.

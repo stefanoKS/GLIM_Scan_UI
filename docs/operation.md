@@ -41,3 +41,7 @@ scripts/fm.py action session_stop
 ```
 
 After shutdown completes, copy the entire session to the workstation. Select it there and process/export with GLIM. Keep the original Jetson copy until the copied bag has been verified.
+
+## Optional camera extension
+
+See [camera acquisition and calibration](camera_calibration.md) for opt-in installation, fixed pipeline setup, one-bag RGB recording, intrinsic import, static calibration datasets and the workstation manual/NID workflow. GLIM remains LiDAR + IMU only. Camera-disabled and record-only workflows above remain supported.

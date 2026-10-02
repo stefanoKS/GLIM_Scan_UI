@@ -7,7 +7,7 @@ from .storage import Sessions, atomic_json, read_json, now, size
 from .processes import ProcessManager
 from .health import network, system_status
 from .calibration_data import camera_metadata, intrinsics_status
-from .camera import check_camera_dependencies
+from .camera import check_camera_dependencies, detect_camera
 
 class Service:
     def __init__(self, root=ROOT, mock=False):
@@ -39,7 +39,9 @@ class Service:
         return obj
     def status(self):
         processes=self.pm.view(); h=self.health(); h['camera']=self.camera_health()
-        return dict(mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,camera_calibration=self.camera_calibration(),network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
+        detection={'camera':detect_camera(self.config.get('camera',{})), 'mid360':dict(detected=self.net.get('state')=='reachable',basis='Configured IP responds to ICMP; stream health is separate')}
+        if self.mock: detection={k:dict(detected=False,basis='MOCK: physical detection is not performed') for k in detection}
+        return dict(detection=detection,mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,camera_calibration=self.camera_calibration(),network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
     async def start_process(self,key,args,log,out=None,done=None):
         if self.mock:
             args=[sys.executable,'-m','factory_mapping.mock_worker',key,str(out or self.root/'.state/mock')]
@@ -71,12 +73,31 @@ class Service:
         if not self.mock and not all(self.health().get(k,{}).get('state')=='healthy' for k in ('lidar','imu')): raise ValueError('LiDAR and IMU must both have healthy message rates; run diagnostics')
         if self.config['system']['camera']['enabled'] and self.config['camera']['required_for_mapping'] and not self.camera_health()['healthy']: raise ValueError('Required camera frames are not healthy; start camera and check rates/geometry')
         if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
+    async def prepare_recording(self):
+        # Enabling RGB means Record must acquire both sensors. Disabling it keeps
+        # the independent LiDAR-only / record-only path available.
+        if self.config['system']['camera']['enabled'] and not self.pm.active('camera'):
+            await self.start_camera()
+        if not self.pm.active('driver'): await self.start_driver()
+        for attempt in range(16):
+            try:
+                self.require_health()
+                if self.config['system']['camera']['enabled']:
+                    h=self.camera_health()
+                    if not h['healthy'] or not h['camera_info_seen']:
+                        raise ValueError('Camera-enabled recording requires 720×540 images and CameraInfo; check camera diagnostics or disable RGB for LiDAR-only recording')
+                return
+            except ValueError:
+                if attempt==15: raise
+                await asyncio.sleep(1)
+
     async def start_recording(self,sid):
         if self.pm.active('recording'): raise ValueError('Recording is already active; stop the current session before starting another')
         if self.pm.active('calibration_record'): raise ValueError('Finish calibration capture before mapping recording')
-        self.require_health(); p=self.sessions.get(sid)
+        p=self.sessions.get(sid)
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if (p/'raw_bag').exists(): raise ValueError('This session already contains a raw bag; create another session')
+        await self.prepare_recording()
         # Re-snapshot at acquisition time, not merely when a name is reserved.
         shutil.copytree(self.root/'config',p/'config_snapshot',dirs_exist_ok=True); atomic_json(p/'active_config.json',self.config)
         self.active=p; self.rate_baseline={k:self.health().get(k,{}).get('count',0) for k in ('lidar','imu')}

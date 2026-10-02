@@ -2,13 +2,13 @@ driver: gscam2
 source: tiscamera
 model: DFK 33UX287
 camera_name: factory_rgb
-serial_number: null
+serial_number: "05420543"
 frame_id: camera_optical_frame
 image_topic: /camera/image_raw
 camera_info_topic: /camera/camera_info
-# Requested defaults only; probe the physical camera before choosing its mode.
-width: 1440
-height: 1080
+# DFK 33UX287 sensor resolution; validate format and rate on the attached device.
+width: 720
+height: 540
 fps: 15.0
 expected_hz: 15.0
 use_gst_timestamps: true
@@ -19,5 +19,5 @@ preview_hz: 2.0
 preview_max_width: 640
 time_offset_sec: 0.0
 # Local trusted configuration only. Never set through the HTTP API.
-gstreamer_pipeline: null
-pipeline_validated: false
+gstreamer_pipeline: 'tcambin serial="05420543" tcam-properties="tcam,ExposureAuto=Continuous,ExposureAutoUpperLimit=33333.0" ! video/x-raw,format=BGRx,width=720,height=540,framerate=15/1 ! videoconvert'
+pipeline_validated: true

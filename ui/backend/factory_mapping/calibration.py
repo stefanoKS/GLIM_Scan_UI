@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import uuid
 from pathlib import Path
 import yaml
@@ -12,6 +13,16 @@ from . import commands
 from .storage import atomic_json,read_json,now,size
 from .calibration_data import require_intrinsics,parse_result,transform,atomic_yaml
 from .camera_config import config_path
+
+async def ensure_display():
+    if not os.environ.get('DISPLAY'):raise ValueError('Native calibration GUI requires a server DISPLAY; copy the dataset to a desktop workstation')
+    code='import ctypes; x=ctypes.CDLL("libX11.so.6"); x.XOpenDisplay.restype=ctypes.c_void_p; d=x.XOpenDisplay(None); raise SystemExit(0 if d else 1)'
+    p=await asyncio.create_subprocess_exec(sys.executable,'-c',code,stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
+    try:rc=await asyncio.wait_for(p.wait(),5)
+    except asyncio.TimeoutError:
+        p.kill();await p.wait();raise ValueError('Server DISPLAY did not respond; open a working desktop session')
+    if rc:raise ValueError('Cannot connect to server DISPLAY; check X11 display permissions and desktop session')
+
 
 STATES=('CREATED','CAPTURING','CAPTURED','PREPROCESSED','INITIALIZED','CALIBRATED','IMPORTED','VALIDATED')
 
@@ -145,7 +156,7 @@ class Calibrations:
         before,after=transitions[stage]
         if m['state']!=before:raise ValueError(f'{stage} requires {before}; current state is {m["state"]}')
         if self.s.mock:raise ValueError('Mock datasets cannot produce genuine calibration results')
-        if stage!='preprocess' and not os.environ.get('DISPLAY'):raise ValueError('Native calibration GUI requires a server DISPLAY; copy the dataset to a desktop workstation')
+        if stage!='preprocess':await ensure_display()
         exe=self.root/'ros2_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'/stage
         if not exe.is_file():raise ValueError('Install the optional workstation calibrator with scripts/install_calibration.sh')
         captures=await asyncio.to_thread(self.verify_captures,p)

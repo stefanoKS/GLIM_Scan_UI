@@ -1,0 +1,39 @@
+diff --git a/cmake/modules/FindGObjectIntrospection.cmake b/cmake/modules/FindGObjectIntrospection.cmake
+index 3c95c12..839aebe 100644
+--- a/cmake/modules/FindGObjectIntrospection.cmake
++++ b/cmake/modules/FindGObjectIntrospection.cmake
+@@ -26,8 +26,7 @@ macro(_GIR_GET_PKGCONFIG_VAR _outvar _varname _extra_args)
+     else ()
+         string(REGEX REPLACE "[\r\n]" " " _result "${_result}")
+         string(REGEX REPLACE " +$" ""  _result "${_result}")
+-        separate_arguments(_result)
+-        set(${_outvar} ${_result} CACHE INTERNAL "")
++        set(${_outvar} "${_result}" CACHE INTERNAL "")
+     endif ()
+ endmacro(_GIR_GET_PKGCONFIG_VAR)
+ 
+diff --git a/libs/tcam-property/src/CMakeLists.txt b/libs/tcam-property/src/CMakeLists.txt
+index 360b680..40b266d 100644
+--- a/libs/tcam-property/src/CMakeLists.txt
++++ b/libs/tcam-property/src/CMakeLists.txt
+@@ -52,6 +52,7 @@ endif (CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+ 
+ 
+ add_custom_command(
++  VERBATIM
+   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/Tcam-${TCAM_PROPERTY_GI_API_VERSION}.gir"
+   DEPENDS tcam-property
+   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+@@ -65,10 +66,11 @@ add_custom_command(
+   -I${CMAKE_CURRENT_SOURCE_DIR}
+   --pkg=gobject-2.0
+   --library=tcam-property -L${tcam-property_dir}
+-  --output="${CMAKE_CURRENT_BINARY_DIR}/Tcam-${TCAM_PROPERTY_GI_API_VERSION}.gir"
++  "--output=${CMAKE_CURRENT_BINARY_DIR}/Tcam-${TCAM_PROPERTY_GI_API_VERSION}.gir"
+   )
+ 
+ add_custom_command(
++  VERBATIM
+   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/Tcam-${TCAM_PROPERTY_GI_API_VERSION}.typelib"
+   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/Tcam-${TCAM_PROPERTY_GI_API_VERSION}.gir"
+   WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"

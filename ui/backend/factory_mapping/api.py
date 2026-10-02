@@ -33,6 +33,10 @@ class ToolRequest(BaseModel):
     run: str
     tool: str
     additional: list[ToolSource]=Field(default_factory=list,max_length=10)
+class CameraEnabled(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    enabled: bool=Field(strict=True)
+
 class IntrinsicsImport(BaseModel):
     model_config=ConfigDict(extra='forbid')
     yaml_text: str=Field(min_length=1,max_length=65536)
@@ -76,12 +80,23 @@ def make_app(root=ROOT,mock=None):
     async def bad_request(request,e): return JSONResponse({'detail':str(e)},status_code=409)
     @app.get('/api/status')
     async def status(): return await asyncio.to_thread(app.state.service.status)
+    @app.post('/api/camera/enabled')
+    async def camera_enabled(body:CameraEnabled):
+        s=app.state.service
+        async with s.lock:
+            if any(s.pm.active(k) for k in ('recording','glim','camera','calibration_record','calibration_tool')):
+                raise ValueError('Stop acquisition and calibration processes before changing RGB recording')
+            if body.enabled and 'camera' not in s.config: raise ValueError('Camera configuration is missing')
+            # Machine preference is separate from the portable default-disabled config.
+            atomic_json(root/'.state/camera_enabled.json',{'enabled':body.enabled})
+            s.config['system']['camera']['enabled']=body.enabled
+            return {'enabled':body.enabled}
     @app.get('/api/camera/preview')
     async def camera_preview():
         s=app.state.service
         if not s.config['system']['camera']['enabled'] or not s.pm.active('camera'): raise HTTPException(404,'Camera preview is unavailable')
         p=Path(__file__).with_name('mock_camera.jpg') if s.mock else root/'.state/camera_preview.jpg'
-        if not s.mock and (not s.pm.active('camera_preview') or not p.is_file() or time.time()-p.stat().st_mtime>3): raise HTTPException(404,'Camera preview is stale or unavailable; recording is independent')
+        if not s.mock and (not s.pm.active('camera_preview') or not p.is_file() or time.time()-p.stat().st_mtime>max(3,2/s.config['camera']['preview_hz'])): raise HTTPException(404,'Camera preview is stale or unavailable; recording is independent')
         return Response(await asyncio.to_thread(p.read_bytes),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
@@ -107,11 +122,6 @@ def make_app(root=ROOT,mock=None):
                 s.sessions.get(body.session or '')
                 if a=='session_start': s.check_preset(body.preset)
                 elif s.pm.active('glim'): raise ValueError('Stop live GLIM before starting a record-only session')
-                if s.config['system']['camera']['enabled'] and s.config['camera']['required_for_mapping'] and not s.pm.active('camera'): await s.start_camera()
-                if not s.pm.active('driver'): await s.start_driver()
-                for _ in range(15):
-                    try: s.require_health(); break
-                    except ValueError: await asyncio.sleep(1)
                 await s.start_recording(body.session or '')
                 if a=='session_start':
                     try: await s.start_glim(body.session or '',body.preset)
@@ -136,6 +146,9 @@ def make_app(root=ROOT,mock=None):
         async with s.lock:
             if any(s.pm.active(k) for k in s.pm.items) or s.active: raise ValueError('Stop all processes and the active session before changing network settings')
             sensor={**s.config['sensor'],**body.model_dump()}; validate_sensor(sensor)
+            if s.config.get('camera'):
+                from .camera_config import validate_camera
+                validate_camera(s.config['camera'],sensor)
             if sensor['ros_domain_id']==s.config['system'].get('offline_ros_domain_id',230): raise ValueError('Acquisition and offline ROS domains must differ')
             import yaml
             p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump(sensor,sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor

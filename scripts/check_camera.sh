@@ -12,5 +12,5 @@ if command -v tcam-ctrl >/dev/null; then
  if [[ -n "${1:-}" ]]; then tcam-ctrl --caps "$1" || failed=1; fi
 fi
 ros2 pkg executables gscam2 || failed=1
-"$ROOT/.venv/bin/python" -c 'import cv2,cv_bridge;print("System/ROS preview dependencies:",cv2.__version__)' || failed=1
+"$ROOT/.venv/bin/python" "$ROOT/scripts/check_camera_python.py" || failed=1
 exit "$failed"

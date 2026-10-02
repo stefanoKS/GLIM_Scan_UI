@@ -1,5 +1,5 @@
 from pathlib import Path
-import ipaddress, os, re, math
+import ipaddress, os, re, math, json
 import yaml
 from .camera_config import validate_camera, config_path
 
@@ -8,6 +8,11 @@ PRESETS = ('jetson_cpu', 'jetson_gpu', 'offline_quality')
 
 def load(root=ROOT):
     system = yaml.safe_load((root/'config/system.yaml').read_text())
+    preference=root/'.state/camera_enabled.json'
+    if preference.is_file():
+        enabled=json.loads(preference.read_text()).get('enabled')
+        if type(enabled) is not bool: raise ValueError('Local camera preference must be boolean')
+        system['camera']['enabled']=enabled
     sensor = yaml.safe_load((root/'config/livox/mid360.yaml').read_text())
     validate_sensor(sensor)
     if not 0 <= system.get('offline_ros_domain_id',230) <= 232 or system.get('offline_ros_domain_id',230)==sensor['ros_domain_id']: raise ValueError('Offline ROS domain must be valid and different from acquisition')

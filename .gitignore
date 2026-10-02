@@ -22,3 +22,6 @@ core.*
 data/calibrations/*
 !data/calibrations/.gitkeep
 config/calibration/history/
+
+/ros2_ws/src/gscam2
+/ros2_ws/src/direct_visual_lidar_calibration

@@ -2,6 +2,7 @@
 import asyncio
 import math
 import shutil
+import re
 import time
 from collections import deque
 from .health import Rates
@@ -47,5 +48,22 @@ async def check_camera_dependencies(config):
     if rc:raise ValueError('tiscamera tcambin plugin unavailable; check tiscamera installation and GST_PLUGIN_PATH')
     rc,text=await run(['tcam-ctrl','--list'])
     serial=config.get('serial_number')
-    if rc or not text.strip() or (serial and serial not in text):raise ValueError('Configured camera not found by tcam-ctrl; check USB3, serial and device permissions')
+    devices=re.findall(r'Model: (.*?) Serial: (\S+) Type: (\S+)',text)
+    if rc or not devices or (serial and serial not in [d[1] for d in devices]):raise ValueError('Configured camera not found by tcam-ctrl; check USB3, serial and device permissions')
     return {'devices':text[-4000:],'plugin':'tcambin','publisher':'gscam_main'}
+
+
+def detect_camera(config, sysfs=None):
+    """USB presence only; stream readiness is reported separately."""
+    from pathlib import Path
+    devices=[]
+    for device in (Path(sysfs) if sysfs else Path('/sys/bus/usb/devices')).glob('*'):
+        try:
+            if (device/'idVendor').read_text().strip().lower()!='199e': continue
+            model=(device/'product').read_text().strip()
+            serial=(device/'serial').read_text().strip()
+            if '33UX287' not in model.replace(' ','').upper(): continue
+            if config.get('serial_number') and config['serial_number']!=serial: continue
+            devices.append(dict(model=model,serial=serial,usb_speed_mbps=(device/'speed').read_text().strip()))
+        except OSError: continue
+    return dict(detected=bool(devices),basis='USB enumeration; does not prove frame delivery',devices=devices)

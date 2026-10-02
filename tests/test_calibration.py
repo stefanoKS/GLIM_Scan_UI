@@ -96,3 +96,72 @@ def test_fixed_manual_tool_commands(root):
     assert '--image_topic' in args and '--camera_info_topic' in args and '--points_topic' in args
     assert '--auto_topic' not in args
     with pytest.raises(ValueError):tool_command('initial_guess_auto',root,c,intr)
+
+
+def test_nonfinite_result_rejected(root):
+    measured_intrinsics(root);p,intr=result(root,[0,0,0,0,0,0,1]);obj=json.loads(p.read_text());obj['results']['T_lidar_camera'][0]=float('nan');p.write_text(json.dumps(obj))
+    with pytest.raises(ValueError):parse_result(p,intr)
+
+
+def test_capture_statistics_reject_missing_or_slow_camera(root):
+    c=enabled(root);bag=root/'bag';bag.mkdir()
+    info={'duration':{'nanoseconds':10_000_000_000},'topics_with_message_count':[]}
+    entries=info['topics_with_message_count']
+    for name,kind,count in [(c['sensor']['points_topic'],'PointCloud2',100),(c['camera']['image_topic'],'Image',150),(c['camera']['camera_info_topic'],'CameraInfo',150)]:
+        entries.append({'topic_metadata':{'name':name,'type':'sensor_msgs/msg/'+kind},'message_count':count})
+    def save(): (bag/'metadata.yaml').write_text(yaml.safe_dump({'rosbag2_bagfile_information':info}))
+    save();assert bag_statistics(bag,c)['topics']['image_topic']['hz']==15
+    entries[1]['message_count']=1;save()
+    with pytest.raises(ValueError,match='rate'):bag_statistics(bag,c)
+    entries[1]['message_count']=150;entries.pop();save()
+    with pytest.raises(ValueError,match='CameraInfo'):bag_statistics(bag,c)
+
+
+def test_intrinsics_import_archives_previous_and_rejects_api_injection(root):
+    enabled(root);obj=measured_intrinsics(root)
+    with TestClient(make_app(root,True)) as c:
+        assert c.post('/api/camera/intrinsics',json={'yaml_text':yaml.safe_dump(obj),'command':'touch evil'}).status_code==422
+        assert c.post('/api/camera/intrinsics',json={'yaml_text':'!!python/object/apply:os.system [touch evil]'}).status_code==409
+        assert c.post('/api/camera/intrinsics',json={'yaml_text':yaml.safe_dump(obj)}).status_code==200
+        assert list((root/'config/calibration/history').glob('*'))
+        c.post('/api/action',json={'action':'camera_start'})
+        assert c.post('/api/camera/intrinsics',json={'yaml_text':yaml.safe_dump(obj)}).status_code==409
+
+
+def test_calibration_tool_requires_display_and_failed_job_can_retry(root,monkeypatch):
+    enabled(root);measured_intrinsics(root);s=Service(root,False);cal=s.calibrations;m=cal.create('native');p=cal.get(m['id'])
+    cal.update(p,state='PREPROCESSED')
+    monkeypatch.delenv('DISPLAY',raising=False)
+    with pytest.raises(ValueError,match='DISPLAY'):asyncio.run(cal.run(m['id'],'initial_guess_manual'))
+    assert read_json(p/'metadata.json')['state']=='PREPROCESSED'
+
+
+def test_manual_calibration_stages_preserve_prior_outputs(root,monkeypatch):
+    enabled(root);measured_intrinsics(root);s=Service(root,False);cal=s.calibrations;m=cal.create('stages');p=cal.get(m['id'])
+    cap=p/'captures/capture_001';(cap/'raw_bag').mkdir(parents=True);(cap/'raw_bag/data.db3').write_bytes(b'fixture raw')
+    atomic_json(cap/'metadata.json',dict(state='CAPTURED',raw_hashes=hashes(cap/'raw_bag')));cal.update(p,state='CAPTURED')
+    for stage in ('preprocess','initial_guess_manual','calibrate'):
+        exe=root/'ros2_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'/stage;exe.parent.mkdir(parents=True,exist_ok=True);exe.touch()
+    monkeypatch.setenv('DISPLAY',':test')
+    async def display_ok():pass
+    monkeypatch.setattr('factory_mapping.calibration.ensure_display',display_ok)
+    async def fake_start(key,args,log,out=None,done=None):
+        assert key=='calibration_tool'
+        stage=args[3];work=__import__('pathlib').Path(args[5] if stage=='preprocess' else args[4])
+        if stage=='preprocess':
+            work.mkdir();obj={'meta':{'bag_names':['capture_001']},'camera':{'camera_model':'plumb_bob','intrinsics':m['intrinsics']['intrinsics'],'distortion_coeffs':m['intrinsics']['distortion']}}
+            (work/'capture_001.ply').write_bytes(b'fixture cloud');(work/'capture_001.png').write_bytes(b'fixture image')
+        else:obj=read_json(work/'calib.json')
+        if stage=='initial_guess_manual':obj['results']={'init_T_lidar_camera':[0,0,0,0,0,0,1]}
+        if stage=='calibrate':obj['results']['T_lidar_camera']=[1,2,3,0,0,0,1]
+        atomic_json(work/'calib.json',obj)
+        await done({'state':'completed','returncode':0,'forced':False})
+    monkeypatch.setattr(s,'start_process',fake_start)
+    async def go():
+        await cal.run(m['id'],'preprocess');first=p/read_json(p/'metadata.json')['work'];before=hashes(first)
+        await cal.run(m['id'],'initial_guess_manual');assert hashes(first)==before
+        second=p/read_json(p/'metadata.json')['work'];second_before=hashes(second)
+        await cal.run(m['id'],'calibrate');assert hashes(second)==second_before
+        assert read_json(p/'metadata.json')['state']=='CALIBRATED'
+        assert (cap/'raw_bag/data.db3').read_bytes()==b'fixture raw'
+    asyncio.run(go())

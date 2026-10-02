@@ -24,3 +24,11 @@ mkdir -p "$ROS_LOG_DIR"
 export GST_PLUGIN_PATH="$ROOT/.local/lib/gstreamer-1.0:$ROOT/.local/lib/$(gcc -dumpmachine)/gstreamer-1.0:${GST_PLUGIN_PATH:-}"
 export GI_TYPELIB_PATH="$ROOT/.local/lib/girepository-1.0:$ROOT/.local/lib/$(gcc -dumpmachine)/girepository-1.0:${GI_TYPELIB_PATH:-}"
 export PKG_CONFIG_PATH="$ROOT/.local/lib/pkgconfig:$ROOT/.local/lib/$(gcc -dumpmachine)/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# Optional dependencies extracted locally on hosts without administrator access.
+# Native Jetson installations use the normal /opt/ros/humble packages.
+if [[ -d "$ROOT/.local/opt/ros/humble" ]]; then
+ export AMENT_PREFIX_PATH="$ROOT/.local/opt/ros/humble:${AMENT_PREFIX_PATH:-}"
+ export CMAKE_PREFIX_PATH="$ROOT/.local/opt/ros/humble:$CMAKE_PREFIX_PATH"
+ export LD_LIBRARY_PATH="$ROOT/.local/opt/ros/humble/lib:$LD_LIBRARY_PATH"
+fi

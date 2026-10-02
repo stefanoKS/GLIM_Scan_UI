@@ -88,3 +88,7 @@ scripts/run_system.sh --host 0.0.0.0
 This profile fetches only Livox-SDK2 and livox_ros_driver2, skips GLIM/GTSAM/Iridescence builds and CUDA probing, and retains the upstream PCL dependencies required by the Livox driver. It does not remove an existing GLIM installation. Choose **Start Record-only Session** in the dashboard. Use `scripts/verify_jetson.sh --record-only --hardware` for a sensor-connected acquisition test.
 
 For later local GLIM processing, rerun `scripts/bootstrap_jetson.sh` without the option. Alternatively, keep Jetson acquisition-only and copy completed sessions to the PC. The full default installation continues to include all five official GLIM executables.
+
+## Optional camera extension
+
+See [camera acquisition and calibration](camera_calibration.md) for opt-in installation, fixed pipeline setup, one-bag RGB recording, intrinsic import, static calibration datasets and the workstation manual/NID workflow. GLIM remains LiDAR + IMU only. Camera-disabled and record-only workflows above remain supported.

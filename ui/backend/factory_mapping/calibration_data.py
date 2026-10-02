@@ -82,7 +82,7 @@ def parse_result(path,expected):
 
 def camera_metadata(root,config):
     enabled=config['system'].get('camera',{}).get('enabled',False);c=config.get('camera',{})
-    result=dict(enabled=enabled,**{k:c.get(k) for k in ('camera_name','model','serial_number','image_topic','camera_info_topic','frame_id','fps','time_offset_sec','intrinsics_file','extrinsics_file')})
+    result=dict(enabled=enabled,**{k:c.get(k) for k in ('camera_name','model','serial_number','image_topic','camera_info_topic','frame_id','width','height','fps','time_offset_sec','intrinsics_file','extrinsics_file')})
     result['measured_image_hz']=None
     for key in ('intrinsics_file','extrinsics_file'):
         if c.get(key):

@@ -30,7 +30,7 @@ def acquisition_topics(config,calibration=False):
 
 def record(session,config,calibration=False):
     topics=acquisition_topics(config,calibration)
-    qos={value:dict(reliability='best_effort',durability='volatile',history='keep_last',depth=10 if key in ('image_topic','camera_info_topic') else 1000) for key,value in topics.items()}
+    qos={value:dict(reliability='reliable' if key in ('image_topic','camera_info_topic') else 'best_effort',durability='volatile',history='keep_last',depth=10 if key in ('image_topic','camera_info_topic') else 1000) for key,value in topics.items()}
     import yaml
     path=session/'config_snapshot/record_qos.yaml'; path.write_text(yaml.safe_dump(qos))
     return ['ros2','bag','record','--storage','sqlite3','--output',str(session/'raw_bag'),'--qos-profile-overrides-path',str(path),*qos.keys()]
@@ -41,7 +41,10 @@ def preset_snapshot(root,session,preset,output):
     shutil.copytree(root/'config/glim'/preset,output)
     # Always take topic names/extrinsics from acquisition, including after network config edits.
     config=json.loads((session/'active_config.json').read_text()); sensor=config['sensor']
-    p=output/'config_ros.json'; obj=json.loads(p.read_text()); obj['glim_ros'].update(points_topic=sensor['points_topic'],imu_topic=sensor['imu_topic']); atomic_json(p,obj)
+    p=output/'config_ros.json'; obj=json.loads(p.read_text()); obj['glim_ros'].update(points_topic=sensor['points_topic'],imu_topic=sensor['imu_topic'])
+    if config['system'].get('camera',{}).get('enabled'):
+        obj['glim_ros']['image_topic']='/factory_mapping_unused_rgb_'+uuid.uuid4().hex
+    atomic_json(p,obj)
     p=output/'config_sensors.json'; obj=json.loads(p.read_text()); obj['sensors']['T_lidar_imu']=sensor['T_lidar_imu']; atomic_json(p,obj)
     return output
 
@@ -69,7 +72,7 @@ def camera(root,config):
     from .calibration_data import intrinsics_status
     c=config['camera'];validate_camera(c,config['sensor'])
     if not c['pipeline_validated'] or not c.get('gstreamer_pipeline'): raise ValueError('Camera pipeline is not hardware-validated. Probe the DFK and set trusted local camera YAML first.')
-    params=dict(gscam_config=c['gstreamer_pipeline'],use_gst_timestamps=c['use_gst_timestamps'],camera_name=c['camera_name'],frame_id=c['frame_id'],image_encoding='rgb8')
+    params=dict(gscam_config=c['gstreamer_pipeline'],use_gst_timestamps=c['use_gst_timestamps'],camera_name=c['camera_name'],frame_id=c['frame_id'],image_encoding='rgb8',sync_sink=False)
     if intrinsics_status(root,c)['status']=='VALID': params['camera_info_url']=config_path(root,c['intrinsics_file']).resolve().as_uri()
     else:params['camera_info_url']=''
     import yaml

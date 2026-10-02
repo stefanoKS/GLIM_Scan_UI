@@ -1,6 +1,6 @@
 # Factory Mapping — GLIM + Mid-360
 
-Local ROS 2 acquisition, immutable raw bags, GLIM processing jobs and a lightweight browser interface. Phase 1 uses **only the Mid-360 LiDAR and its IMU**. The PC can perform processing; the future Jetson can focus on acquisition.
+Local ROS 2 acquisition, immutable raw bags, GLIM processing jobs and a lightweight browser interface. GLIM uses **only the Mid-360 LiDAR and its IMU**. Optional parallel RGB acquisition and manual LiDAR–camera calibration are available. The PC can perform processing; the future Jetson can focus on acquisition.
 
 ## Install from GitHub
 
@@ -65,3 +65,9 @@ source scripts/env.sh
 ```
 
 No ARM64 build result is claimed from the x86_64 test machine. No AVX/native architecture options are enabled. Dependency revisions and build evidence are in `dependencies.lock`. Build/install/log trees, raw bags and map outputs are excluded from Git.
+
+## Optional RGB camera and calibration
+
+Camera is disabled by default. The DFK 33UX287 pipeline must be verified on hardware before enabling it; no guessed GStreamer format is supplied. `scripts/install_camera.sh` adds the optional tiscamera/gscam2 acquisition stack. `scripts/install_calibration.sh` adds the separate workstation calibrator. Neither is required for LiDAR-only or record-only operation.
+
+See [camera setup, calibration conventions and hardware acceptance commands](docs/camera_calibration.md). The dashboard has camera health/JPEG preview, intrinsic YAML import and a separate persistent calibration workflow: static captures → preprocessing → manual alignment → NID → result import → independent validation. SuperGlue and final colorization are not integrated.
