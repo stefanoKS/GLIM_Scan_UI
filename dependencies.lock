@@ -5,43 +5,67 @@
       "url": "https://github.com/borglab/gtsam.git",
       "sha": "3ad4b4c3cb28394c9597f48fa02dad361c8450e3",
       "validation": "built_on_x86_64",
-      "arm64_validated": false
+      "arm64_validated": false,
+      "version": "4.3a0"
     },
     "glim": {
       "url": "https://github.com/koide3/glim.git",
       "sha": "2262aafa2369acff6afab2268a7743aec7a7fa49",
       "validation": "built_on_x86_64",
-      "arm64_validated": false
+      "arm64_validated": false,
+      "version": "1.2.2",
+      "hardware_validation": "x86_64_Mid360_2026-10-01"
     },
     "Livox-SDK2": {
       "url": "https://github.com/Livox-SDK/Livox-SDK2.git",
       "sha": "c0796f04c143143899c87a773d9f6b7136453c0b",
       "validation": "built_on_x86_64",
-      "arm64_validated": false
+      "arm64_validated": false,
+      "version": "1.5.2",
+      "hardware_validation": "x86_64_Mid360_2026-10-01"
     },
     "livox_ros_driver2": {
       "url": "https://github.com/Livox-SDK/livox_ros_driver2.git",
       "sha": "21445540f0d100dc86a7e6df312dd70bbdb4afdf",
       "validation": "built_on_x86_64",
-      "arm64_validated": false
+      "arm64_validated": false,
+      "version": "1.2.8",
+      "hardware_validation": "x86_64_Mid360_2026-10-01"
     },
     "iridescence": {
       "url": "https://github.com/koide3/iridescence.git",
       "sha": "cfb82c631a42392454395545e87a9c28f97ef84a",
       "validation": "built_on_x86_64",
-      "arm64_validated": false
+      "arm64_validated": false,
+      "version": "1.0.3"
     },
     "glim_ros2": {
       "url": "https://github.com/koide3/glim_ros2.git",
       "sha": "4d4ec524ccf1b02aa09b0af2af767ecc54343798",
       "validation": "built_on_x86_64",
-      "arm64_validated": false
+      "arm64_validated": false,
+      "version": "1.2.2",
+      "hardware_validation": "x86_64_Mid360_2026-10-01"
     },
     "gtsam_points": {
       "url": "https://github.com/koide3/gtsam_points.git",
       "sha": "76437e4ddb03df98a4f8a875c8de28edb0394c7c",
       "validation": "built_on_x86_64",
+      "arm64_validated": false,
+      "version": "1.2.2"
+    },
+    "glim_ext": {
+      "url": "https://github.com/koide3/glim_ext.git",
+      "sha": "2dd2193a45d36785168600cc17a31a17e0102d36",
+      "validation": "optional_source_inspected_not_built",
       "arm64_validated": false
+    }
+  },
+  "frontend": {
+    "three": {
+      "version": "0.170.0",
+      "source": "https://registry.npmjs.org/three/-/three-0.170.0.tgz",
+      "license": "MIT"
     }
   }
 }

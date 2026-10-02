@@ -1,10 +1,13 @@
 """Commands inspected against pinned official source; no user-supplied commands."""
-import json, os, shutil, sys
+import json, os, shutil, sys, uuid
 from .storage import atomic_json
 from .config import PRESETS
 
-def ros_env(config):
-    env=os.environ.copy(); env['ROS_DOMAIN_ID']=str(config['sensor']['ros_domain_id']); return env
+def ros_env(config, offline=False):
+    env=os.environ.copy()
+    env['ROS_DOMAIN_ID']=str(config['system'].get('offline_ros_domain_id',230) if offline else config['sensor']['ros_domain_id'])
+    if offline: env['ROS_LOCALHOST_ONLY']='1'
+    return env
 
 def driver(root,config):
     sensor=config['sensor']; obj=json.loads((root/'config/livox/upstream_mid360.json').read_text())
@@ -37,7 +40,14 @@ def glim(config_path,dump,bag=None):
     args=['ros2','run','glim_ros','glim_rosbag' if bag else 'glim_rosnode']
     if bag: args.append(str(bag))
     args+=['--ros-args','-p',f'config_path:={config_path}','-p',f'dump_path:={dump}']
-    if bag: args+=['-p','auto_quit:=true']
+    if bag:
+        args+=['-p','auto_quit:=true']
+        # GLIM rosbag also spins live subscriptions. Remap only ROS subscriptions;
+        # direct bag filtering still uses the original names in config_ros.json.
+        config=json.loads((config_path/'config_ros.json').read_text())['glim_ros']
+        namespace='/factory_mapping_offline_'+uuid.uuid4().hex
+        for field in ('imu_topic','points_topic','image_topic'):
+            if config.get(field): args+=['-r',f'{config[field]}:={namespace}/{field}']
     return args
 
 def export(dump,target,config_path):

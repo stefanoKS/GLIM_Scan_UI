@@ -19,7 +19,7 @@
     "ring_field": "",
     "autoconf_perpoint_times": false,
     "autoconf_prefer_frame_time": false,
-    "perpoint_relative_time": true,
+    "perpoint_relative_time": false,
     "perpoint_time_scale": 1e-09,
     "global_shutter_camera": true,
     "image_size": [

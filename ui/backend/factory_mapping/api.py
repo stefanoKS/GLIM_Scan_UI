@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ConfigDict
 from .config import ROOT, validate_sensor
 from .service import Service
+from .glim_tools import capabilities
 from .storage import atomic_json, read_json
 from .preview import encode
 from .quality import quality, ply_stats, ply_to_pcd
@@ -22,6 +23,16 @@ class Action(BaseModel):
     session: str | None=None
     preset: str='jetson_cpu'
     run: str | None=None
+class ToolSource(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    session: str
+    run: str
+class ToolRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    session: str
+    run: str
+    tool: str
+    additional: list[ToolSource]=Field(default_factory=list,max_length=10)
 class Network(BaseModel):
     model_config=ConfigDict(extra='forbid')
     lidar_ip: str
@@ -81,6 +92,7 @@ def make_app(root=ROOT,mock=None):
             elif a=='record_start': return await s.start_recording(body.session or '')
             elif a=='record_stop': await s.stop_recording()
             elif a=='glim_start': return await s.start_glim(body.session or '',body.preset)
+            elif a=='glim_viewer_start': return await s.start_glim(body.session or '',body.preset,viewer=True)
             elif a=='glim_stop': await s.stop_glim()
             elif a=='session_start':
                 if not s.pm.active('driver'): await s.start_driver()
@@ -92,6 +104,10 @@ def make_app(root=ROOT,mock=None):
                 except Exception: await s.stop_session(); raise
             elif a=='session_stop': await s.stop_session()
             elif a=='process': return await s.offline(body.session or '',body.preset)
+            elif a=='validator_start': return await s.start_validator()
+            elif a=='validator_stop': await s.pm.stop('validator',20)
+            elif a=='tool_stop': await s.pm.stop('tool',20,cancel=True)
+            elif a=='export_edit': return await s.export_edit(body.session or '',body.run or '')
             elif a=='cancel': await s.pm.stop('offline',180,cancel=True)
             elif a=='export': return await s.export(body.session or '',body.run or '')
             elif a=='delete_derived': s.delete_run(body.session or '',body.run or '')
@@ -106,9 +122,20 @@ def make_app(root=ROOT,mock=None):
         async with s.lock:
             if any(s.pm.active(k) for k in s.pm.items) or s.active: raise ValueError('Stop all processes and the active session before changing network settings')
             sensor={**s.config['sensor'],**body.model_dump()}; validate_sensor(sensor)
+            if sensor['ros_domain_id']==s.config['system'].get('offline_ros_domain_id',230): raise ValueError('Acquisition and offline ROS domains must differ')
             import yaml
             p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump(sensor,sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor
             s.event('network_config_updated'); return {'ok':True}
+    @app.get('/api/tools')
+    async def tools_catalog(): return capabilities(root)
+    @app.post('/api/tools/open')
+    async def open_tool(body:ToolRequest):
+        s=app.state.service
+        async with s.lock: return await s.open_tool(body.session,body.run,body.tool,[x.model_dump() for x in body.additional])
+    @app.get('/api/sessions/{sid}/edits')
+    async def edits(sid:str):
+        p=app.state.service.sessions.get(sid)
+        return [read_json(f) for f in sorted((p/'edits').glob('*/workspace.json'))]
     def artifact(sid,path):
         p=app.state.service.sessions.get(sid); f=(p/path).resolve()
         if p.resolve() not in f.parents or not f.is_file() or any(x.is_symlink() for x in [p/path,*(p/path).parents] if x!=p.parent): raise ValueError('Invalid artifact path')

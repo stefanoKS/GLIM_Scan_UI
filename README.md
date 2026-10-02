@@ -2,10 +2,32 @@
 
 Local ROS 2 acquisition, immutable raw bags, GLIM processing jobs and a lightweight browser interface. Phase 1 uses **only the Mid-360 LiDAR and its IMU**. The PC can perform processing; the future Jetson can focus on acquisition.
 
+## Install from GitHub
+
+Use Ubuntu 22.04 with ROS 2 Humble already installed. On Jetson, use a JetPack 6 image with Ubuntu 22.04 and ROS 2 Humble; do not upgrade JetPack. For a new Ubuntu workstation, install ROS 2 Humble from the [official installation guide](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html) before continuing.
+
+Clone the private repository using your GitHub access, then run the bootstrap from its root:
+
+```bash
+git clone https://github.com/stefanoKS/GLIM_Scan_UI.git
+cd GLIM_Scan_UI
+scripts/check_system.sh
+scripts/bootstrap_jetson.sh
+```
+
+Bootstrap installs the OS build prerequisites, creates the Python environment, downloads the exact upstream GLIM and Livox revisions pinned in `dependencies.lock`, builds and installs them into this checkout, then builds the ROS 2 workspace. GLIM is fetched automatically; do not clone or install it separately. The first build needs internet access, `sudo` for apt packages, and can take a while. Use `BUILD_JOBS=1 scripts/bootstrap_jetson.sh` on memory-constrained machines. CUDA is detected automatically and falls back to CPU when unavailable.
+
+Start the dashboard after bootstrap completes:
+
+```bash
+scripts/run_system.sh
+```
+
+Open http://127.0.0.1:8080. For network and hardware setup, see [installation](docs/installation_jetson.md) and [operation](docs/operation.md).
+
 ## Quick start on this PC
 
 ```bash
-cd '/home/ubuntu-ros/Documents/GLIM Factory Mapping/factory_mapping'
 scripts/run_system.sh
 ```
 
@@ -26,6 +48,10 @@ scripts/process_bag.sh YYYYMMDD_HHMMSS_terminal_test --preset jetson_cpu
 ```
 
 Each run writes a new `processing/run_NNN/` directory. Inspect `job.log`, `job.json` and `glim_dump/`. Never pass an unfinished bag to GLIM.
+
+## Official GLIM editing tools
+
+The dashboard includes launchers for **manual loop closure, map merging, plane constraints, optimization, graph recovery, MinCut/region-growing segmentation and map cleanup**. They use the installed upstream `offline_viewer` and `map_editor` on the server desktop, starting from separate working copies. The native live viewer and upstream sensor validator are also available. See [toolkit workflows](docs/glim_tools.md).
 
 ## Installation and verification
 

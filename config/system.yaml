@@ -1,4 +1,5 @@
 ros_distro: humble
+offline_ros_domain_id: 230
 preset: jetson_cpu
 loop_closure:
   enabled: false

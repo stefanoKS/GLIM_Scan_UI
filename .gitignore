@@ -15,3 +15,6 @@ data/sessions/*
 *.mcap
 *.pcd
 *.ply
+imgui.ini
+core
+core.*

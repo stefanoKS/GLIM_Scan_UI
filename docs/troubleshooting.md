@@ -12,3 +12,7 @@
 - **Disk low**: automatic graceful stop begins at the configured free-space threshold. Move completed sessions to external storage before another run.
 
 Use `scripts/diagnose.sh`, UI diagnostics, and per-session logs. Full logs remain on disk even when the UI shows only a bounded recent stream.
+
+- **Offline timestamp rewind while the sensor is live**: use the project wrapper, which separates the offline ROS domain and remaps live subscriptions. Direct unisolated upstream glim_rosbag can also receive live messages. Never accept a map whose log shows mismatched IMU/point epochs.
+- **Driver hangs after unplugging sensor**: observed with the pinned official driver. The process manager waits for the full process group, then escalates after its graceful timeout; a ros2 wrapper exit does not prove the native child exited. Shutdown may be forced and is recorded as such. Stop acquisition before disconnecting the sensor where possible.
+- **Native editor not visible on remote browser PC**: GLIM editors run on the server display. The browser launches and tracks them but does not stream native windows. Use a local workstation desktop, or copy the finished session to that workstation.

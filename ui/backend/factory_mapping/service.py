@@ -1,7 +1,7 @@
 import asyncio, json, os, shutil, sys, time, uuid
 from datetime import datetime
 from pathlib import Path
-from . import commands
+from . import commands, glim_tools
 from .config import ROOT, PRESETS, load, validate_sensor
 from .storage import Sessions, atomic_json, read_json, now, size
 from .processes import ProcessManager
@@ -11,7 +11,7 @@ class Service:
     def __init__(self, root=ROOT, mock=False):
         self.root=root; self.mock=mock; self.config=load(root); self.sessions=Sessions(root,mock)
         self.pm=ProcessManager(root/'.state'); self.active=None; self.lock=asyncio.Lock(); self.errors=list(self.pm.recovery); self.net={}; self.closed=False
-        self.record_started=None; self.rate_baseline={}
+        self.record_started=None; self.rate_baseline={}; self.live_preset=None
         for m in self.sessions.list():
             p=self.sessions.get(m['id'])
             if m['state'] in ('recording','mapping','stopping'):
@@ -35,11 +35,16 @@ class Service:
         return obj
     def status(self):
         processes=self.pm.view(); h=self.health()
-        return dict(mock=self.mock,system=system_status(self.root),config=self.config,network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
+        return dict(mock=self.mock,live_preset=self.live_preset,system=system_status(self.root),config=self.config,network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
     async def start_process(self,key,args,log,out=None,done=None):
         if self.mock:
             args=[sys.executable,'-m','factory_mapping.mock_worker',key,str(out or self.root/'.state/mock')]
-        result=await self.pm.start(key,args,log,commands.ros_env(self.config),done)
+        async def finished(item):
+            if done: await done(item)
+            self.event('process_exit',role=key,state=item['state'],returncode=item['returncode'],forced=item['forced'])
+            if item['state']=='failed':
+                self.errors.append(f"{key} exited with code {item['returncode']}; inspect {log}. Restart the affected process after correcting the cause.")
+        result=await self.pm.start(key,args,log,commands.ros_env(self.config, offline=key in ('offline','export','tool')),finished)
         self.event('process_start',role=key,pid=result['pid']); return result
     async def start_driver(self):
         if not self.mock:
@@ -66,7 +71,7 @@ class Service:
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if (p/'raw_bag').exists(): raise ValueError('This session already contains a raw bag; create another session')
         # Re-snapshot at acquisition time, not merely when a name is reserved.
-        shutil.rmtree(p/'config_snapshot'); shutil.copytree(self.root/'config',p/'config_snapshot'); atomic_json(p/'active_config.json',self.config)
+        shutil.copytree(self.root/'config',p/'config_snapshot',dirs_exist_ok=True); atomic_json(p/'active_config.json',self.config)
         self.active=p; self.rate_baseline={k:self.health().get(k,{}).get('count',0) for k in ('lidar','imu')}
         async def done(item):
             if item['state']=='failed': self.errors.append('Recorder exited unexpectedly; inspect recording.log and bag metadata'); self.sessions.update(p,state='failed')
@@ -93,26 +98,38 @@ class Service:
         if not ok: self.errors.append('Recording did not finalize cleanly; preserve raw_bag and inspect recording.log')
     def check_preset(self,preset):
         if preset not in PRESETS: raise ValueError('Unknown GLIM preset')
-        if not self.mock and preset!='jetson_cpu' and not (self.root/'ros2_ws/install/glim/lib/libodometry_estimation_gpu.so').exists():
+        if not self.mock and preset!='jetson_cpu' and (not read_json(self.root/'.state/build_capabilities.json',{}).get('cuda',False) or not (self.root/'ros2_ws/install/glim/lib/libodometry_estimation_gpu.so').exists()):
             raise ValueError('This installation has no CUDA GLIM module; select the CPU preset or build CUDA support')
-    async def start_glim(self,sid,preset):
+    async def start_glim(self,sid,preset,viewer=False):
         self.check_preset(preset)
+        if viewer and not os.environ.get('DISPLAY'): raise ValueError('Native GLIM viewer needs a server display')
         self.require_health()
         if self.config['system']['loop_closure']['enabled']: raise ValueError('ScanContext is unavailable until separately validated')
-        if self.pm.active('offline') or self.pm.active('export'): raise ValueError('Wait for offline processing/export to finish')
+        if any(self.pm.active(k) for k in ('offline','export','tool')): raise ValueError('Finish offline processing/export and close the native editor first')
         p=self.sessions.get(sid)
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if self.pm.active('glim'): raise ValueError('GLIM is already active')
         out=p/'glim_dump'
         if any(out.iterdir()): raise ValueError('Live output exists; use a new session or offline reprocessing')
         cfg=p/'config_snapshot'/('live_'+uuid.uuid4().hex[:8]); commands.preset_snapshot(self.root,p,preset,cfg)
+        if viewer:
+            path=cfg/'config_ros.json'; obj=read_json(path); obj['glim_ros']['extension_modules']=['libstandard_viewer.so']; atomic_json(path,obj)
         self.active=p
-        self.sessions.update(p,glim_live=True,live_preset=preset)
+        meta=read_json(p/'metadata.json',{})
+        self.sessions.update(p,glim_live=True,live_preset=preset,**({'start_time':now(),'state':'mapping'} if not meta.get('start_time') else {}))
         async def done(item):
             valid=self.mock or (out/'graph.bin').exists()
             self.sessions.update(p,live_result='completed' if item['returncode']==0 and valid and not item['forced'] else 'failed')
-        return await self.start_process('glim',commands.glim(cfg,out),p/'logs/glim.log',out,done)
-    async def stop_glim(self): await self.pm.stop('glim',self.config['system']['shutdown']['glim_timeout'])
+        result=await self.start_process('glim',commands.glim(cfg,out),p/'logs/glim.log',out,done)
+        self.live_preset=preset
+        return result
+    async def stop_glim(self):
+        await self.pm.stop('glim',self.config['system']['shutdown']['glim_timeout'])
+        if self.active and not (self.active/'raw_bag').exists():
+            meta=read_json(self.active/'metadata.json',{})
+            if meta.get('start_time'):
+                duration=time.time()-datetime.fromisoformat(meta['start_time']).timestamp()
+                self.sessions.update(self.active,end_time=now(),duration=duration,state='mapped' if meta.get('live_result')=='completed' else 'failed')
     async def stop_session(self):
         p=self.active
         if not p: return
@@ -125,7 +142,7 @@ class Service:
     async def offline(self,sid,preset):
         self.check_preset(preset)
         if self.config['system']['loop_closure']['enabled']: raise ValueError('ScanContext is unavailable until validated')
-        if any(self.pm.active(k) for k in ('glim','offline','export')): raise ValueError('GLIM or export is already active')
+        if any(self.pm.active(k) for k in ('glim','offline','export','tool')): raise ValueError('GLIM or export is already active')
         p=self.sessions.get(sid)
         if self.active==p or read_json(p/'metadata.json',{})['state'] in ('created','recording','interrupted','failed'): raise ValueError('Session needs a finalized recording before processing')
         if not self.mock and not (p/'raw_bag/metadata.yaml').exists(): raise ValueError('No finalized ROS bag found')
@@ -134,7 +151,13 @@ class Service:
         run=runs/f'run_{i:03d}'; run.mkdir(); cfg=commands.preset_snapshot(self.root,p,preset,run/'config'); dump=run/'glim_dump'
         job=dict(id=run.name,session=sid,preset=preset,state='running',started_at=now(),mock=self.mock); atomic_json(run/'job.json',job)
         async def done(item):
-            valid=self.mock or (dump/'graph.bin').exists()
+            valid=self.mock or ((dump/'graph.bin').exists() and (dump/'traj_lidar.txt').exists() and (dump/'traj_lidar.txt').stat().st_size>0)
+            if not self.mock:
+                bad=('timestamp rewind detected', 'large time difference between points and imu', 'waiting for IMU data')
+                with (run/'job.log').open(errors='replace') as log:
+                    issues=sorted({pattern for line in log for pattern in bad if pattern in line})
+                job['validation_errors']=issues
+                if issues: valid=False
             job.update(state=item['state'] if item['state']!='completed' or valid else 'failed',returncode=item['returncode'],forced=item['forced'],ended_at=now(),result=str(dump.relative_to(p)) if valid else None)
             atomic_json(run/'job.json',job)
             if job['state']=='failed': self.errors.append(f'GLIM processing failed: {sid}/{run.name}; inspect job.log')
@@ -145,11 +168,11 @@ class Service:
         p=self.sessions.get(sid); run=self.get_run(p,run_id); job=read_json(run/'job.json',{})
         if job.get('state')!='completed': raise ValueError('Process this session successfully before export')
         if self.mock: raise ValueError('Mock results cannot be exported as maps')
-        if any(self.pm.active(k) for k in ('glim','offline','export')): raise ValueError('GLIM or export is active')
+        if any(self.pm.active(k) for k in ('glim','offline','export','tool')): raise ValueError('GLIM or export is active')
         if not os.environ.get('DISPLAY'): raise ValueError('Official GLIM exporter needs an OpenGL display; run on a desktop workstation or configured Xvfb')
         output=p/'exports'/f'{run_id}_{uuid.uuid4().hex[:8]}.ply'
         async def done(item):
-            if item['returncode']!=0 or not output.is_file(): self.errors.append('PLY export failed; inspect export.log')
+            if item['returncode']!=0 or not output.is_file(): raise ValueError('PLY export failed; inspect export.log')
         return await self.start_process('export',commands.export(run/'glim_dump',output,run/'config'),run/'export.log',done=done)
     def get_run(self,p,rid):
         import re
@@ -158,8 +181,48 @@ class Service:
         if not run.is_dir() or run.is_symlink(): raise ValueError('Processing run not found')
         return run
     def delete_run(self,sid,rid):
-        if any(self.pm.active(k) for k in ('glim','offline','export')): raise ValueError('Stop processing before deleting derived data')
+        if any(self.pm.active(k) for k in ('glim','offline','export','tool')): raise ValueError('Stop processing before deleting derived data')
         run=self.get_run(self.sessions.get(sid),rid); shutil.rmtree(run)
+    async def open_tool(self,sid,rid,kind,additional):
+        if self.mock: raise ValueError('Native GLIM editing requires a real saved map')
+        if any(self.pm.active(k) for k in ('glim','offline','export','tool')): raise ValueError('Finish GLIM processing or close the current editor first')
+        if not os.environ.get('DISPLAY'): raise ValueError('GLIM editing opens on the server desktop. Use a local display on Jetson or copy the session to a workstation.')
+        def source(sid,rid):
+            p=self.sessions.get(sid); run=self.get_run(p,rid)
+            if read_json(run/'job.json',{}).get('state')!='completed': raise ValueError('Select a successfully processed run')
+            return dict(session=sid,run=rid,dump=run/'glim_dump',config=run/'config')
+        p=self.sessions.get(sid); sources=[source(sid,rid)]+[source(x['session'],x['run']) for x in additional]
+        required=sum(size(x['dump']) for x in sources)
+        if shutil.disk_usage(self.root).free<required+self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Not enough space for safe map working copies')
+        workspace,meta=await asyncio.to_thread(glim_tools.prepare,self.root,p,rid,sources,kind)
+        async def done(item):
+            meta.update(state='closed' if item['returncode']==0 else 'interrupted',closed_at=now(),returncode=item['returncode'],forced=item['forced'])
+            atomic_json(workspace/'workspace.json',meta)
+        try: await self.start_process('tool',glim_tools.command(kind,Path(meta['maps'][0])),workspace/'tool.log',done=done)
+        except Exception as e: meta.update(state='failed',error=str(e));atomic_json(workspace/'workspace.json',meta);raise
+        meta['state']='open';atomic_json(workspace/'workspace.json',meta);return meta
+    async def start_validator(self):
+        if not self.pm.active('driver'): raise ValueError('Start the sensor first')
+        c=self.config['sensor']
+        return await self.start_process('validator',['ros2','run','glim_ros','validator_node','--ros-args','-r',f"imu:={c['imu_topic']}",'-r',f"points:={c['points_topic']}"],self.root/'.state/validator.log')
+    def edit_workspace(self,sid,eid):
+        import re
+        if not re.fullmatch(r'edit_[a-f0-9]{12}',eid): raise ValueError('Invalid edit workspace')
+        p=self.sessions.get(sid)/'edits'/eid
+        if not p.is_dir() or p.is_symlink(): raise ValueError('Edit workspace not found')
+        return p
+    async def export_edit(self,sid,eid):
+        if any(self.pm.active(k) for k in ('glim','offline','export','tool')): raise ValueError('Close editing and finish processing before export')
+        if not os.environ.get('DISPLAY'): raise ValueError('Official GLIM exporter requires a display')
+        workspace=self.edit_workspace(sid,eid); dump=workspace/'saved_map'
+        # Native tools must save explicitly into the displayed output location.
+        glim_tools.validate_dump(dump)
+        target=self.sessions.get(sid)/'exports'/f'{eid}_{uuid.uuid4().hex[:8]}.ply'
+        cfg=dump/'config'
+        if not cfg.is_dir(): cfg=workspace/'map_01/config'
+        async def done(item):
+            if item['returncode']!=0 or not target.is_file(): raise ValueError('Edited-map export failed; inspect the workspace export.log')
+        return await self.start_process('export',commands.export(dump,target,cfg),workspace/'export.log',done=done)
     async def background(self):
         while not self.closed:
             try:
@@ -172,5 +235,5 @@ class Service:
     async def close(self):
         self.closed=True
         await self.stop_session()
-        for k in ('offline','export','preview','monitor','driver'):
-            if self.pm.items.get(k,{}).get('state')!='orphaned': await self.pm.stop(k,self.config['system']['shutdown']['glim_timeout'],cancel=True)
+        for k in ('offline','export','tool','validator','preview','monitor','driver'):
+            if self.pm.items.get(k,{}).get('state')!='orphaned': await self.pm.stop(k,self.config['system']['shutdown']['glim_timeout'] if k in ('offline','export','tool') else 20,cancel=True)

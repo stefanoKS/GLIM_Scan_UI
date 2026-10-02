@@ -16,5 +16,5 @@ for preset in ['jetson_cpu','jetson_gpu','offline_quality']:
         if src.name=='config_logging.json': obj['logging']['save_logs']=False
         if src.name=='config_sensors.json':
             obj['sensors']['T_lidar_imu']=sensor['T_lidar_imu']
-            obj['sensors'].update(autoconf_perpoint_times=False,perpoint_relative_time=True,perpoint_time_scale=1e-9)
+            obj['sensors'].update(autoconf_perpoint_times=False,perpoint_relative_time=False,perpoint_time_scale=1e-9)
         (dest/src.name).write_text(json.dumps(obj,indent=2)+'\n')

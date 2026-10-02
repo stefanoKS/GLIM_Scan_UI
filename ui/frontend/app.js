@@ -10,11 +10,11 @@ function el(tag,text){const e=document.createElement(tag);e.textContent=text;ret
 async function refresh(){try{const s=await json('status');$('login').hidden=true;$('mode').textContent=s.mock?'MOCK · simulated data':'LIVE HARDWARE MODE';const x=s.system;
 $('system').textContent=`${x.model}\nCPU ${x.cpu_percent}% · RAM ${x.ram_percent}%\nGPU ${x.gpu_percent==null?'unavailable':x.gpu_percent+'%'}\nDisk free ${bytes(x.disk_free)}\n${s.config.sensor.interface}: ${s.config.sensor.host_ip}\nROS domain ${s.config.sensor.ros_domain_id}\nTemperature ${Object.entries(x.temperatures).map(([k,v])=>k+': '+v.join('/')+'°C').join(', ')||'unavailable'}`;
 const l=s.health.lidar||{},i=s.health.imu||{};$('sensor').textContent=`Network: ${s.network.state||'checking'}\nDriver: ${s.processes.driver?.state||'stopped'}\n${s.config.sensor.points_topic}\nLiDAR ${l.state}: ${hz(l.hz)}\nPoints/s ${Math.round(l.point_rate||0)}\n${s.config.sensor.imu_topic}\nIMU ${i.state}: ${hz(i.hz)}\nLatest stamp ${l.stamp||'—'}`;
-const g=s.processes.glim;$('glim').textContent=`${g?.state||'stopped'} · ${$('preset').value==='jetson_cpu'?'CPU':'CUDA'}\nLoop detection ${s.loop_detection}\nSession ${s.active_session||'none'}\nRuntime ${g?.started_at?sec((Date.now()-Date.parse(g.started_at))/1000):'—'}`;
+const g=s.processes.glim;$('glim').textContent=`${g?.state||'stopped'} · ${s.live_preset?(s.live_preset==='jetson_cpu'?'CPU':'CUDA'):'—'}\nLoop detection ${s.loop_detection}\nSession ${s.active_session||'none'}\nRuntime ${g?.started_at?sec(((g.ended_at?Date.parse(g.ended_at):Date.now())-Date.parse(g.started_at))/1000):'—'}`;
 $('record').textContent=`${s.processes.recording?.state||'stopped'}\nElapsed ${sec(s.recording_elapsed)}\nBag ${bytes(s.bag_size_bytes)}\n${s.active_session||'No active session'}\nFree-space time ${s.recording_elapsed>3&&s.bag_size_bytes>0?sec(x.disk_free/(s.bag_size_bytes/s.recording_elapsed)):'waiting for size samples'}`;
 $('diagnostics').textContent=JSON.stringify({network:s.network,health:s.health,processes:s.processes,errors:s.errors},null,2);
 if(!configured){for(const [k,type] of [['lidar_ip','text'],['host_ip','text'],['interface','text'],['points_topic','text'],['imu_topic','text'],['publish_freq','number'],['ros_domain_id','number']]){const label=el('label',k);const input=document.createElement('input');input.name=k;input.type=type;input.value=s.config.sensor[k];label.append(input);$('network').querySelector('.fields').append(label)}configured=true}
-await sessions();if(!previewWS||previewWS.readyState>1)connectPreview();}catch(e){error(e)}}
+await sessions();await toolsPanel();if(!previewWS||previewWS.readyState>1)connectPreview();}catch(e){error(e)}}
 async function sessions(){sessionData=await json('sessions');$('sessions').replaceChildren();for(const m of sessionData){const tr=document.createElement('tr');tr.dataset.id=m.id;if(m.id===selected)tr.className='selected';for(const text of [m.name+'\n'+m.created_at,sec(m.duration),bytes(m.bag_size_bytes),m.state,m.notes])tr.append(el('td',text));tr.onclick=()=>{selected=m.id;logKey='';sessions()};$('sessions').append(tr)}const m=sessionData.find(x=>x.id===selected);$('selected').textContent=m?.name||'None';$('selected-job').textContent=m?.name||'None';const old=$('runs').value;$('runs').replaceChildren();for(const j of m?.processing||[]){if(j){const o=el('option',`${j.id} · ${j.preset} · ${j.state}`);o.value=j.id;$('runs').append(o)}}if([...$('runs').options].some(o=>o.value===old))$('runs').value=old;else if($('runs').options.length)$('runs').selectedIndex=$('runs').options.length-1;
 $('exports').replaceChildren();for(const path of m?.exports||[]){const row=el('div',path.split('/').pop()+' ');if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b);const c=el('button','Convert PCD');c.onclick=()=>json(`sessions/${selected}/pcd?path=${encodeURIComponent(path)}`,{}).then(sessions).catch(error);row.append(c)}const d=el('button','Download');d.onclick=()=>download(path);row.append(d);$('exports').append(row)}connectLogs()}
 async function action(a){$('error').hidden=true;try{const out=await json('action',{action:a,session:selected,preset:$('preset').value,run:$('runs').value||null});if(a==='diagnose'){$('diagnostics').textContent=JSON.stringify(out,null,2);$('diagnostics').parentElement.open=true}await refresh()}catch(e){error(e)}}
@@ -38,3 +38,21 @@ function reset(){points.geometry.computeBoundingSphere();const sphere=points.geo
 $('reset').onclick=reset;$('point-size').oninput=e=>material.size=Number(e.target.value);
 new ResizeObserver(()=>{const w=$('canvas').clientWidth,h=$('canvas').clientHeight;renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix()}).observe($('canvas'));
 renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera)});if(token)refresh();let polling=false;setInterval(async()=>{if(token&&!polling){polling=true;await refresh();polling=false}},2500);
+
+async function toolsPanel(){
+ const catalog=await json('tools');$('tool-catalog').replaceChildren();
+ for(const t of catalog)$('tool-catalog').append(el('p',`${t.label}: ${t.installed?'installed':'not built'}${t.display&&!t.display_available?' · no server display':''}. ${t.features.join(' · ')}`));
+ const old=[...$('merge-inputs').selectedOptions].map(o=>o.value);$('merge-inputs').replaceChildren();
+ for(const m of sessionData)for(const r of m.processing||[])if(r?.state==='completed'&&!(m.id===selected&&r.id===$('runs').value)){
+  const option=el('option',m.name+' / '+r.id);option.value=JSON.stringify({session:m.id,run:r.id});option.selected=old.includes(option.value);$('merge-inputs').append(option);
+ }
+ $('edit-workspaces').replaceChildren();if(!selected)return;
+ for(const edit of await json(`sessions/${selected}/edits`)){
+  const row=el('div',edit.id+' · '+edit.tool+' · '+edit.state+' ');
+  const info=el('button','Show workspace');info.onclick=()=>$('tool-workspace').textContent=JSON.stringify(edit,null,2);row.append(info);
+  const exportButton=el('button','Export saved edited map');exportButton.onclick=async()=>{try{await json('action',{action:'export_edit',session:selected,run:edit.id});refresh()}catch(e){error(e)}};row.append(exportButton);
+  const log=el('button','Download tool log');log.onclick=()=>download(`edits/${edit.id}/tool.log`);row.append(log);$('edit-workspaces').append(row);
+ }
+}
+async function openTool(tool){try{const result=await json('tools/open',{session:selected,run:$('runs').value,tool,additional:tool==='offline_viewer'?[...$('merge-inputs').selectedOptions].map(o=>JSON.parse(o.value)):[]});$('tool-workspace').textContent=JSON.stringify(result,null,2);await refresh()}catch(e){error(e)}}
+$('open-viewer').onclick=()=>openTool('offline_viewer');$('open-editor').onclick=()=>openTool('map_editor');$('stop-tool').onclick=()=>{if(confirm('Stop the native tool? Save your edits in its window first; unsaved edits may be lost.'))action('tool_stop')};

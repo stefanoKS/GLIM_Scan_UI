@@ -1,5 +1,22 @@
 # Installation: Jetson and workstation
 
+## Fresh checkout
+
+This project builds on Ubuntu 22.04 with ROS 2 Humble. On a Jetson Orin Nano, use JetPack 6 and keep its supplied Ubuntu/ROS installation intact. On a workstation, install ROS 2 Humble using the [official Ubuntu instructions](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html) first. The bootstrap expects `/opt/ros/humble/setup.bash` to exist and uses the system ROS Python packages.
+
+Clone the private repository, then from its root run:
+
+```bash
+git clone https://github.com/stefanoKS/GLIM_Scan_UI.git
+cd GLIM_Scan_UI
+scripts/check_system.sh
+scripts/bootstrap_jetson.sh
+```
+
+The bootstrap installs the project build prerequisites with apt, creates `.venv`, and builds the Livox SDK/driver and GLIM stack. `scripts/fetch_dependencies.py` clones the upstream projects into ignored `external/` directories at the immutable revisions recorded in `dependencies.lock`; GLIM is therefore downloaded and installed automatically by these instructions. The resulting libraries are installed under `.local/` and ROS packages under `ros2_ws/`. No prebuilt GLIM binaries are included in Git, so each machine builds native artifacts for its own architecture. Internet access and sudo for apt are required. Builds can take a long time; set `BUILD_JOBS=1` before bootstrap on a memory-constrained machine.
+
+When bootstrap succeeds, start the UI with `scripts/run_system.sh` and open http://127.0.0.1:8080. Configure the Mid-360 network settings as described below before connecting hardware.
+
 ## Tested host
 
 This implementation pass ran on an x86_64 PC, Ubuntu 22.04.5, kernel 6.8.0-138-generic, ROS 2 Humble, approximately 15 GiB RAM. It is not a Jetson. CUDA/nvcc and JetPack were absent. System Python is 3.10.12; interactive `python3` resolves to Conda 3.13.2. The project uses a system-site-packages Python 3.10 virtual environment so `rclpy` remains compatible. See `environment_report.md` for exact outputs and `validation.md` for actual test results.
@@ -17,7 +34,9 @@ scripts/bootstrap_jetson.sh
 
 Bootstrap installs missing distribution prerequisites, builds official pinned source into project `.local`, and uses an isolated ROS workspace. It never upgrades the OS/JetPack or removes another workspace. It needs ordinary sudo for apt prerequisites. There was no passwordless sudo on the test PC; missing small development packages were downloaded from Ubuntu with apt and extracted inside `.local` instead. This local workaround did not replace system packages.
 
-The normal venv setup is `/usr/bin/python3 -m venv --system-site-packages .venv`. On this PC `python3-venv` was absent, so a local virtualenv bootstrap targeted `/usr/bin/python3`. `requirements.txt` pins application packages; `.state/python-freeze.txt` records the resolved PC environment.
+The normal venv setup is `/usr/bin/python3 -m venv --system-site-packages .venv`. On this PC `python3-venv` was absent, so a local virtualenv bootstrap targeted `/usr/bin/python3`. `requirements.txt` pins application packages; `requirements.lock` pins the resolved application and test dependencies for bootstrap.
+
+Upstream `glim_ros2` declares `cv_bridge` and `image_transport` as build dependencies even when camera support is disabled. Bootstrap installs these libraries to satisfy its unmodified manifest. Camera processing is compiled OFF; no camera driver or camera input is active.
 
 ## Build controls
 
@@ -34,3 +53,24 @@ The normal venv setup is `/usr/bin/python3 -m venv --system-site-packages .venv`
 Edit `config/livox/mid360.yaml`: LiDAR IP, assigned host IP, wired interface, topics and ROS domain. The supplied host/interface are specific to the tested PC. Configure a static Ethernet address in the same subnet on Jetson using the OS network settings. The application validates assigned addresses but does not change the OS network configuration. Preserve Wi-Fi/default-route settings.
 
 Source `scripts/env.sh` for any manual ROS commands. It selects the correct Python, ROS overlay, local library paths and local ROS logs.
+
+## Jetson acceptance checklist
+
+After a fresh native build with `BUILD_VIEWER=ON`:
+
+```bash
+scripts/verify_jetson.sh
+# Only with the sensor connected and UI stopped:
+scripts/verify_jetson.sh --hardware
+scripts/process_bag.sh SESSION_ID --preset jetson_cpu
+# For a successfully built CUDA stack:
+scripts/process_bag.sh SESSION_ID --preset jetson_gpu
+```
+
+`verify_jetson.sh` deliberately rejects x86_64. It checks ROS/Python imports, tests, prohibited architecture flags and all five official GLIM binaries. Hardware validation then records a new bag. Finish with a real walking route, multiple submaps, loop/merge acceptance, segmentation save/export, a long recording and thermal/memory observation. These cannot be established by a PC build.
+
+Use `scripts/package_for_jetson.sh` to create a source-only archive from the current commit in `.state/`. It excludes PC binaries, virtual environments, operator tokens and acquisition data. Extract on Jetson, edit its network/interface configuration, and run bootstrap natively. The Jetson acquires bags; it is not required to perform final heavy optimization.
+
+The compile-job default is 1 below ~4 GiB RAM, 2 below ~19 GiB, and 4 on larger hosts, with sequential colcon packages. Override with BUILD_JOBS when appropriate. Runtime OpenMP defaults to two threads (OMP_NUM_THREADS can override); SLAM estimation parameters remain the official baselines.
+
+CUDA setup compiles a tiny runtime probe, queries the installed GPU's compute capability, and passes the resulting SM target to CMake. This avoids compiling a desktop multi-architecture set on Jetson with older CMake. AUTO falls back to CPU if the probe is unavailable; explicit `USE_CUDA=ON` fails with a diagnostic instead. `CUDA_ARCHITECTURES` supports an intentional numeric override for controlled builds. Successful installation records capabilities in `.state/build_capabilities.json` so stale GPU library files cannot mislabel a CPU build.

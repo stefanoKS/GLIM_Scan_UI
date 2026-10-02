@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export FACTORY_MAPPING_ROOT="$ROOT"
+if [[ -z "${BUILD_JOBS:-}" ]]; then
+ BUILD_JOBS="$(awk '/MemTotal/ {print ($2 < 4500000 ? 1 : ($2 < 20000000 ? 2 : 4))}' /proc/meminfo)"
+fi
+export BUILD_JOBS
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+if [[ -x /usr/local/cuda/bin/nvcc ]]; then export PATH="/usr/local/cuda/bin:$PATH"; fi
 export PATH="$ROOT/.venv/bin:/usr/bin:/bin:$PATH"
 # ROS setup scripts are not nounset safe.
 set +u

@@ -68,3 +68,18 @@ def test_commands_have_real_upstream_arguments(root):
 
 def test_session_browser_ignores_non_directories(root):
     s=Sessions(root);(s.base/'.gitkeep').touch(); assert s.list()==[]
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_parent_exit_does_not_abandon_child(root, cancel):
+    from factory_mapping.processes import group_alive
+    async def go():
+        pm=ProcessManager(root/'.state')
+        child="import signal,time; signal.signal(signal.SIGINT,signal.SIG_IGN); time.sleep(60)"
+        parent="import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',%r]); time.sleep(.3)" % child
+        await pm.start('tree',[sys.executable,'-c',parent],root/'tree.log')
+        await asyncio.sleep(.5)
+        pid=pm.items['tree']['pid'];assert group_alive(pid);assert pm.active('tree')
+        await pm.stop('tree',.2,cancel=cancel)
+        assert not group_alive(pid) and pm.items['tree']['forced']
+        assert pm.items['tree']['state']==('cancelled' if cancel else 'failed')
+    asyncio.run(go())
