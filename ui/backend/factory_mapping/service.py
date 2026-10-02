@@ -2,7 +2,7 @@ import asyncio, json, os, shutil, sys, time, uuid
 from datetime import datetime
 from pathlib import Path
 from . import commands, glim_tools
-from .config import ROOT, PRESETS, load, validate_sensor
+from .config import ROOT, PRESETS, load, validate_sensor, wired_host_ip
 from .storage import Sessions, atomic_json, read_json, now, size
 from .processes import ProcessManager
 from .health import network, system_status
@@ -13,6 +13,7 @@ class Service:
     def __init__(self, root=ROOT, mock=False):
         self.root=root; self.mock=mock; self.config=load(root); self.sessions=Sessions(root,mock)
         self.pm=ProcessManager(root/'.state'); self.active=None; self.lock=asyncio.Lock(); self.errors=list(self.pm.recovery); self.net={}; self.closed=False
+        self.intrinsic_samples=[]
         self.record_started=None; self.rate_baseline={}; self.live_preset=None
         from .calibration import Calibrations
         self.calibrations=Calibrations(self)
@@ -54,6 +55,7 @@ class Service:
         self.event('process_start',role=key,pid=result['pid']); return result
     async def start_driver(self):
         if not self.mock:
+            self.config['sensor']['host_ip']=wired_host_ip(self.config['sensor'])
             self.net=await network(self.config['sensor'])
             if self.net['state']!='reachable': raise ValueError(self.net['action'])
         result=await self.start_process('driver',commands.driver(self.root,self.config),self.root/'.state/driver.log')
@@ -264,6 +266,7 @@ class Service:
     async def background(self):
         while not self.closed:
             try:
+                if not self.mock: await self.refresh_host_ip()
                 self.net={'state':'mock'} if self.mock else await network(self.config['sensor'])
                 if (self.pm.active('recording') or self.pm.active('calibration_record')) and shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9:
                     async with self.lock:
@@ -272,6 +275,17 @@ class Service:
                         await self.stop_session()
             except Exception as e: self.errors.append(str(e))
             await asyncio.sleep(2)
+    async def refresh_host_ip(self):
+        async with self.lock:
+            sensor=self.config['sensor']; current=wired_host_ip(sensor)
+            if current==sensor['host_ip']: return
+            was_running=self.pm.active('driver')
+            if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
+            if self.active: await self.stop_session()
+            if was_running: await self.stop_driver()
+            previous=sensor['host_ip']; sensor['host_ip']=current
+            self.event('host_ip_changed',previous=previous,current=current)
+            if was_running and current: await self.start_driver()
     async def close(self):
         self.closed=True
         if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
@@ -308,7 +322,7 @@ class Service:
             args=commands.camera(self.root,self.config)
             await check_camera_dependencies(self.config['camera'])
         else:args=[]
-        for name in ('camera_health.json','camera_preview.jpg'):(self.root/'.state'/name).unlink(missing_ok=True)
+        for name in ('camera_health.json','camera_preview.jpg','camera_calibration_frame.jpg'):(self.root/'.state'/name).unlink(missing_ok=True)
         result=await self.start_process('camera',args,self.root/'.state/camera.log')
         if not self.mock:
             for role in ('camera_monitor','camera_preview'):

@@ -23,9 +23,9 @@ class CameraMetrics:
     def info(self,width,height,k,distortion,model,frame):
         self.info_seen=True;self.info_time=time.monotonic();self.info_valid=False
         try:
-            k=finite_vector(list(k),9);finite_vector(list(distortion))
+            k=finite_vector([float(value) for value in k],9);finite_vector([float(value) for value in distortion])
             self.info_valid=(width==self.config['width'] and height==self.config['height'] and frame==self.config['frame_id'] and k[0]>0 and k[4]>0 and abs(k[8]-1)<1e-6 and model in ('plumb_bob','equidistant','fisheye','omnidir') and len(distortion)==(5 if model=='plumb_bob' else 4))
-        except ValueError:pass
+        except (TypeError,ValueError):pass
     def view(self):
         r=self.rate.view();expected=self.config['expected_hz']
         healthy=expected*.7<=r['hz']<=expected*1.3 and (self.width,self.height)==(self.config['width'],self.config['height']) and self.frame_id==self.config['frame_id']

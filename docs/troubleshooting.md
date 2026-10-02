@@ -1,6 +1,6 @@
 # Troubleshooting
 
-- **Ethernet missing**: select the correct wired interface. **Host IP missing**: configure an address with the OS or change project host_ip to the assigned address. **Unreachable**: check power, cable and subnet; ICMP may be filtered.
+- **Ethernet missing**: select the correct wired interface. **Host IP missing**: assign an IPv4 address on that interface in the LiDAR subnet using OS network settings; the app detects it automatically. **Unreachable**: check power, cable and subnet; ICMP may be filtered.
 - **Driver stopped/failed**: inspect its process state and `.state/driver.log` or the session's `logs/driver.log`. **Topic missing**: verify ROS_DOMAIN_ID, remappings and PointCloud2 xfer_format. **Topic exists/no messages**: check UDP destination IP, firewall, device state and sensor power. **Abnormal rate**: inspect CPU load, DDS loss, Ethernet packets and publish frequency; expected defaults are 10 Hz cloud/200 Hz IMU.
 - **ROS Python import errors**: source `scripts/env.sh`, use `.venv/bin/python` based on `/usr/bin/python3`, not Conda Python. Do not pip-install a replacement rclpy.
 - **GPU preset fails**: this test PC has no CUDA. Use jetson_cpu, or build the CUDA stack on a compatible host.

@@ -1,13 +1,12 @@
 lidar_ip: 192.168.1.120
-host_ip: 192.168.1.135
-interface: enp6s0
+interface: enP8p1s0
 points_topic: /livox/lidar
 imu_topic: /livox/imu
 frame_id: livox_frame
 imu_frame_id: livox_frame
 publish_freq: 10.0
 expected_imu_hz: 200.0
-ros_domain_id: 0
+ros_domain_id: 41
 serial_number: null
 # Translation from IMU to LiDAR. Verify against device documentation before mapping.
 T_lidar_imu: [0.011, 0.02329, -0.04412, 0, 0, 0, 1]

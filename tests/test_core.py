@@ -1,7 +1,8 @@
-import asyncio, json, os, signal, sys, time
+import asyncio, json, os, signal, socket, sys, time
+from types import SimpleNamespace
 import numpy as np
 import pytest
-from factory_mapping.config import load, validate_sensor
+from factory_mapping.config import load, validate_sensor, wired_host_ip
 from factory_mapping.storage import Sessions, read_json
 from factory_mapping.processes import ProcessManager
 from factory_mapping.preview import encode, decode
@@ -12,6 +13,15 @@ def test_configuration(root):
     c=load(root); assert c['sensor']['points_topic']=='/livox/lidar'
     c['sensor']['lidar_ip']='$(reboot)'
     with pytest.raises(ValueError): validate_sensor(c['sensor'])
+
+def test_wired_host_ip_uses_matching_subnet(monkeypatch):
+    addresses=[SimpleNamespace(family=socket.AF_INET,address='10.0.0.2',netmask='255.255.255.0'),
+               SimpleNamespace(family=socket.AF_INET,address='192.168.1.240',netmask='255.255.255.0')]
+    monkeypatch.setattr('factory_mapping.config.psutil.net_if_addrs',lambda:{'enP8p1s0':addresses})
+    sensor={'interface':'enP8p1s0','lidar_ip':'192.168.1.120'}
+    assert wired_host_ip(sensor)=='192.168.1.240'
+    sensor['interface']='missing'
+    assert wired_host_ip(sensor) is None
 
 def test_session_snapshot_and_raw_protection(root):
     s=Sessions(root); a=s.create('factory / zone','hello',load(root)); b=s.create('factory / zone','other',load(root))

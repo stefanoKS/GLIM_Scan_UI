@@ -4,7 +4,7 @@ preset: jetson_cpu
 loop_closure:
   enabled: false
 preview:
-  hz: 3
+  hz: 5
   max_points: 50000
   voxel_size: 0.10
 storage:

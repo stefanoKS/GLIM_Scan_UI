@@ -74,14 +74,16 @@ No fake matrices are shipped. The canonical intrinsic YAML is initially a missin
 
 Supported models are plumb_bob with five distortion terms, equidistant/fisheye with four, and omnidir with four plus a measured `xi` extension. Intrinsic files must contain K, R, P, distortion, image_width and image_height. Geometry must match configured acquisition. Omnidir's xi is passed explicitly to preprocessing because standard CameraInfo does not carry it. Unknown models are rejected rather than guessed.
 
-For obtaining an intrinsic file, ROS's optional `camera_calibration` package can be used separately. With a measured checkerboard, supply its actual internal-corner count and square size, for example the command pattern below (replace all placeholders):
+For browser-based camera intrinsics, open **Calibrate camera intrinsics** from the camera panel (or `/intrinsics.html`). Download the 24 × 16 ChArUco board with `DICT_4X4_250`, 25 mm squares and 20 mm markers. Print at 600 × 400 mm and measure a square with a ruler; printing at "fit to page" without matching the physical size produces an incorrect calibration. With the camera running at its configured resolution, capture at least eight distinct views with the board at different angles and positions, then choose **Calibrate & save**. The server detects corners in full-resolution frames, rejects duplicate poses and high reprojection error, and saves a ROS `plumb_bob` calibration at the configured `intrinsics_file`. The running camera is restarted to publish the new CameraInfo. Previous intrinsic files are archived, and any existing LiDAR–camera extrinsic is marked unvalidated because it was tied to the old intrinsic parameters. **Delete intrinsics** archives and replaces the active file with a missing-calibration marker, then restarts the camera. Neither change is allowed during recording or calibration jobs. Recheck intrinsics after changing lens, focus, crop, or resolution; camera intrinsics do not estimate LiDAR–camera extrinsics or timing offset.
+
+Alternatively, ROS's optional `camera_calibration` package can generate an intrinsic file separately. With a measured checkerboard, supply its actual internal-corner count and square size, for example the command pattern below (replace all placeholders):
 
 ```bash
 ros2 run camera_calibration cameracalibrator --size COLSxROWS --square METRES \
   --ros-args -r image:=/camera/image_raw -r camera:=/camera
 ```
 
-Save/export its YAML and import it here. Interactive intrinsic calibration is not a backend dependency or a ChArUco implementation. Revalidate resolution, focus and lens before collecting extrinsics.
+Save/export its YAML and import it here. Revalidate resolution, focus and lens before collecting extrinsics.
 
 ## Calibration datasets and state
 

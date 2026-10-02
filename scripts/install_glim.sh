@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
 source "$(dirname "$0")/env.sh"
-"$ROOT/.venv/bin/python" "$ROOT/scripts/fetch_dependencies.py"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/fetch_dependencies.py" --only gtsam glim iridescence glim_ros2 gtsam_points
 # Query the installed runtime/device rather than compiling desktop SM targets.
 REQUESTED_CUDA="${USE_CUDA:-AUTO}"
 CUDA_ARGS=()

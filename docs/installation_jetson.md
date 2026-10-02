@@ -50,7 +50,7 @@ Upstream `glim_ros2` declares `cv_bridge` and `image_transport` as build depende
 
 ## Network setup
 
-Edit `config/livox/mid360.yaml`: LiDAR IP, assigned host IP, wired interface, topics and ROS domain. The supplied host/interface are specific to the tested PC. Configure a static Ethernet address in the same subnet on Jetson using the OS network settings. The application validates assigned addresses but does not change the OS network configuration. Preserve Wi-Fi/default-route settings.
+Edit `config/livox/mid360.yaml`: LiDAR IP, wired interface, topics and ROS domain. The host IP is detected from the configured Ethernet interface on the LiDAR subnet; do not put it in the YAML. Assign an Ethernet address in that subnet using the OS network settings. If it changes while running, the app finalizes any active recording, restarts the sensor driver and shows the new address. The app does not change OS network configuration. Preserve Wi-Fi/default-route settings.
 
 Source `scripts/env.sh` for any manual ROS commands. It selects the correct Python, ROS overlay, local library paths and local ROS logs.
 

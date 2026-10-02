@@ -4,8 +4,11 @@ import time
 import asyncio
 import pytest
 import yaml
+import cv2
+import numpy as np
 from factory_mapping.config import load
 from factory_mapping.camera_config import validate_camera
+from factory_mapping.camera_intrinsics import board, add_view, calibrate, detect, printable_board
 from factory_mapping import commands
 
 
@@ -23,6 +26,75 @@ def test_disabled_camera_needs_no_calibration_or_hardware(root):
 def test_camera_configuration(root):
     c=enable(root)
     assert c['camera']['image_topic']=='/camera/image_raw'
+
+
+def test_charuco_board_capture_and_solver(root):
+    image=cv2.imdecode(np.frombuffer(printable_board(),np.uint8),cv2.IMREAD_COLOR)
+    if hasattr(cv2.aruco,'CharucoDetector'):
+        assert len(detect(image)[1])>100
+        views=[]
+        add_view(views,image,1)
+        with pytest.raises(ValueError,match='new camera frame'):add_view(views,image,1)
+        with pytest.raises(ValueError,match='Move or rotate'):add_view(views,image,2)
+    points=board().getChessboardCorners()
+    matrix=np.array([[630.,0,360.],[0,635.,270.],[0,0,1.]])
+    samples=[]
+    for index in range(9):
+        projected,_=cv2.projectPoints(points,np.array([.08*index,.04*(index%3),-.03*index]),
+                                      np.array([-.3+.015*index,-.2+.013*index,1.1+.04*index]),matrix,np.zeros(5))
+        samples.append(dict(ids=np.arange(len(points)),corners=projected.reshape(-1,2).astype(np.float32),size=(720,540)))
+    with pytest.raises(ValueError,match='at least 8'):calibrate(samples[:7],load(root)['camera'])
+    measured,quality=calibrate(samples,load(root)['camera'])
+    assert quality['rms']<.01
+    assert abs(measured['camera_matrix']['data'][0]-630)<1
+
+
+def test_intrinsic_browser_capture_save_and_delete(root,monkeypatch):
+    from fastapi.testclient import TestClient
+    from factory_mapping.api import make_app
+    from factory_mapping.calibration_data import intrinsics_status
+    enable(root)
+    with TestClient(make_app(root,True)) as client:
+        assert client.get('/api/camera/intrinsics/board').headers['content-type']=='image/png'
+        assert client.get('/api/camera/intrinsics/views').json()['views']==0
+        assert client.post('/api/camera/intrinsics/views').status_code==409
+        assert client.post('/api/action',json={'action':'camera_start'}).status_code==200
+        service=client.app.state.service
+        original_active=service.pm.active
+        monkeypatch.setattr(service.pm,'active',lambda key:key=='camera_preview' or original_active(key))
+        image=board().generateImage((690,460),marginSize=0) if hasattr(board(),'generateImage') else board().draw((690,460),marginSize=0)
+        image=cv2.copyMakeBorder(image,40,40,15,15,cv2.BORDER_CONSTANT,value=255)
+        success,encoded=cv2.imencode('.jpg',image)
+        assert success
+        (root/'.state/camera_calibration_frame.jpg').write_bytes(encoded.tobytes())
+        if hasattr(cv2.aruco,'CharucoDetector'):
+            captured=client.post('/api/camera/intrinsics/views')
+            assert captured.status_code==200,captured.text
+            assert captured.json()['corners']>=12
+            assert client.post('/api/camera/intrinsics/views').status_code==409
+        assert client.delete('/api/camera/intrinsics/views').json()['views']==0
+        points=board().getChessboardCorners();matrix=np.array([[630.,0,360.],[0,635.,270.],[0,0,1.]])
+        for index in range(9):
+            projected,_=cv2.projectPoints(points,np.array([.08*index,.04*(index%3),-.03*index]),
+                                          np.array([-.3+.015*index,-.2+.013*index,1.1+.04*index]),matrix,np.zeros(5))
+            service.intrinsic_samples.append(dict(ids=np.arange(len(points)),corners=projected.reshape(-1,2).astype(np.float32),size=(720,540)))
+        previous_pid=service.pm.items['camera']['pid']
+        result=client.post('/api/camera/intrinsics/calibrate')
+        assert result.status_code==200,result.text
+        assert result.json()['intrinsics']['status']=='VALID'
+        assert result.json()['quality']['rms']<.01
+        assert service.pm.items['camera']['pid']!=previous_pid
+        assert client.get('/api/camera/intrinsics/views').json()['views']==0
+        assert intrinsics_status(root,service.config['camera'])['status']=='VALID'
+        session=client.post('/api/sessions',json={'name':'busy'}).json()
+        assert client.post('/api/action',json={'action':'record_start','session':session['id']}).status_code==200
+        assert client.delete('/api/camera/intrinsics').status_code==409
+        assert client.post('/api/action',json={'action':'session_stop'}).status_code==200
+        deleted=client.delete('/api/camera/intrinsics')
+        assert deleted.status_code==200,deleted.text
+        assert deleted.json()['intrinsics']['status']=='MISSING'
+        assert list((root/'config/calibration/history').glob('*camera_intrinsics.yaml'))
+        assert service.pm.active('camera')
 
 
 @pytest.mark.parametrize('key,value',[('image_topic','/bad;touch'),('camera_info_topic','/camera/image_raw'),('width',0),('height',True),('fps',-1),('fps',float('nan')),('time_offset_sec',float('inf')),('frame_id','bad frame'),('preview_hz',20),('driver','shell'),('intrinsics_file','../other')])
@@ -67,6 +139,8 @@ def test_camera_metrics_reject_zero_info(root):
     m.info(c['width'],c['height'],[0]*9,[0]*5,'plumb_bob',c['frame_id'])
     m.image(time.time(),c['width'],c['height'],c['frame_id'])
     assert m.view()['camera_info_seen'] and not m.view()['camera_info_valid']
+    m.info(c['width'],c['height'],np.array([800,0,c['width']/2,0,800,c['height']/2,0,0,1],dtype=np.float64),[0.]*5,'plumb_bob',c['frame_id'])
+    assert m.view()['camera_info_valid']
     json.dumps(m.view(),allow_nan=False)
 
 

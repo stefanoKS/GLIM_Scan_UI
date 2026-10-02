@@ -2,6 +2,7 @@
 import hashlib
 import json
 import math
+import shutil
 import uuid
 from pathlib import Path
 import yaml
@@ -93,3 +94,14 @@ def camera_metadata(root,config):
 def atomic_yaml(path,obj):
     path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
     tmp.write_text(yaml.safe_dump(obj,sort_keys=False));tmp.replace(path)
+
+
+def replace_intrinsics(root,camera,obj):
+    target=config_path(root,camera['intrinsics_file'])
+    if target.exists():
+        history=target.parent/'history';history.mkdir(exist_ok=True);shutil.copy2(target,history/(uuid.uuid4().hex+'_'+target.name))
+    atomic_yaml(target,obj)
+    ext=config_path(root,camera['extrinsics_file'])
+    if ext.exists():
+        history=ext.parent/'history';history.mkdir(exist_ok=True);shutil.copy2(ext,history/(uuid.uuid4().hex+'_'+ext.name))
+        atomic_yaml(ext,{'version':1,'calibrated':False,'validated':False,'reason':'Intrinsics changed; previous result retained in history and source dataset'})

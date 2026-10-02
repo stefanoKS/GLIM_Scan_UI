@@ -165,7 +165,7 @@ Create:
 containing at minimum configurable:
 
 LiDAR IP
-Jetson host IP
+Jetson wired interface (detect its host IP on the LiDAR subnet at runtime)
 PointCloud2 topic
 IMU topic
 frame IDs

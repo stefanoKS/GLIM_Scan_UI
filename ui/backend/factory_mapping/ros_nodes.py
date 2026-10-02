@@ -69,6 +69,9 @@ def run_camera(kind):
         last[0]=t
         try:
             rgb=bridge.imgmsg_to_cv2(m,desired_encoding='bgr8')
+            ok,full=cv2.imencode('.jpg',rgb,[cv2.IMWRITE_JPEG_QUALITY,95])
+            if not ok:raise ValueError('Calibration frame encoding failed')
+            calibration=ROOT/'.state/camera_calibration_frame.jpg';temp=calibration.with_suffix('.tmp');temp.write_bytes(full.tobytes());temp.replace(calibration)
             scale=min(1,c['preview_max_width']/rgb.shape[1]);rgb=cv2.resize(rgb,(max(1,int(rgb.shape[1]*scale)),max(1,int(rgb.shape[0]*scale))))
             ok,encoded=cv2.imencode('.jpg',rgb,[cv2.IMWRITE_JPEG_QUALITY,75])
             if not ok:raise ValueError('JPEG encoding failed')

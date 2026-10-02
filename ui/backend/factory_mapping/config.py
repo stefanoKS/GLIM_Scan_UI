@@ -1,5 +1,6 @@
 from pathlib import Path
-import ipaddress, os, re, math, json
+import ipaddress, os, re, math, json, socket
+import psutil
 import yaml
 from .camera_config import validate_camera, config_path
 
@@ -15,6 +16,7 @@ def load(root=ROOT):
         system['camera']['enabled']=enabled
     sensor = yaml.safe_load((root/'config/livox/mid360.yaml').read_text())
     validate_sensor(sensor)
+    sensor['host_ip'] = wired_host_ip(sensor)
     if not 0 <= system.get('offline_ros_domain_id',230) <= 232 or system.get('offline_ros_domain_id',230)==sensor['ros_domain_id']: raise ValueError('Offline ROS domain must be valid and different from acquisition')
     if system['preset'] not in PRESETS: raise ValueError('Unknown GLIM preset')
     if system['loop_closure']['enabled'] not in (False, 'scan_context'): raise ValueError('Invalid loop closure mode')
@@ -32,8 +34,14 @@ def load(root=ROOT):
     elif system['camera']['enabled']: raise ValueError('Camera configuration is missing')
     return result
 
+def wired_host_ip(sensor):
+    lidar_ip=ipaddress.IPv4Address(sensor['lidar_ip'])
+    addresses=psutil.net_if_addrs().get(sensor['interface'],[])
+    matches=[address.address for address in addresses if address.family==socket.AF_INET and address.netmask and lidar_ip in ipaddress.IPv4Network(f'{address.address}/{address.netmask}',strict=False)]
+    return matches[0] if len(matches)==1 else None
+
 def validate_sensor(s):
-    for key in ('lidar_ip', 'host_ip'): ipaddress.IPv4Address(s[key])
+    ipaddress.IPv4Address(s['lidar_ip'])
     if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,32}', s['interface']): raise ValueError('Invalid interface')
     for key in ('points_topic', 'imu_topic'):
         if not re.fullmatch(r'/[A-Za-z_][A-Za-z0-9_/]*', s[key]): raise ValueError('Invalid ROS topic')

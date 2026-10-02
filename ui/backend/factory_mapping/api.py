@@ -1,10 +1,11 @@
-import asyncio, contextlib, fcntl, json, os, time
+import asyncio, contextlib, fcntl, json, os, shutil, tempfile, time, zipfile
 from pathlib import Path
 from contextlib import asynccontextmanager
 import numpy as np
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, ConfigDict
 from .config import ROOT, validate_sensor
 from .service import Service
@@ -15,7 +16,7 @@ from .quality import quality, ply_stats, ply_to_pcd
 
 class Create(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    name: str=Field(min_length=1,max_length=100)
+    name: str=Field(default='',max_length=100)
     notes: str=Field(default='',max_length=4000)
 class Action(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -47,7 +48,6 @@ class CalibrationAction(BaseModel):
 class Network(BaseModel):
     model_config=ConfigDict(extra='forbid')
     lidar_ip: str
-    host_ip: str
     interface: str
     points_topic: str
     imu_topic: str
@@ -100,6 +100,38 @@ def make_app(root=ROOT,mock=None):
         return Response(await asyncio.to_thread(p.read_bytes),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
+    def project_transfer_ready(service):
+        if service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')):
+            raise ValueError('Stop recording and processing before transferring a project')
+    @app.get('/api/sessions/{sid}/project')
+    async def export_project(sid:str):
+        s=app.state.service
+        async with s.lock:
+            project_transfer_ready(s)
+            s.sessions.get(sid)
+            descriptor,path=tempfile.mkstemp(prefix='project-export-',suffix='.zip',dir=state)
+            os.close(descriptor)
+            try:await asyncio.to_thread(s.sessions.export_archive,sid,path)
+            except Exception:
+                Path(path).unlink(missing_ok=True)
+                raise
+        return FileResponse(path,filename=sid+'.fmproject.zip',media_type='application/zip',background=BackgroundTask(Path(path).unlink,missing_ok=True))
+    @app.post('/api/projects/import')
+    async def import_project(request:Request):
+        if request.headers.get('content-type','').split(';')[0].strip()!='application/zip':raise ValueError('Select a project ZIP archive')
+        descriptor,path=tempfile.mkstemp(prefix='project-import-',suffix='.zip',dir=state)
+        try:
+            with os.fdopen(descriptor,'wb') as output:
+                async for chunk in request.stream():
+                    if len(chunk)>shutil.disk_usage(state).free-1024**3:raise ValueError('Insufficient disk space for project upload')
+                    await asyncio.to_thread(output.write,chunk)
+            s=app.state.service
+            async with s.lock:
+                project_transfer_ready(s)
+                return await asyncio.to_thread(s.sessions.import_archive,path)
+        except (zipfile.BadZipFile,zipfile.LargeZipFile) as error:
+            raise ValueError('Invalid project ZIP archive') from error
+        finally:Path(path).unlink(missing_ok=True)
     @app.post('/api/sessions')
     async def create(body:Create):
         s=app.state.service
@@ -146,34 +178,94 @@ def make_app(root=ROOT,mock=None):
         async with s.lock:
             if any(s.pm.active(k) for k in s.pm.items) or s.active: raise ValueError('Stop all processes and the active session before changing network settings')
             sensor={**s.config['sensor'],**body.model_dump()}; validate_sensor(sensor)
+            from .config import wired_host_ip
+            sensor['host_ip']=wired_host_ip(sensor)
             if s.config.get('camera'):
                 from .camera_config import validate_camera
                 validate_camera(s.config['camera'],sensor)
             if sensor['ros_domain_id']==s.config['system'].get('offline_ros_domain_id',230): raise ValueError('Acquisition and offline ROS domains must differ')
             import yaml
-            p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump(sensor,sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor
+            p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump({key:value for key,value in sensor.items() if key!='host_ip'},sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor
             s.event('network_config_updated'); return {'ok':True}
     @app.post('/api/camera/intrinsics')
     async def import_intrinsics(body:IntrinsicsImport):
-        import yaml,shutil,uuid
-        from .calibration_data import parse_intrinsics,atomic_yaml
-        from .camera_config import config_path
+        import yaml
+        from .calibration_data import parse_intrinsics,replace_intrinsics
         s=app.state.service
         async with s.lock:
             if s.active or any(s.pm.active(k) for k in s.pm.items): raise ValueError('Stop active processes before replacing intrinsics')
             if not s.config.get('camera'):raise ValueError('Camera configuration is missing')
             try:obj=yaml.safe_load(body.yaml_text);parse_intrinsics(obj,s.config['camera'])
             except (yaml.YAMLError,TypeError,AttributeError) as e:raise ValueError('Invalid ROS intrinsic calibration YAML') from e
-            target=config_path(root,s.config['camera']['intrinsics_file'])
-            if target.exists():
-                history=target.parent/'history';history.mkdir(exist_ok=True);shutil.copy2(target,history/(uuid.uuid4().hex+'_'+target.name))
-            atomic_yaml(target,obj)
-            # A new intrinsic model invalidates the active extrinsic association.
-            ext=config_path(root,s.config['camera']['extrinsics_file'])
-            if ext.exists():
-                history=ext.parent/'history';history.mkdir(exist_ok=True);shutil.copy2(ext,history/(uuid.uuid4().hex+'_'+ext.name))
-                atomic_yaml(ext,{'version':1,'calibrated':False,'validated':False,'reason':'Intrinsics changed; previous result retained in history and source dataset'})
+            replace_intrinsics(root,s.config['camera'],obj)
             return s.camera_calibration()
+
+    @app.get('/api/camera/intrinsics/board')
+    async def intrinsic_board():
+        from .camera_intrinsics import printable_board
+        image=await asyncio.to_thread(printable_board)
+        return Response(image,media_type='image/png',headers={'Content-Disposition':'attachment; filename="charuco_24x16.png"'})
+
+    @app.get('/api/camera/intrinsics/views')
+    async def intrinsic_views():
+        from .camera_intrinsics import MIN_VIEWS
+        s=app.state.service
+        return dict(views=len(s.intrinsic_samples),required=MIN_VIEWS,intrinsics=s.camera_calibration()['intrinsics'])
+
+    @app.delete('/api/camera/intrinsics/views')
+    async def clear_intrinsic_views():
+        s=app.state.service
+        async with s.lock:
+            s.intrinsic_samples.clear()
+            return {'views':0}
+
+    @app.post('/api/camera/intrinsics/views')
+    async def capture_intrinsic_view():
+        import cv2
+        from .camera_intrinsics import add_view
+        s=app.state.service
+        async with s.lock:
+            if not s.pm.active('camera') or not s.camera_health()['healthy'] or not s.pm.active('camera_preview'):
+                raise ValueError('Start the camera and wait for healthy image frames')
+            path=root/'.state/camera_calibration_frame.jpg'
+            if not path.is_file() or time.time()-path.stat().st_mtime>2 or path.stat().st_size>16_000_000:
+                raise ValueError('Full-resolution camera frame is unavailable or stale')
+            frame_id=path.stat().st_mtime_ns
+            image=cv2.imdecode(np.frombuffer(path.read_bytes(),np.uint8),cv2.IMREAD_COLOR)
+            if image is None:raise ValueError('Could not decode camera frame')
+            if (image.shape[1],image.shape[0]) != (s.config['camera']['width'],s.config['camera']['height']):
+                raise ValueError('Camera resolution differs from configured calibration geometry')
+            return await asyncio.to_thread(add_view,s.intrinsic_samples,image,frame_id)
+
+    async def apply_intrinsics(service,obj):
+        from .calibration_data import replace_intrinsics
+        running=service.pm.active('camera')
+        if running:await service.stop_camera()
+        replace_intrinsics(root,service.config['camera'],obj)
+        service.intrinsic_samples.clear()
+        if running:await service.start_camera()
+        return service.camera_calibration()
+
+    def intrinsic_change_allowed(service):
+        if service.active or any(service.pm.active(key) for key in ('recording','glim','calibration_record','calibration_tool','offline','export')):
+            raise ValueError('Stop recording and calibration jobs before changing camera intrinsics')
+
+    @app.post('/api/camera/intrinsics/calibrate')
+    async def calibrate_intrinsics():
+        from .camera_intrinsics import calibrate
+        s=app.state.service
+        async with s.lock:
+            intrinsic_change_allowed(s)
+            obj,quality=await asyncio.to_thread(calibrate,s.intrinsic_samples,s.config['camera'])
+            return dict(**(await apply_intrinsics(s,obj)),quality=quality)
+
+    @app.delete('/api/camera/intrinsics')
+    async def delete_intrinsics():
+        s=app.state.service
+        async with s.lock:
+            intrinsic_change_allowed(s)
+            if s.camera_calibration()['intrinsics']['status']=='MISSING':raise ValueError('No camera intrinsics to delete')
+            return await apply_intrinsics(s,{'calibrated':False})
     @app.get('/api/calibrations')
     async def calibrations():return await asyncio.to_thread(app.state.service.calibrations.list)
     @app.post('/api/calibrations')

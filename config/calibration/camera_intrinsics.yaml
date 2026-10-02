@@ -1,2 +1,55 @@
-# Replace by an actual ROS camera_calibration YAML. No invented matrices.
-calibrated: false
+image_width: 720
+image_height: 540
+camera_name: factory_rgb
+distortion_model: plumb_bob
+camera_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 950.771382776674
+  - 0.0
+  - 373.5527392658851
+  - 0.0
+  - 948.3958792082391
+  - 289.4897294479018
+  - 0.0
+  - 0.0
+  - 1.0
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data:
+  - -0.474462753631642
+  - 0.825926482650803
+  - 0.0013342157255760913
+  - -0.0018504306124340186
+  - -1.5242599284457163
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+  - 950.771382776674
+  - 0.0
+  - 373.5527392658851
+  - 0.0
+  - 0.0
+  - 948.3958792082391
+  - 289.4897294479018
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0

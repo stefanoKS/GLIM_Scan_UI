@@ -28,7 +28,7 @@ def system_status(root):
 async def network(sensor):
     interfaces=psutil.net_if_addrs()
     if sensor['interface'] not in interfaces: return dict(state='ethernet_missing',action='Select the wired interface in network configuration')
-    if sensor['host_ip'] not in [a.address for a in interfaces[sensor['interface']]]: return dict(state='host_ip_missing',action='Set host_ip to an address assigned to the selected interface')
+    if not sensor['host_ip'] or sensor['host_ip'] not in [a.address for a in interfaces[sensor['interface']]]: return dict(state='host_ip_missing',action='Assign a wired IPv4 address on the same subnet as the Mid-360')
     p=await asyncio.create_subprocess_exec('ping','-I',sensor['interface'],'-c','1','-W','1',sensor['lidar_ip'],stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
     await p.wait()
     return dict(state='reachable' if p.returncode==0 else 'unreachable',action=None if p.returncode==0 else 'Check Mid-360 power, Ethernet cable, subnet and LiDAR IP; ICMP alone does not prove message health')

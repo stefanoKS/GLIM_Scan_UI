@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera intrinsics | Factory Mapping</title>
+<link rel="stylesheet" href="/style.css"><script type="module" src="/intrinsics.js"></script>
+</head>
+<body class="intrinsics-page">
+<header><div><a class="back-link" href="/">&#8592; Factory Mapping</a><h1>Camera intrinsics</h1></div><span id="camera-state">Checking camera</span></header>
+<main>
+<section class="intrinsics-toolbar" aria-label="Calibration actions">
+<div><strong>DFK 33UX287</strong><span id="resolution">720 × 540</span></div>
+<div class="intrinsics-actions"><button id="start-camera">Start camera</button><button id="capture" class="primary">Capture view</button><button id="reset-views">Reset views</button><button id="calibrate">Calibrate &amp; save</button><button id="delete-intrinsics">Delete intrinsics</button></div>
+</section>
+<div id="intrinsics-error" role="alert" hidden></div>
+<div class="intrinsics-layout">
+<section class="intrinsics-feed"><div class="bar"><h2>Live camera</h2><span id="view-count">0 / 8 views</span></div><div class="intrinsics-image"><img id="intrinsics-preview" alt="Live camera view of ChArUco board" hidden><span id="preview-state">Waiting for image</span></div><p id="capture-feedback" aria-live="polite"></p></section>
+<aside class="intrinsics-side"><section><h2>ChArUco board</h2><a class="board-download" href="/api/camera/intrinsics/board" download="charuco_24x16.png"><img src="/api/camera/intrinsics/board" alt="24 by 16 ChArUco board"></a><dl><div><dt>Dictionary</dt><dd>4×4 / 250</dd></div><div><dt>Squares</dt><dd>24 × 16</dd></div><div><dt>Square</dt><dd>25 mm</dd></div><div><dt>Marker</dt><dd>20 mm</dd></div></dl><p>Print the board at 600 × 400 mm and verify a square measures 25 mm. Capture different positions and angles in the live camera.</p><a href="/api/camera/intrinsics/board" download="charuco_24x16.png">Download board PNG</a></section><section><h2>Saved intrinsics</h2><pre id="intrinsics-result">Checking saved calibration</pre><p id="calibration-quality"></p></section></aside>
+</div>
+</main>
+</body>
+</html>

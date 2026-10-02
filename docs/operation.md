@@ -3,7 +3,7 @@
 1. Power the Mid-360 and connect Ethernet. Ensure host and sensor addresses share a subnet.
 2. Start `scripts/run_system.sh` and open http://127.0.0.1:8080.
 3. Start Mid-360. Verify **both** LiDAR and IMU rates, latest timestamps, network state and driver status. A process alone is not a connection test.
-4. Create a named session and enter notes. Start Record-only Session automatically starts the sensor and records LiDAR + IMU without launching GLIM. Use Start Recording + GLIM for live mapping as well. The separate Start Recording button remains available after manually starting the sensor. CPU is the preset for this test PC.
+4. Create a session (leave the name blank for a date-time name) and enter notes. Start Record-only Session automatically starts the sensor and records LiDAR + IMU without launching GLIM. Use Start Recording + GLIM for live mapping as well. The separate Start Recording button remains available after manually starting the sensor. CPU is the preset for this test PC.
 5. Walk slowly, avoid violent rotations, keep the sensor unobstructed, revisit locations and return near the start. Prefer several overlapping factory zones over a single enormous recording.
 6. Stop Session. Wait for rosbag metadata and GLIM dump finalization before powering off. Stopping recording separately leaves live GLIM active until Stop GLIM/Stop Session.
 7. Select a session, choose a preset, and Process/Reprocess. Watch the processing log. Each attempt gets a separate run directory and state.
@@ -12,7 +12,9 @@
 
 The live browser preview is raw LiDAR in its sensor frame, not a moving optimized world map. A preview is intentionally downsampled; archived bags remain full data. GLIM itself applies its normal estimation filtering, so the optimized export is not a replacement for the raw bag.
 
-Copy a **completed entire session directory** to the workstation's `data/sessions/` to process locally. Preserve `metadata.json`, `active_config.json`, and `config_snapshot/`. The same ROS distribution/storage plugin must be able to read its raw bag. The application never mutates a bag during processing. No raw-bag deletion endpoint exists. Delete Derived Run only removes the selected generated run after processing has stopped.
+To move a mapping project to a workstation, stop its session and any processing, select it under **Sessions**, and choose **Export selected**. The downloaded `.fmproject.zip` contains the entire session directory: raw bag, GLIM dump and processing runs, map exports, logs, `metadata.json`, `active_config.json`, and `config_snapshot/` (including the intrinsics/extrinsics and GLIM presets captured for that session). On a server running this application, choose **Project ZIP** and **Import project**. The manifest verifies file sizes and SHA-256 hashes before importing into `data/sessions/`; an existing session ID is never overwritten. Importing does not change the workstation's live camera, LiDAR, ROS domain, or network settings. The target still needs compatible ROS 2/rosbag storage and GLIM installed to process a raw bag. Archives are not a way to move binaries between architectures. Dedicated calibration datasets under `data/calibrations/` are not part of a mapping session project; copy those separately if their history is needed.
+
+Alternatively, copy a **completed entire session directory** to the workstation's `data/sessions/` manually. Preserve `metadata.json`, `active_config.json`, and `config_snapshot/`. The application never mutates a bag during processing. No raw-bag deletion endpoint exists. Delete Derived Run only removes the selected generated run after processing has stopped.
 
 Terminal manual commands:
 

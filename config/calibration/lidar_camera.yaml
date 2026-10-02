@@ -1,5 +1,4 @@
 version: 1
 calibrated: false
 validated: false
-# Convention: p_lidar = T_lidar_camera * p_camera
-# No transform exists until a real calibration result is imported.
+reason: Intrinsics changed; previous result retained in history and source dataset
