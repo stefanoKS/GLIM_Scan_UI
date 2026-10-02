@@ -74,3 +74,17 @@ Use `scripts/package_for_jetson.sh` to create a source-only archive from the cur
 The compile-job default is 1 below ~4 GiB RAM, 2 below ~19 GiB, and 4 on larger hosts, with sequential colcon packages. Override with BUILD_JOBS when appropriate. Runtime OpenMP defaults to two threads (OMP_NUM_THREADS can override); SLAM estimation parameters remain the official baselines.
 
 CUDA setup compiles a tiny runtime probe, queries the installed GPU's compute capability, and passes the resulting SM target to CMake. This avoids compiling a desktop multi-architecture set on Jetson with older CMake. AUTO falls back to CPU if the probe is unavailable; explicit `USE_CUDA=ON` fails with a diagnostic instead. `CUDA_ARCHITECTURES` supports an intentional numeric override for controlled builds. Successful installation records capabilities in `.state/build_capabilities.json` so stale GPU library files cannot mislabel a CPU build.
+
+## Acquisition without GLIM
+
+A fresh Jetson can install just the official Livox driver, recording, monitoring, browser UI and preview:
+
+```bash
+scripts/bootstrap_jetson.sh --record-only
+scripts/verify_jetson.sh --record-only
+scripts/run_system.sh --host 0.0.0.0
+```
+
+This profile fetches only Livox-SDK2 and livox_ros_driver2, skips GLIM/GTSAM/Iridescence builds and CUDA probing, and retains the upstream PCL dependencies required by the Livox driver. It does not remove an existing GLIM installation. Choose **Start Record-only Session** in the dashboard. Use `scripts/verify_jetson.sh --record-only --hardware` for a sensor-connected acquisition test.
+
+For later local GLIM processing, rerun `scripts/bootstrap_jetson.sh` without the option. Alternatively, keep Jetson acquisition-only and copy completed sessions to the PC. The full default installation continues to include all five official GLIM executables.

@@ -17,6 +17,8 @@ scripts/bootstrap_jetson.sh
 
 Bootstrap installs the OS build prerequisites, creates the Python environment, downloads the exact upstream GLIM and Livox revisions pinned in `dependencies.lock`, builds and installs them into this checkout, then builds the ROS 2 workspace. GLIM is fetched automatically; do not clone or install it separately. The first build needs internet access, `sudo` for apt packages, and can take a while. Use `BUILD_JOBS=1 scripts/bootstrap_jetson.sh` on memory-constrained machines. CUDA is detected automatically and falls back to CPU when unavailable.
 
+For a Jetson used only to capture bags, use `scripts/bootstrap_jetson.sh --record-only`. This skips GLIM and CUDA builds. In the UI choose **Start Record-only Session**, then **Stop Session** before copying the completed session to the workstation for GLIM processing.
+
 Start the dashboard after bootstrap completes:
 
 ```bash

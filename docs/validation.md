@@ -17,7 +17,7 @@ Host: Ubuntu 22.04.5 x86_64 PC, Linux 6.8.0-138-generic, ROS 2 Humble, system Py
 | PCD conversion | Passed on first exported map; all exported points retained |
 | Native map_editor | Launched with a copied real dump; log confirmed one submap loaded |
 | Native offline_viewer | Launched with a copied real dump; interactive viewer initialized |
-| Project tests | 18 passed (configuration, metadata, process crashes/cancellation/descendants, mock lifecycle, API restrictions, binary WebSockets, editing copies, timestamp convention, offline isolation command contract) |
+| Project tests | 20 passed (configuration, metadata, process crashes/cancellation/descendants, mock lifecycle, API restrictions, binary WebSockets, editing copies, timestamp convention, offline isolation command contract) |
 | Architecture flag audit | 157 compiled flags.make files checked; no AVX/SSE/native-x86 flags introduced |
 | ARM64 Python dependency availability | All pinned packages and dependencies downloaded as Python 3.10 ARM64/universal wheels; execution still requires Jetson |
 | Optimized browser preview, sensor disconnected | Accepted 2,366-point export displayed correctly |
@@ -55,3 +55,13 @@ metadata.yaml df3bd76ab607b0e4c44bf974eb3e704370615344a5f2ae6537e00609ae382ad9
 - LiDAR serial was not available through the current wrapper and is null in metadata. Network diagnostics distinguish assigned-host-address, reachability and actual message health; they are not a packet-capture analyzer.
 
 Detailed build/run logs remain under `.state/`, and sensor/job logs under each session. Dependencies are pinned in `dependencies.lock`; Python resolution is pinned in `requirements.lock`.
+
+## Auth removal and record-only review — 2026-10-02
+
+Reviewed commit `55d2566` and retained its no-login HTTP, WebSocket, browser and CLI behavior. Same-origin HTTP/WebSocket rejection remains tested. No token is created for fresh test environments.
+
+Added an explicit **Start Record-only Session** action that starts the driver and recorder without invoking GLIM or checking its preset. Tests cover missing GLIM binaries, an irrelevant CUDA preset, duplicate-start protection, finalized metadata, and the absence of a GLIM process. A missing GLIM installation is rejected before a combined mapping action starts the driver or creates a bag.
+
+The browser review used an isolated mock repository under `.state/record-only-browser-review/`, with no GLIM installation. It opened without login, created a session, started record-only with the CUDA preset selected, kept GLIM stopped, and finalized the session as recorded with `glim_live=false` and `bag_finalized=true`. This was a mock lifecycle check; the disconnected sensor was not contacted and production sessions were not changed.
+
+`bootstrap_jetson.sh --record-only` skips GLIM and CUDA setup; `verify_jetson.sh --record-only` checks acquisition prerequisites without requiring GLIM. Selective fetching of the two official Livox repositories was exercised on this PC. The full fresh ARM64 installation and live record-only hardware acceptance remain to be run on Jetson.

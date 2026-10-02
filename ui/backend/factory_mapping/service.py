@@ -35,7 +35,7 @@ class Service:
         return obj
     def status(self):
         processes=self.pm.view(); h=self.health()
-        return dict(mock=self.mock,live_preset=self.live_preset,system=system_status(self.root),config=self.config,network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
+        return dict(mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
     async def start_process(self,key,args,log,out=None,done=None):
         if self.mock:
             args=[sys.executable,'-m','factory_mapping.mock_worker',key,str(out or self.root/'.state/mock')]
@@ -67,6 +67,7 @@ class Service:
         if not self.mock and not all(self.health().get(k,{}).get('state')=='healthy' for k in ('lidar','imu')): raise ValueError('LiDAR and IMU must both have healthy message rates; run diagnostics')
         if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
     async def start_recording(self,sid):
+        if self.pm.active('recording'): raise ValueError('Recording is already active; stop the current session before starting another')
         self.require_health(); p=self.sessions.get(sid)
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if (p/'raw_bag').exists(): raise ValueError('This session already contains a raw bag; create another session')
@@ -96,8 +97,11 @@ class Service:
         self.sessions.update(p,state='recorded' if ok else 'failed',end_time=now(),duration=duration,average_lidar_hz=rates['lidar'],average_imu_hz=rates['imu'],disk_usage_bytes=size(p),bag_finalized=finalized)
         self.record_started=None
         if not ok: self.errors.append('Recording did not finalize cleanly; preserve raw_bag and inspect recording.log')
+    def glim_available(self):
+        return self.mock or all((self.root/'ros2_ws/install/glim_ros/lib/glim_ros'/name).is_file() for name in ('glim_rosnode','glim_rosbag'))
     def check_preset(self,preset):
         if preset not in PRESETS: raise ValueError('Unknown GLIM preset')
+        if not self.glim_available(): raise ValueError('GLIM is not installed here. Use Record-only Session and process the completed session on the workstation, or install GLIM.')
         if not self.mock and preset!='jetson_cpu' and (not read_json(self.root/'.state/build_capabilities.json',{}).get('cuda',False) or not (self.root/'ros2_ws/install/glim/lib/libodometry_estimation_gpu.so').exists()):
             raise ValueError('This installation has no CUDA GLIM module; select the CPU preset or build CUDA support')
     async def start_glim(self,sid,preset,viewer=False):

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Fetch immutable revisions. Never reset a dirty external checkout."""
-import json,subprocess
+import argparse,json,subprocess
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 def run(*args):subprocess.run(args,check=True)
-for name,dep in json.loads((root/'dependencies.lock').read_text())['dependencies'].items():
+dependencies=json.loads((root/'dependencies.lock').read_text())['dependencies']
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--only',nargs='+',choices=list(dependencies),help='Fetch only these dependencies (default: all)')
+args=parser.parse_args()
+for name,dep in dependencies.items():
+ if args.only and name not in args.only: continue
  p=root/'external'/name
  fresh=not p.exists()
  if fresh: run('git','clone','--no-checkout',dep['url'],str(p))

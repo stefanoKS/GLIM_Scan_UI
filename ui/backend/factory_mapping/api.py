@@ -87,14 +87,18 @@ def make_app(root=ROOT,mock=None):
             elif a=='glim_start': return await s.start_glim(body.session or '',body.preset)
             elif a=='glim_viewer_start': return await s.start_glim(body.session or '',body.preset,viewer=True)
             elif a=='glim_stop': await s.stop_glim()
-            elif a=='session_start':
+            elif a in ('session_start','session_record_start'):
+                s.sessions.get(body.session or '')
+                if a=='session_start': s.check_preset(body.preset)
+                elif s.pm.active('glim'): raise ValueError('Stop live GLIM before starting a record-only session')
                 if not s.pm.active('driver'): await s.start_driver()
                 for _ in range(15):
                     try: s.require_health(); break
                     except ValueError: await asyncio.sleep(1)
                 await s.start_recording(body.session or '')
-                try: await s.start_glim(body.session or '',body.preset)
-                except Exception: await s.stop_session(); raise
+                if a=='session_start':
+                    try: await s.start_glim(body.session or '',body.preset)
+                    except Exception: await s.stop_session(); raise
             elif a=='session_stop': await s.stop_session()
             elif a=='process': return await s.offline(body.session or '',body.preset)
             elif a=='validator_start': return await s.start_validator()
