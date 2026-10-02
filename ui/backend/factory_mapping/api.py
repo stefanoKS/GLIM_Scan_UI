@@ -1,4 +1,4 @@
-import asyncio, contextlib, fcntl, json, os, secrets, time
+import asyncio, contextlib, fcntl, json, os, time
 from pathlib import Path
 from contextlib import asynccontextmanager
 import numpy as np
@@ -46,11 +46,6 @@ class Network(BaseModel):
 def make_app(root=ROOT,mock=None):
     mock=bool(os.environ.get('FACTORY_MAPPING_MOCK')=='1') if mock is None else mock
     state=root/'.state'; state.mkdir(parents=True,exist_ok=True)
-    token_path=state/'operator.token'
-    if not token_path.exists():
-        fd=os.open(token_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-        with os.fdopen(fd,'w') as f: f.write(secrets.token_urlsafe(32))
-    token=token_path.read_text().strip()
     @asynccontextmanager
     async def lifespan(app):
         guard=(state/'backend.lock').open('w')
@@ -65,12 +60,10 @@ def make_app(root=ROOT,mock=None):
             await service.close(); guard.close()
     app=FastAPI(title='Factory Mapping',lifespan=lifespan)
     @app.middleware('http')
-    async def auth(request,call_next):
-        if request.url.path.startswith('/api/'):
-            candidate=request.headers.get('Authorization','').removeprefix('Bearer ')
-            if not secrets.compare_digest(candidate,token): return JSONResponse({'detail':'Enter the operator token from .state/operator.token'},status_code=401)
-            origin=request.headers.get('origin')
-            if origin and origin!=str(request.base_url).rstrip('/'): return JSONResponse({'detail':'Cross-origin control is disabled'},status_code=403)
+    async def same_origin_guard(request,call_next):
+        origin=request.headers.get('origin')
+        if request.url.path.startswith('/api/') and origin and origin!=str(request.base_url).rstrip('/'):
+            return JSONResponse({'detail':'Cross-origin control is disabled'},status_code=403)
         return await call_next(request)
     @app.exception_handler(ValueError)
     async def bad_request(request,e): return JSONResponse({'detail':str(e)},status_code=409)
@@ -162,14 +155,13 @@ def make_app(root=ROOT,mock=None):
         f=artifact(sid,path)
         if f.suffix!='.ply': raise ValueError('Select a PLY')
         await asyncio.to_thread(ply_to_pcd,f,f.with_suffix('.pcd')); return {'ok':True}
-    async def ws_auth(ws):
-        if not secrets.compare_digest(ws.query_params.get('token',''),token): await ws.close(code=1008); return False
+    async def ws_origin_guard(ws):
         origin=ws.headers.get('origin'); host=ws.headers.get('host')
         if origin and origin not in (f'http://{host}',f'https://{host}'): await ws.close(code=1008); return False
         await ws.accept(); return True
     @app.websocket('/ws/preview')
     async def preview(ws:WebSocket):
-        if not await ws_auth(ws): return
+        if not await ws_origin_guard(ws): return
         try:
             while True:
                 s=app.state.service; payload=None; p=root/'.state/preview.bin'
@@ -182,7 +174,7 @@ def make_app(root=ROOT,mock=None):
         except (WebSocketDisconnect,asyncio.TimeoutError,RuntimeError): pass
     @app.websocket('/ws/logs/{sid}/{rid}')
     async def logs(ws:WebSocket,sid:str,rid:str):
-        if not await ws_auth(ws): return
+        if not await ws_origin_guard(ws): return
         try:
             s=app.state.service; p=s.get_run(s.sessions.get(sid),rid)/'job.log'; offset=0
             while True:

@@ -31,7 +31,7 @@ Open http://127.0.0.1:8080. For network and hardware setup, see [installation](d
 scripts/run_system.sh
 ```
 
-Open http://127.0.0.1:8080 and enter the operator token from `.state/operator.token`. For another PC on the trusted LAN, use `scripts/run_system.sh --host 0.0.0.0`, then open `http://192.168.1.135:8080`. The token protects operations; this is a local HTTP application, not an Internet service. One backend instance per repository is allowed.
+Open http://127.0.0.1:8080. For another PC on the trusted LAN, use `scripts/run_system.sh --host 0.0.0.0`, then open `http://192.168.1.135:8080`. The UI has no login; use it only on a trusted network and do not expose it to the Internet. One backend instance per repository is allowed.
 
 Use `--mock` for development without ROS hardware. Mock sessions are marked and filtered separately; they cannot be exported as genuine maps. Stop with Ctrl-C to finalize recording and GLIM. `scripts/stop_system.sh` finalizes the active session while keeping the dashboard running.
 

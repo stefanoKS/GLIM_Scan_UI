@@ -1,7 +1,7 @@
 # Operation
 
 1. Power the Mid-360 and connect Ethernet. Ensure host and sensor addresses share a subnet.
-2. Start `scripts/run_system.sh`; enter `.state/operator.token` in the browser.
+2. Start `scripts/run_system.sh` and open http://127.0.0.1:8080.
 3. Start Mid-360. Verify **both** LiDAR and IMU rates, latest timestamps, network state and driver status. A process alone is not a connection test.
 4. Create a named session and enter notes. Start Recording for acquisition only, or Start Mapping Session for recording plus live GLIM. CPU is the preset for this test PC.
 5. Walk slowly, avoid violent rotations, keep the sensor unobstructed, revisit locations and return near the start. Prefer several overlapping factory zones over a single enormous recording.

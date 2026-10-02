@@ -1,13 +1,12 @@
 import * as THREE from 'three';
 import {OrbitControls} from '/vendor/OrbitControls.js';
-const $=id=>document.getElementById(id);let token=sessionStorage.getItem('fm_token')||'',selected=null,sessionData=[],previewWS,logWS,logKey='',configured=false,live=true;
-$('token').value=token;
+const $=id=>document.getElementById(id);let selected=null,sessionData=[],previewWS,logWS,logKey='',configured=false,live=true;
 function error(e){$('error').hidden=false;$('error').textContent=String(e.message||e)}
-async function api(path,body,method){const r=await fetch('/api/'+path,{method:method||(body?'POST':'GET'),headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw Error(e.detail||r.statusText)}return r}
+async function api(path,body,method){const r=await fetch('/api/'+path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw Error(e.detail||r.statusText)}return r}
 async function json(path,body,method){return(await api(path,body,method)).json()}
 const bytes=n=>n==null?'—':n>1e9?(n/1e9).toFixed(2)+' GB':(n/1e6).toFixed(1)+' MB';const hz=n=>n==null?'—':n.toFixed(1)+' Hz';const sec=n=>n==null?'—':Math.round(n)+' s';
 function el(tag,text){const e=document.createElement(tag);e.textContent=text;return e}
-async function refresh(){try{const s=await json('status');$('login').hidden=true;$('mode').textContent=s.mock?'MOCK · simulated data':'LIVE HARDWARE MODE';const x=s.system;
+async function refresh(){try{const s=await json('status');$('mode').textContent=s.mock?'MOCK · simulated data':'LIVE HARDWARE MODE';const x=s.system;
 $('system').textContent=`${x.model}\nCPU ${x.cpu_percent}% · RAM ${x.ram_percent}%\nGPU ${x.gpu_percent==null?'unavailable':x.gpu_percent+'%'}\nDisk free ${bytes(x.disk_free)}\n${s.config.sensor.interface}: ${s.config.sensor.host_ip}\nROS domain ${s.config.sensor.ros_domain_id}\nTemperature ${Object.entries(x.temperatures).map(([k,v])=>k+': '+v.join('/')+'°C').join(', ')||'unavailable'}`;
 const l=s.health.lidar||{},i=s.health.imu||{};$('sensor').textContent=`Network: ${s.network.state||'checking'}\nDriver: ${s.processes.driver?.state||'stopped'}\n${s.config.sensor.points_topic}\nLiDAR ${l.state}: ${hz(l.hz)}\nPoints/s ${Math.round(l.point_rate||0)}\n${s.config.sensor.imu_topic}\nIMU ${i.state}: ${hz(i.hz)}\nLatest stamp ${l.stamp||'—'}`;
 const g=s.processes.glim;$('glim').textContent=`${g?.state||'stopped'} · ${s.live_preset?(s.live_preset==='jetson_cpu'?'CPU':'CUDA'):'—'}\nLoop detection ${s.loop_detection}\nSession ${s.active_session||'none'}\nRuntime ${g?.started_at?sec(((g.ended_at?Date.parse(g.ended_at):Date.now())-Date.parse(g.started_at))/1000):'—'}`;
@@ -19,14 +18,14 @@ async function sessions(){sessionData=await json('sessions');$('sessions').repla
 $('exports').replaceChildren();for(const path of m?.exports||[]){const row=el('div',path.split('/').pop()+' ');if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b);const c=el('button','Convert PCD');c.onclick=()=>json(`sessions/${selected}/pcd?path=${encodeURIComponent(path)}`,{}).then(sessions).catch(error);row.append(c)}const d=el('button','Download');d.onclick=()=>download(path);row.append(d);$('exports').append(row)}connectLogs()}
 async function action(a){$('error').hidden=true;try{const out=await json('action',{action:a,session:selected,preset:$('preset').value,run:$('runs').value||null});if(a==='diagnose'){$('diagnostics').textContent=JSON.stringify(out,null,2);$('diagnostics').parentElement.open=true}await refresh()}catch(e){error(e)}}
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{b.disabled=true;await action(b.dataset.action);b.disabled=false});
-$('connect').onclick=()=>{token=$('token').value.trim();sessionStorage.setItem('fm_token',token);$('error').hidden=true;refresh()};$('refresh').onclick=refresh;
+$('refresh').onclick=refresh;
 $('create').onclick=async()=>{try{const m=await json('sessions',{name:$('name').value,notes:$('notes').value});selected=m.id;await refresh()}catch(e){error(e)}};
 $('network').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));body.publish_freq=Number(body.publish_freq);body.ros_domain_id=Number(body.ros_domain_id);try{await json('network',body,'PUT');await refresh()}catch(e){error(e)}};
 $('delete-derived').onclick=()=>{if(confirm('Delete this generated processing run? The raw bag will be retained.'))action('delete_derived')};
 $('quality').onclick=async()=>{try{const q=await json(`sessions/${selected}/quality/${$('runs').value}`);const m=sessionData.find(x=>x.id===selected);const ply=m?.exports.filter(x=>x.endsWith('.ply')).at(-1);if(ply)Object.assign(q,await json(`sessions/${selected}/cloud_stats?path=${encodeURIComponent(ply)}`));$('quality-result').textContent=JSON.stringify(q,null,2)}catch(e){error(e)}};
 async function download(path){try{const r=await api(`sessions/${selected}/artifact?path=${encodeURIComponent(path)}`);const u=URL.createObjectURL(await r.blob());const a=el('a','');a.href=u;a.download=path.split('/').pop();a.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}catch(e){error(e)}}
 $('download-log').onclick=()=>download(`processing/${$('runs').value}/job.log`);
-function socket(path){return new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}${path}?token=${encodeURIComponent(token)}`)}
+function socket(path){return new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}${path}`)}
 function connectLogs(){const key=selected+'/'+$('runs').value;if(key===logKey)return;logWS?.close();logKey=key;$('logs').textContent='';if(!selected||!$('runs').value)return;logWS=socket('/ws/logs/'+key);logWS.onmessage=e=>{try{if(JSON.parse(e.data).job)return}catch{}$('logs').textContent=($('logs').textContent+e.data).slice(-60000);$('logs').scrollTop=$('logs').scrollHeight}}$('runs').onchange=()=>{logKey='';connectLogs()};
 const scene=new THREE.Scene();scene.background=new THREE.Color('#080f17');const camera=new THREE.PerspectiveCamera(55,1,.05,10000);camera.up.set(0,0,1);camera.position.set(8,-10,8);const renderer=new THREE.WebGLRenderer({antialias:false});renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));$('canvas').append(renderer.domElement);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;
 const grid=new THREE.GridHelper(30,30,0x395366,0x1d303f);grid.rotation.x=Math.PI/2;scene.add(grid,new THREE.AxesHelper(2));const material=new THREE.PointsMaterial({size:2,sizeAttenuation:false,vertexColors:true});const points=new THREE.Points(new THREE.BufferGeometry(),material);scene.add(points);
@@ -37,7 +36,7 @@ $('live-preview').onclick=()=>{live=true;$('preview-label').textContent='Raw LiD
 function reset(){points.geometry.computeBoundingSphere();const sphere=points.geometry.boundingSphere;const center=sphere?.center||new THREE.Vector3();const radius=Math.max(5,Math.min(1000,sphere?.radius||10));controls.target.copy(center);camera.position.copy(center).add(new THREE.Vector3(radius,-radius,radius));controls.update()}
 $('reset').onclick=reset;$('point-size').oninput=e=>material.size=Number(e.target.value);
 new ResizeObserver(()=>{const w=$('canvas').clientWidth,h=$('canvas').clientHeight;renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix()}).observe($('canvas'));
-renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera)});if(token)refresh();let polling=false;setInterval(async()=>{if(token&&!polling){polling=true;await refresh();polling=false}},2500);
+renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera)});refresh();let polling=false;setInterval(async()=>{if(!polling){polling=true;await refresh();polling=false}},2500);
 
 async function toolsPanel(){
  const catalog=await json('tools');$('tool-catalog').replaceChildren();

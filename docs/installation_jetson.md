@@ -69,7 +69,7 @@ scripts/process_bag.sh SESSION_ID --preset jetson_gpu
 
 `verify_jetson.sh` deliberately rejects x86_64. It checks ROS/Python imports, tests, prohibited architecture flags and all five official GLIM binaries. Hardware validation then records a new bag. Finish with a real walking route, multiple submaps, loop/merge acceptance, segmentation save/export, a long recording and thermal/memory observation. These cannot be established by a PC build.
 
-Use `scripts/package_for_jetson.sh` to create a source-only archive from the current commit in `.state/`. It excludes PC binaries, virtual environments, operator tokens and acquisition data. Extract on Jetson, edit its network/interface configuration, and run bootstrap natively. The Jetson acquires bags; it is not required to perform final heavy optimization.
+Use `scripts/package_for_jetson.sh` to create a source-only archive from the current commit in `.state/`. It excludes PC binaries, virtual environments and acquisition data. Extract on Jetson, edit its network/interface configuration, and run bootstrap natively. The Jetson acquires bags; it is not required to perform final heavy optimization.
 
 The compile-job default is 1 below ~4 GiB RAM, 2 below ~19 GiB, and 4 on larger hosts, with sequential colcon packages. Override with BUILD_JOBS when appropriate. Runtime OpenMP defaults to two threads (OMP_NUM_THREADS can override); SLAM estimation parameters remain the official baselines.
 
