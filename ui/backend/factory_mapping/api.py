@@ -14,6 +14,13 @@ from .glim_tools import capabilities
 from .storage import atomic_json, read_json
 from .preview import encode
 from .quality import quality, ply_stats, ply_to_pcd
+from .reconstruction import DEFAULT_VOXEL_SIZE_M
+
+class ReconstructionRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    trajectory: str
+    voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0, allow_inf_nan=False)
+    save_full_density: bool=False
 
 class CaptureAction(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -202,6 +209,18 @@ def make_app(root=ROOT,mock=None):
         p=Path(__file__).with_name('mock_camera.jpg') if s.mock else root/'.state/camera_preview.jpg'
         if not s.mock and (not s.pm.active('camera_preview') or not p.is_file() or time.time()-p.stat().st_mtime>max(3,2/s.config['camera']['preview_hz'])): raise HTTPException(404,'Camera preview is stale or unavailable; recording is independent')
         return Response(await asyncio.to_thread(p.read_bytes),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
+    @app.get('/api/sessions/{sid}/reconstruction')
+    async def reconstruction_status(sid:str):
+        from .reconstruction_jobs import view
+        return await asyncio.to_thread(view, app.state.service, sid)
+
+    @app.post('/api/sessions/{sid}/reconstruction', status_code=202)
+    async def prepare_reconstruction(sid:str, body:ReconstructionRequest):
+        from .reconstruction_jobs import start
+        s=app.state.service
+        async with s.lock:
+            return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density)
+
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
     def project_transfer_ready(service):
@@ -434,7 +453,7 @@ def make_app(root=ROOT,mock=None):
     def artifact(sid,path):
         p=app.state.service.sessions.get(sid); f=(p/path).resolve()
         if p.resolve() not in f.parents or not f.is_file() or any(x.is_symlink() for x in [p/path,*(p/path).parents] if x!=p.parent): raise ValueError('Invalid artifact path')
-        if f.suffix not in ('.log','.json','.jsonl','.txt','.ply','.pcd','.yaml'): raise ValueError('Artifact type not exposed')
+        if f.suffix not in ('.log','.json','.jsonl','.txt','.ply','.pcd','.yaml','.npz'): raise ValueError('Artifact type not exposed')
         if 'raw_bag' in f.relative_to(p).parts: raise ValueError('Raw bag downloads are not served by this endpoint; copy the session directory')
         return f
     @app.get('/api/sessions/{sid}/artifact')

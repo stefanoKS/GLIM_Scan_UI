@@ -63,3 +63,48 @@ Settings → Capture preferences → Mapping quality selects the preset used by 
 `PC dense · CPU · 5 cm detail` targets the current Ryzen 5 5600G / 16 GB workstation. It uses six CPU threads, a 20,000-point preprocessing target, 0.05 m minimum point separation within submap voxels, at most 500 points per voxel and 200,000 points per submap. These are sampling settings, not guaranteed accuracy or uniform spacing. CPU odometry and pose-graph mapping remain compatible with the installed CPU-only GLIM build. The RTX 5060 is present, but CUDA presets require a CUDA-enabled GLIM installation.
 
 Leave live mapping off and automatic processing on for this PC. Dense processing uses more memory and time; long routes still need memory/performance testing. Raw bags are unchanged. Browser previews remain limited to 50,000 points; use the exported PLY/native viewer to evaluate full map detail.
+
+### Prepare surface reconstruction
+
+Select a scan in Library → Surface Reconstruction, choose its `traj_lidar.txt`,
+and click **Prepare Reconstruction**. **Advanced → Voxel size** defaults to
+**1.0 cm** and accepts 0.2–20 cm; the browser converts centimeters to meters.
+The backend API accepts `voxel_size_m` (default `0.01`; `0` disables sampling).
+Preparation requires the original ROS bag and the trajectory from the same scan.
+For merged maps, use each original bag with its corresponding transformed trajectory.
+Preparation does not require NKSR or Open3D, and does not generate a mesh itself.
+
+From a shell with the project ROS environment:
+
+```bash
+source scripts/env.sh
+python tools/glim_nksr_prepare.py \
+  --bag data/sessions/SESSION/raw_bag \
+  --trajectory data/sessions/SESSION/processing/run_001/glim_dump/traj_lidar.txt \
+  --output-dir data/sessions/SESSION/reconstruction/run_debug \
+  --voxel-size 0.01
+```
+
+CLI voxel units are **meters**: `0.01` = 1 cm. Use `--voxel-size 0` for
+full-density NKSR input, or `--save-full-density` to additionally write a full
+validation PLY. Use a new output directory for each preparation.
+
+Per-point trajectory interpolation and trajectory-range filtering precede global
+world-space voxel selection (`floor(point_world / voxel_size_m)`). NumPy selects
+the first actual observation in each occupied voxel, in acquisition order, and
+applies those same indices to every measurement attribute. No sensor origins are
+averaged independently. The selection is deterministic for identical inputs.
+
+Outputs under `reconstruction/run_*/` are:
+
+- `input/nksr_input.npz`: sampled points, paired sensor origins, intensity and timestamps.
+- `validation/reconstructed_from_bag.ply`: the same sampled geometry sent to NKSR.
+- `validation/comparison.json`: `voxel_size_m`, `points_before_voxel`,
+  `points_after_voxel`, and `voxel_reduction_ratio` (after / before).
+- `validation/reconstructed_from_bag_full.ply`: only when explicitly requested.
+
+The UI displays raw and sampled point counts, progress, and preparation logs.
+Compare spatial agreement with GLIM's optimized export; its processed submaps
+naturally have a different point count. No equality check is applied and the
+metadata does not claim a spatial validation has been performed. Existing
+`exports/run_*.ply` and GLIM export commands are unchanged.

@@ -344,7 +344,7 @@ class Service:
         await self.capture.close()
         if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
         await self.stop_session()
-        for k in ('calibration_record','calibration_tool','offline','export','tool','validator','camera_preview','camera_monitor','camera','preview','monitor','driver'):
+        for k in ('reconstruction','calibration_record','calibration_tool','offline','export','tool','validator','camera_preview','camera_monitor','camera','preview','monitor','driver'):
             if self.pm.items.get(k,{}).get('state')!='orphaned': await self.pm.stop(k,self.config['system']['shutdown']['glim_timeout'] if k in ('offline','export','tool','calibration_tool') else 20,cancel=True)
 
     def camera_calibration(self):

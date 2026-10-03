@@ -21,7 +21,7 @@ if(editLoadedId!==selected){$('session-rename').value=m?.name||'';$('session-not
 const canProcess=!!m&&m.kind!=='camera'&&!!latestStatus?.glim_available&&!latestStatus?.capture?.busy;
 for(const b of document.querySelectorAll('[data-action=process],#open-viewer,#open-editor,#merge-maps'))b.disabled=!canProcess;
 $('selected').textContent=m?.name||'None';$('selected-job').textContent=m?.name||'None';const old=$('runs').value;$('runs').replaceChildren();for(const j of m?.processing||[]){if(j){const o=el('option',`${j.id} · ${j.preset} · ${j.state}`);o.value=j.id;$('runs').append(o)}}if([...$('runs').options].some(o=>o.value===old))$('runs').value=old;else if($('runs').options.length)$('runs').selectedIndex=$('runs').options.length-1;
-$('exports').replaceChildren();for(const path of m?.exports||[]){const row=el('div',path.split('/').pop()+' ');if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b);const c=el('button','Convert PCD');c.onclick=()=>json(`sessions/${selected}/pcd?path=${encodeURIComponent(path)}`,{}).then(sessions).catch(error);row.append(c)}const d=el('button','Download');d.onclick=()=>download(path);row.append(d);$('exports').append(row)}connectLogs()}
+$('exports').replaceChildren();for(const path of m?.exports||[]){const row=el('div',path.split('/').pop()+' ');if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b);const c=el('button','Convert PCD');c.onclick=()=>json(`sessions/${selected}/pcd?path=${encodeURIComponent(path)}`,{}).then(sessions).catch(error);row.append(c)}const d=el('button','Download');d.onclick=()=>download(path);row.append(d);$('exports').append(row)}connectLogs();await reconstructionPanel()}
 async function action(a){$('error').hidden=true;try{const out=await json('action',{action:a,session:selected,preset:$('preset').value,run:$('runs').value||null});if(a==='diagnose'){$('diagnostics').textContent=JSON.stringify(out,null,2);$('diagnostics').parentElement.open=true}await refresh()}catch(e){error(e)}}
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{b.disabled=true;await action(b.dataset.action);b.disabled=false});
 $('refresh').onclick=refresh;
@@ -85,3 +85,33 @@ async function toolsPanel(){
 async function openTool(tool,merge=false){try{if(merge&&!$('merge-inputs').selectedOptions.length)throw Error('Select at least one additional processed map to merge');const result=await json('tools/open',{session:selected,run:$('runs').value,tool,additional:merge?[...$('merge-inputs').selectedOptions].map(o=>JSON.parse(o.value)):[]});$('tool-workspace').textContent=JSON.stringify(result,null,2);await refresh()}catch(e){error(e)}}
 $('merge-maps').onclick=()=>openTool('offline_viewer',true);
 $('open-viewer').onclick=()=>openTool('offline_viewer');$('open-editor').onclick=()=>openTool('map_editor');$('stop-tool').onclick=()=>{if(confirm('Stop the native tool? Save your edits in its window first; unsaved edits may be lost.'))action('tool_stop')};
+
+let reconstructionPending=false;
+async function reconstructionPanel(){
+ const sid=selected;
+ $('prepare-reconstruction').disabled=!sid||reconstructionPending||!!latestStatus?.capture?.busy||['running','stopping','orphaned'].includes(latestStatus?.processes?.reconstruction?.state);
+ if(!sid){$('reconstruction-trajectory').replaceChildren();$('reconstruction-status').textContent='Select a scan first.';$('reconstruction-results').replaceChildren();return}
+ const data=await json(`sessions/${sid}/reconstruction`);if(sid!==selected)return;
+ const select=$('reconstruction-trajectory'),old=select.value;select.replaceChildren();
+ for(const path of data.trajectories){const option=el('option',path);option.value=path;select.append(option)}
+ if(data.trajectories.includes(old))select.value=old;
+ $('prepare-reconstruction').disabled ||= !data.trajectories.length;
+ const job=data.jobs.at(-1),meta=job?.metadata;
+ $('reconstruction-status').textContent=!data.trajectories.length?'No traj_lidar.txt found. Save a GLIM map with its trajectory first.':job?`${job.state} · ${job.progress||''}`:'Ready to prepare reconstruction.';
+ $('reconstruction-results').replaceChildren();
+ if(job?.state==='completed'&&meta?.points_after_voxel!==undefined){
+  const label=meta.voxel_size_m===0?'sampling disabled':`after ${(meta.voxel_size_m*100).toFixed(1)} cm voxel sampling`;
+  $('reconstruction-results').append(el('p',`Points: ${meta.points_before_voxel.toLocaleString()} raw → ${meta.points_after_voxel.toLocaleString()} ${label}`));
+  for(const [name,file] of [['Download NKSR input','input/nksr_input.npz'],['Preview input','validation/reconstructed_from_bag.ply'],['Metadata','validation/comparison.json']]){
+   const button=el('button',name),path=`reconstruction/${job.id}/${file}`;
+   button.onclick=()=>name==='Preview input'?showCloud(path):download(path);$('reconstruction-results').append(button);
+  }
+ }
+ if(job){const button=el('button','Preparation log');button.onclick=()=>download(`reconstruction/${job.id}/job.log`);$('reconstruction-results').append(button)}
+}
+$('reconstruction-form').onsubmit=async event=>{
+ event.preventDefault();if(reconstructionPending||!selected)return;
+ const cm=Number($('voxel-size-cm').value);if(!Number.isFinite(cm)||cm<0.2||cm>20){error(Error('Voxel size must be between 0.2 and 20 cm'));return}
+ reconstructionPending=true;$('prepare-reconstruction').disabled=true;
+ try{await json(`sessions/${selected}/reconstruction`,{trajectory:$('reconstruction-trajectory').value,voxel_size_m:cm/100.0});await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
+};
