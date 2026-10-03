@@ -50,7 +50,7 @@ Upstream `glim_ros2` declares `cv_bridge` and `image_transport` as build depende
 
 ## Network setup
 
-Edit `config/livox/mid360.yaml`: LiDAR IP, wired interface, topics and ROS domain. The host IP is detected from the configured Ethernet interface on the LiDAR subnet; do not put it in the YAML. Assign an Ethernet address in that subnet using the OS network settings. If it changes while running, the app finalizes any active recording, restarts the sensor driver and shows the new address. The app does not change OS network configuration. Preserve Wi-Fi/default-route settings.
+Edit `config/livox/mid360.yaml` for LiDAR IP, topics and ROS domain. `interface: auto` selects the single active physical Ethernet adapter with an IPv4 address on the LiDAR subnet, excluding Wi-Fi and virtual adapters. Ambiguous matches require an explicit interface in Advanced Diagnostics. The host IP is detected; do not put it in the YAML. Assign an Ethernet address in that subnet using the OS network settings. If it changes while running, the app finalizes any active recording, restarts the sensor driver and shows the new address. The app does not change OS network configuration. Preserve Wi-Fi/default-route settings.
 
 Source `scripts/env.sh` for any manual ROS commands. It selects the correct Python, ROS overlay, local library paths and local ROS logs.
 
@@ -85,10 +85,27 @@ scripts/verify_jetson.sh --record-only
 scripts/run_system.sh --host 0.0.0.0
 ```
 
-This profile fetches only Livox-SDK2 and livox_ros_driver2, skips GLIM/GTSAM/Iridescence builds and CUDA probing, and retains the upstream PCL dependencies required by the Livox driver. It does not remove an existing GLIM installation. Choose **Start Record-only Session** in the dashboard. Use `scripts/verify_jetson.sh --record-only --hardware` for a sensor-connected acquisition test.
+This profile fetches only Livox-SDK2 and livox_ros_driver2, skips GLIM/GTSAM/Iridescence builds and CUDA probing, and retains the upstream PCL dependencies required by the Livox driver. It does not remove an existing GLIM installation. Choose **START SCAN** in the dashboard; it detects the record-only installation automatically. Use `scripts/verify_jetson.sh --record-only --hardware` for a sensor-connected acquisition test.
 
 For later local GLIM processing, rerun `scripts/bootstrap_jetson.sh` without the option. Alternatively, keep Jetson acquisition-only and copy completed sessions to the PC. The full default installation continues to include all five official GLIM executables.
 
 ## Optional camera extension
 
 See [camera acquisition and calibration](camera_calibration.md) for opt-in installation, fixed pipeline setup, one-bag RGB recording, intrinsic import, static calibration datasets and the workstation manual/NID workflow. GLIM remains LiDAR + IMU only. Camera-disabled and record-only workflows above remain supported.
+
+## Orin Nano 8 GB with the optional camera
+
+Use native aarch64 Ubuntu 22.04/JetPack 6 with ROS Humble. A conservative acquisition installation is:
+
+```bash
+BUILD_JOBS=1 scripts/bootstrap_jetson.sh --record-only
+BUILD_JOBS=1 scripts/install_camera.sh
+source scripts/env.sh
+python scripts/check_camera_python.py
+scripts/verify_jetson.sh --record-only
+scripts/check_camera.sh
+```
+
+The Imaging Source Python interface comes from system PyGObject (`python3-gi`, `python3-gst-1.0`) and the natively built Tcam typelib, not a pip-only camera SDK. `env.sh` sets the project-local plugin/typelib paths. The venv must use `/usr/bin/python3 --system-site-packages` so ROS, cv_bridge and OpenCV share the distribution ABI. Do not copy the PC venv or use Conda Python. The installer adds the camera USB/video permission rule and video-group membership; reconnect and log out/in afterward.
+
+Keep the configured 720×540 geometry and verify serial/pipeline against the camera attached to that Jetson. Enable camera inclusion in Settings for one bag containing LiDAR, IMU, RGB and CameraInfo. Use RECORD CAMERA for a camera-only bag. Export a completed project from Library and import it on the GLIM workstation. Native ARM64 build, sustained recording, USB throughput and thermal/memory acceptance still require the actual Jetson; PC tests cannot establish them.

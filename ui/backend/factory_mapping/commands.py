@@ -20,16 +20,16 @@ def driver(root,config):
     args+=['-r',f"/livox/lidar:={sensor['points_topic']}",'-r',f"/livox/imu:={sensor['imu_topic']}"]
     return args
 
-def acquisition_topics(config,calibration=False):
-    topics={'points_topic':config['sensor']['points_topic']}
-    if not calibration:topics['imu_topic']=config['sensor']['imu_topic']
+def acquisition_topics(config,calibration=False,camera_only=False):
+    topics={} if camera_only else {'points_topic':config['sensor']['points_topic']}
+    if not calibration and not camera_only:topics['imu_topic']=config['sensor']['imu_topic']
     if config['system']['camera']['enabled']:
         topics.update({k:config['camera'][k] for k in ('image_topic','camera_info_topic')})
     return topics
 
 
-def record(session,config,calibration=False):
-    topics=acquisition_topics(config,calibration)
+def record(session,config,calibration=False,camera_only=False):
+    topics=acquisition_topics(config,calibration,camera_only)
     qos={value:dict(reliability='reliable' if key in ('image_topic','camera_info_topic') else 'best_effort',durability='volatile',history='keep_last',depth=10 if key in ('image_topic','camera_info_topic') else 1000) for key,value in topics.items()}
     import yaml
     path=session/'config_snapshot/record_qos.yaml'; path.write_text(yaml.safe_dump(qos))
@@ -73,7 +73,7 @@ def camera(root,config):
     c=config['camera'];validate_camera(c,config['sensor'])
     if not c['pipeline_validated'] or not c.get('gstreamer_pipeline'): raise ValueError('Camera pipeline is not hardware-validated. Probe the DFK and set trusted local camera YAML first.')
     params=dict(gscam_config=c['gstreamer_pipeline'],use_gst_timestamps=c['use_gst_timestamps'],camera_name=c['camera_name'],frame_id=c['frame_id'],image_encoding='rgb8',sync_sink=False)
-    if intrinsics_status(root,c)['status']=='VALID': params['camera_info_url']=config_path(root,c['intrinsics_file']).resolve().as_uri()
+    if intrinsics_status(root,c)['status']=='VALID': params['camera_info_url']='file://'+str(config_path(root,c['intrinsics_file']).resolve())
     else:params['camera_info_url']=''
     import yaml
     path=root/'.state/camera.params.yaml';path.write_text(yaml.safe_dump({'/**':{'ros__parameters':params}}))

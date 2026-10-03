@@ -1,0 +1,190 @@
+diff --git a/include/vlcal/common/integrated_ct_gicp_factor.hpp b/include/vlcal/common/integrated_ct_gicp_factor.hpp
+index 0e5b3c0..8314c90 100644
+--- a/include/vlcal/common/integrated_ct_gicp_factor.hpp
++++ b/include/vlcal/common/integrated_ct_gicp_factor.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <memory>
++
+ #include <vlcal/common/integrated_ct_icp_factor.hpp>
+ 
+ namespace vlcal {
+@@ -13,7 +15,7 @@ template <typename TargetFrame = Frame, typename SourceFrame = Frame>
+ class IntegratedCT_GICPFactor_ : public IntegratedCT_ICPFactor_<TargetFrame, SourceFrame> {
+ public:
+   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+-  using shared_ptr = boost::shared_ptr<IntegratedCT_GICPFactor_<TargetFrame, SourceFrame>>;
++  using shared_ptr = std::pointer_traits<gtsam::NonlinearFactor::shared_ptr>::rebind<IntegratedCT_GICPFactor_<TargetFrame, SourceFrame>>;
+ 
+   /**
+    * @brief Constructor
+@@ -46,7 +48,7 @@ public:
+   virtual ~IntegratedCT_GICPFactor_() override;
+ 
+   virtual double error(const gtsam::Values& values) const override;
+-  virtual boost::shared_ptr<gtsam::GaussianFactor> linearize(const gtsam::Values& values) const override;
++  virtual gtsam::GaussianFactor::shared_ptr linearize(const gtsam::Values& values) const override;
+ 
+ protected:
+   virtual void update_correspondences() const override;
+diff --git a/include/vlcal/common/integrated_ct_gicp_factor_impl.hpp b/include/vlcal/common/integrated_ct_gicp_factor_impl.hpp
+index 9445eb8..9121505 100644
+--- a/include/vlcal/common/integrated_ct_gicp_factor_impl.hpp
++++ b/include/vlcal/common/integrated_ct_gicp_factor_impl.hpp
+@@ -67,7 +67,7 @@ double IntegratedCT_GICPFactor_<TargetFrame, SourceFrame>::error(const gtsam::Va
+ }
+ 
+ template <typename TargetFrame, typename SourceFrame>
+-boost::shared_ptr<gtsam::GaussianFactor> IntegratedCT_GICPFactor_<TargetFrame, SourceFrame>::linearize(const gtsam::Values& values) const {
++gtsam::GaussianFactor::shared_ptr IntegratedCT_GICPFactor_<TargetFrame, SourceFrame>::linearize(const gtsam::Values& values) const {
+   this->update_poses(values);
+   this->update_correspondences();
+ 
+diff --git a/include/vlcal/common/integrated_ct_icp_factor.hpp b/include/vlcal/common/integrated_ct_icp_factor.hpp
+index c0cf3f5..56cc7e6 100644
+--- a/include/vlcal/common/integrated_ct_icp_factor.hpp
++++ b/include/vlcal/common/integrated_ct_icp_factor.hpp
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <memory>
++
+ #include <gtsam/geometry/Pose3.h>
+ #include <gtsam/nonlinear/NonlinearFactorGraph.h>
+ 
+@@ -20,7 +22,7 @@ template <typename TargetFrame = Frame, typename SourceFrame = Frame>
+ class IntegratedCT_ICPFactor_ : public gtsam::NonlinearFactor {
+ public:
+   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+-  using shared_ptr = boost::shared_ptr<IntegratedCT_ICPFactor_<TargetFrame, SourceFrame>>;
++  using shared_ptr = std::pointer_traits<gtsam::NonlinearFactor::shared_ptr>::rebind<IntegratedCT_ICPFactor_<TargetFrame, SourceFrame>>;
+ 
+   /**
+    * @brief Constructor
+@@ -54,7 +56,7 @@ public:
+ 
+   virtual size_t dim() const override { return 6; }
+   virtual double error(const gtsam::Values& values) const override;
+-  virtual boost::shared_ptr<gtsam::GaussianFactor> linearize(const gtsam::Values& values) const override;
++  virtual gtsam::GaussianFactor::shared_ptr linearize(const gtsam::Values& values) const override;
+ 
+   void set_num_threads(int n) { num_threads = n; }
+   void set_max_corresponding_distance(double dist) { max_correspondence_distance_sq = dist * dist; }
+diff --git a/include/vlcal/common/integrated_ct_icp_factor_impl.hpp b/include/vlcal/common/integrated_ct_icp_factor_impl.hpp
+index b73db24..e3f2c0e 100644
+--- a/include/vlcal/common/integrated_ct_icp_factor_impl.hpp
++++ b/include/vlcal/common/integrated_ct_icp_factor_impl.hpp
+@@ -94,7 +94,7 @@ double IntegratedCT_ICPFactor_<TargetFrame, SourceFrame>::error(const gtsam::Val
+ }
+ 
+ template <typename TargetFrame, typename SourceFrame>
+-boost::shared_ptr<gtsam::GaussianFactor> IntegratedCT_ICPFactor_<TargetFrame, SourceFrame>::linearize(const gtsam::Values& values) const {
++gtsam::GaussianFactor::shared_ptr IntegratedCT_ICPFactor_<TargetFrame, SourceFrame>::linearize(const gtsam::Values& values) const {
+   if (!frame::has_normals(*target)) {
+     std::cerr << "error: target cloud doesn't have normals!!" << std::endl;
+     abort();
+diff --git a/src/vlcal/calib/visual_camera_calibration.cpp b/src/vlcal/calib/visual_camera_calibration.cpp
+index 61aabcd..8785750 100644
+--- a/src/vlcal/calib/visual_camera_calibration.cpp
++++ b/src/vlcal/calib/visual_camera_calibration.cpp
+@@ -10,7 +10,7 @@
+ #include <ceres/autodiff_first_order_function.h>
+ 
+ #include <sophus/se3.hpp>
+-#include <sophus/ceres_manifold.hpp>
++#include <vlcal/common/ceres_se3_parameterization.hpp>
+ 
+ #include <dfo/nelder_mead.hpp>
+ #include <gtsam/geometry/Pose3.h>
+@@ -213,7 +213,7 @@ Eigen::Isometry3d VisualCameraCalibration::estimate_pose_bfgs(const Eigen::Isome
+   }
+ 
+   auto cost = new ceres::AutoDiffFirstOrderFunction<MultiNIDCost, Sophus::SE3d::num_parameters>(sum_nid);
+-  ceres::GradientProblem problem(cost, new Sophus::Manifold<Sophus::SE3>());
++  ceres::GradientProblem problem(cost, new SE3Parameterization());
+ 
+   ceres::GradientProblemSolver::Options options;
+   options.minimizer_progress_to_stdout = true;
+diff --git a/src/vlcal/common/estimate_pose.cpp b/src/vlcal/common/estimate_pose.cpp
+index 49c1312..2a8a7a0 100644
+--- a/src/vlcal/common/estimate_pose.cpp
++++ b/src/vlcal/common/estimate_pose.cpp
+@@ -6,7 +6,7 @@
+ #include <ceres/problem.h>
+ #include <ceres/rotation.h>
+ #include <sophus/se3.hpp>
+-#include <sophus/ceres_manifold.hpp>
++#include <vlcal/common/ceres_se3_parameterization.hpp>
+ 
+ #include <vlcal/common/estimate_fov.hpp>
+ #include <vlcal/costs/reprojection_cost.hpp>
+@@ -153,9 +153,7 @@ Eigen::Isometry3d PoseEstimation::estimate_pose_lsq(
+   Sophus::SE3d T_camera_lidar = Sophus::SE3d(init_T_camera_lidar.matrix());
+   
+   ceres::Problem problem;
+-  problem.AddParameterBlock(T_camera_lidar.data(), Sophus::SE3d::num_parameters, new Sophus::Manifold<Sophus::SE3>());
+-  // The default ceres (2.0.0) on Ubuntu 20.04 does not have manifold.hpp yet
+-  // problem.AddParameterBlock(T_camera_lidar.data(), Sophus::SE3d::num_parameters, new Sophus::Manifold<Sophus::SE3>());
++  problem.AddParameterBlock(T_camera_lidar.data(), Sophus::SE3d::num_parameters, new SE3Parameterization());
+ 
+   // Create reprojection error costs
+   for (const auto& [pt_2d, pt_3d] : correspondences) {
+diff --git a/src/vlcal/preprocess/dynamic_point_cloud_integrator.cpp b/src/vlcal/preprocess/dynamic_point_cloud_integrator.cpp
+index eb52177..6bf5d29 100644
+--- a/src/vlcal/preprocess/dynamic_point_cloud_integrator.cpp
++++ b/src/vlcal/preprocess/dynamic_point_cloud_integrator.cpp
+@@ -84,7 +84,7 @@ void DynamicPointCloudIntegrator::insert_points(const Frame::ConstPtr& raw_point
+   values.insert(1, pred_T_odom_lidar_end);
+ 
+   gtsam::NonlinearFactorGraph graph;
+-  auto factor = boost::make_shared<IntegratedCT_GICPFactor_<iVox, Frame>>(0, 1, target_ivox, points, target_ivox);
++  auto factor = IntegratedCT_GICPFactor_<iVox, Frame>::shared_ptr(new IntegratedCT_GICPFactor_<iVox, Frame>(0, 1, target_ivox, points, target_ivox));
+   factor->set_num_threads(params.num_threads);
+   graph.add(factor);
+ 
+diff --git a/include/vlcal/common/ceres_se3_parameterization.hpp b/include/vlcal/common/ceres_se3_parameterization.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/vlcal/common/ceres_se3_parameterization.hpp
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <ceres/version.h>
++#include <sophus/se3.hpp>
++
++#if CERES_VERSION_MAJOR > 2 || (CERES_VERSION_MAJOR == 2 && CERES_VERSION_MINOR >= 1)
++#include <sophus/ceres_manifold.hpp>
++namespace vlcal {
++using SE3Parameterization = Sophus::Manifold<Sophus::SE3>;
++}
++#else
++#include <ceres/local_parameterization.h>
++
++namespace vlcal {
++// Ceres 2.0 uses LocalParameterization. Keep the same right-multiplicative
++// SE(3) update and Jacobian as Sophus::Manifold for both calibration solvers.
++class SE3Parameterization : public ceres::LocalParameterization {
++public:
++  bool Plus(const double* x, const double* delta, double* result) const override {
++    const Eigen::Map<const Sophus::SE3d> pose(x);
++    const Eigen::Map<const Sophus::SE3d::Tangent> tangent(delta);
++    Eigen::Map<Sophus::SE3d> updated(result);
++    updated = pose * Sophus::SE3d::exp(tangent);
++    return true;
++  }
++
++  bool ComputeJacobian(const double* x, double* result) const override {
++    const Eigen::Map<const Sophus::SE3d> pose(x);
++    Eigen::Map<Eigen::Matrix<double, Sophus::SE3d::num_parameters,
++                             Sophus::SE3d::DoF, Eigen::RowMajor>> jacobian(result);
++    jacobian = pose.Dx_this_mul_exp_x_at_0();
++    return true;
++  }
++
++  int GlobalSize() const override { return Sophus::SE3d::num_parameters; }
++  int LocalSize() const override { return Sophus::SE3d::DoF; }
++};
++}  // namespace vlcal
++#endif

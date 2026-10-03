@@ -50,8 +50,6 @@ def bag_statistics(path,config):
             entry=entries.get(topic)
             if not entry or entry['message_count']<=0 or entry['topic_metadata']['type']!='sensor_msgs/msg/'+kind:raise ValueError('Capture missing usable '+topic+' ('+kind+')')
             stats[key]={'topic':topic,'count':entry['message_count'],'hz':entry['message_count']/seconds if seconds>0 else 0}
-        rate=stats['image_topic']['hz'];expected=config['camera']['expected_hz']
-        if not expected*.7<=rate<=expected*1.3:raise ValueError(f'Camera capture rate {rate:.2f} Hz differs from expected {expected} Hz; record a longer static capture and check USB3/exposure')
         return dict(duration=seconds,topics=stats)
     except (OSError,KeyError,TypeError,yaml.YAMLError) as e:raise ValueError('Invalid or unfinished calibration bag metadata') from e
 

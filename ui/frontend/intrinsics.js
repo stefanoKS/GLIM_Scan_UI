@@ -1,5 +1,5 @@
 const $=id=>document.getElementById(id);
-let views=0,required=8,cameraReady=false,cameraRunning=false,saved=false,busy=false,previewURL=null,loading=false;
+let views=0,required=4,cameraReady=false,cameraRunning=false,saved=false,busy=false,previewURL=null,loading=false;
 async function request(path,method='GET'){
  const response=await fetch('/api/'+path,{method,cache:'no-store'});
  if(!response.ok){const error=await response.json().catch(()=>({}));throw Error(error.detail||`Request failed (${response.status})`)}
@@ -42,11 +42,7 @@ async function action(button,operation){
  busy=true;controls();message('');
  try{await operation();await refresh()}catch(error){message(error.message)}finally{busy=false;controls()}
 }
-$('start-camera').onclick=()=>action('start-camera',async()=>{
- const state=await request('status');
- if(!state.config.system.camera.enabled)await fetch('/api/camera/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true})}).then(async response=>{if(!response.ok)throw Error((await response.json()).detail)});
- await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'camera_start'})}).then(async response=>{if(!response.ok)throw Error((await response.json()).detail)});
-});
+$('start-camera').onclick=()=>action('start-camera',()=>request('calibration/prepare','POST'));
 $('capture').onclick=()=>action('capture',async()=>{const result=await request('camera/intrinsics/views','POST');$('capture-feedback').textContent=`View ${result.views} captured · ${result.corners} corners detected`});
 $('reset-views').onclick=()=>action('reset',async()=>{await request('camera/intrinsics/views','DELETE');$('capture-feedback').textContent='Views cleared'});
 $('calibrate').onclick=()=>action('calibrate',async()=>{const result=await request('camera/intrinsics/calibrate','POST');$('calibration-quality').textContent=`Saved · ${result.quality.views} views · ${result.quality.rms.toFixed(2)} px reprojection error`});

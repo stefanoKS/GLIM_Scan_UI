@@ -1,5 +1,6 @@
 import asyncio, contextlib, fcntl, json, os, shutil, tempfile, time, zipfile
 from pathlib import Path
+from typing import Literal
 from contextlib import asynccontextmanager
 import numpy as np
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
@@ -13,6 +14,21 @@ from .glim_tools import capabilities
 from .storage import atomic_json, read_json
 from .preview import encode
 from .quality import quality, ply_stats, ply_to_pcd
+
+class CaptureAction(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    action: Literal['start_scan','stop_scan','start_camera_recording','stop_camera_recording']
+
+class CaptureSettings(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    live_glim: bool=Field(strict=True)
+    auto_process: bool=Field(strict=True)
+    mapping_preset: Literal['auto','jetson_cpu','pc_dense','jetson_gpu','offline_quality'] | None=None
+
+class SessionEdit(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    name: str=Field(min_length=1,max_length=100)
+    notes: str=Field(default='',max_length=4000)
 
 class Create(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -63,6 +79,7 @@ def make_app(root=ROOT,mock=None):
         try: fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: guard.close(); raise RuntimeError('Another mapping backend is already running')
         service=Service(root,mock); app.state.service=service
+        await service.start_preview_sensors()
         bg=asyncio.create_task(service.background())
         try: yield
         finally:
@@ -80,13 +97,100 @@ def make_app(root=ROOT,mock=None):
     async def bad_request(request,e): return JSONResponse({'detail':str(e)},status_code=409)
     @app.get('/api/status')
     async def status(): return await asyncio.to_thread(app.state.service.status)
+    @app.get('/api/capture')
+    async def capture_status(): return app.state.service.capture.view()
+
+    @app.post('/api/capture/action',status_code=202)
+    async def capture_action(body:CaptureAction):
+        return await getattr(app.state.service.capture,body.action)()
+
+    @app.put('/api/capture/settings')
+    async def capture_settings(body:CaptureSettings):
+        s=app.state.service
+        async with s.lock:
+            if s.capture.busy or s.active: raise ValueError('Finish capture before changing its settings')
+            if body.mapping_preset and body.mapping_preset != 'auto': s.check_preset(body.mapping_preset)
+            settings={**s.capture.capabilities()['settings'], **body.model_dump(exclude_none=True)}
+            atomic_json(state/'capture_settings.json',settings)
+            return s.capture.capabilities()
+
+    @app.patch('/api/sessions/{sid}')
+    async def edit_session(sid:str,body:SessionEdit):
+        s=app.state.service
+        async with s.lock:
+            p=s.sessions.get(sid)
+            if s.active==p or (s.capture.busy and s.capture.data.get('session')==sid): raise ValueError('Finish capture and processing before renaming the scan')
+            if not body.name.strip(): raise ValueError('Scan name cannot be blank')
+            return s.sessions.update(p,name=body.name.strip(),notes=body.notes)
+
+    @app.get('/api/preview/orientation')
+    async def view_orientation():
+        return read_json(state/'view_orientation.json',{'quaternion':[0,0,0,1]})
+
+    @app.post('/api/preview/orientation')
+    async def orient_preview():
+        from .orientation import MAX_IMU_AGE_SECONDS, leveling_quaternion
+        s=app.state.service
+        async with s.lock:
+            if s.capture.busy or s.active: raise ValueError('Finish recording before orienting the view')
+            s.calibrations.idle()
+            if s.mock: raise ValueError('Orientation requires real IMU measurements')
+            if not s.pm.active('driver'): await s.start_driver()
+            sample=s.health().get('gravity',{})
+            if not sample.get('stable') or not 0<=time.time()-sample.get('last',0)<=MAX_IMU_AGE_SECONDS:
+                raise ValueError('Fresh, stable IMU data is unavailable; keep the LiDAR still with the sensor running and try again')
+            q=leveling_quaternion(sample['acceleration'],s.config['sensor']['T_lidar_imu'][3:])
+            result={'quaternion':q,'saved_at':time.time(),'scope':'live_preview_only'}
+            atomic_json(state/'view_orientation.json',result)
+            return result
+
+    @app.delete('/api/preview/orientation')
+    async def reset_orientation():
+        result={'quaternion':[0,0,0,1],'scope':'live_preview_only'}
+        async with app.state.service.lock: atomic_json(state/'view_orientation.json',result)
+        return result
+
+    @app.post('/api/calibration/prepare')
+    async def prepare_intrinsic_camera():
+        s=app.state.service
+        async with s.lock:
+            if s.capture.busy: raise ValueError('Finish capture first')
+            s.calibrations.idle()
+            await s.prepare_camera()
+            return {'ready':True}
+
+    @app.post('/api/calibrations/{cid}/wizard')
+    async def calibration_wizard(cid:str,body:CalibrationAction):
+        s=app.state.service
+        async with s.lock:
+            if s.capture.busy: raise ValueError('Finish capture first')
+            cal=s.calibrations
+            if body.action=='capture':
+                cal.idle()
+                if cal.detail(cid)['state'] not in ('CREATED','CAPTURED'): raise ValueError('Create a new alignment for additional captures')
+                await s.prepare_recording()
+                return await cal.capture_start(cid)
+            if body.action=='stop': return await cal.capture_stop(cid)
+            if body.action=='advance':
+                current=cal.detail(cid)['state']
+                stage={'CAPTURED':'preprocess','PREPROCESSED':'initial_guess_manual','INITIALIZED':'calibrate'}.get(current)
+                if stage: return await cal.run(cid,stage)
+                if current=='CALIBRATED':
+                    cal.idle()
+                    await s.stop_camera();await s.stop_driver()
+                    return await asyncio.to_thread(cal.import_result,cid)
+                if current=='IMPORTED': return await asyncio.to_thread(cal.validate,cid,body.notes)
+                raise ValueError('Complete the current calibration step before continuing')
+            raise ValueError('Unknown calibration wizard action')
+
     @app.post('/api/camera/enabled')
     async def camera_enabled(body:CameraEnabled):
         s=app.state.service
         async with s.lock:
-            if any(s.pm.active(k) for k in ('recording','glim','camera','calibration_record','calibration_tool')):
-                raise ValueError('Stop acquisition and calibration processes before changing RGB recording')
+            if s.capture.busy: raise ValueError('Finish capture before changing RGB recording')
+            s.calibrations.idle()
             if body.enabled and 'camera' not in s.config: raise ValueError('Camera configuration is missing')
+            if not body.enabled: await s.stop_camera()
             # Machine preference is separate from the portable default-disabled config.
             atomic_json(root/'.state/camera_enabled.json',{'enabled':body.enabled})
             s.config['system']['camera']['enabled']=body.enabled
@@ -94,21 +198,23 @@ def make_app(root=ROOT,mock=None):
     @app.get('/api/camera/preview')
     async def camera_preview():
         s=app.state.service
-        if not s.config['system']['camera']['enabled'] or not s.pm.active('camera'): raise HTTPException(404,'Camera preview is unavailable')
+        if not s.pm.active('camera'): raise HTTPException(404,'Camera preview is unavailable')
         p=Path(__file__).with_name('mock_camera.jpg') if s.mock else root/'.state/camera_preview.jpg'
         if not s.mock and (not s.pm.active('camera_preview') or not p.is_file() or time.time()-p.stat().st_mtime>max(3,2/s.config['camera']['preview_hz'])): raise HTTPException(404,'Camera preview is stale or unavailable; recording is independent')
         return Response(await asyncio.to_thread(p.read_bytes),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
     def project_transfer_ready(service):
-        if service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')):
+        if service.capture.busy or service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')):
             raise ValueError('Stop recording and processing before transferring a project')
     @app.get('/api/sessions/{sid}/project')
     async def export_project(sid:str):
         s=app.state.service
         async with s.lock:
             project_transfer_ready(s)
-            s.sessions.get(sid)
+            session=s.sessions.get(sid)
+            from .storage import size
+            if await asyncio.to_thread(size,session)>shutil.disk_usage(state).free-s.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free space to stage the project export')
             descriptor,path=tempfile.mkstemp(prefix='project-export-',suffix='.zip',dir=state)
             os.close(descriptor)
             try:await asyncio.to_thread(s.sessions.export_archive,sid,path)
@@ -119,10 +225,12 @@ def make_app(root=ROOT,mock=None):
     @app.post('/api/projects/import')
     async def import_project(request:Request):
         if request.headers.get('content-type','').split(';')[0].strip()!='application/zip':raise ValueError('Select a project ZIP archive')
+        project_transfer_ready(app.state.service)
         descriptor,path=tempfile.mkstemp(prefix='project-import-',suffix='.zip',dir=state)
         try:
             with os.fdopen(descriptor,'wb') as output:
                 async for chunk in request.stream():
+                    project_transfer_ready(app.state.service)
                     if len(chunk)>shutil.disk_usage(state).free-1024**3:raise ValueError('Insufficient disk space for project upload')
                     await asyncio.to_thread(output.write,chunk)
             s=app.state.service
@@ -139,6 +247,10 @@ def make_app(root=ROOT,mock=None):
     @app.post('/api/action')
     async def action(body:Action):
         s=app.state.service
+        if s.capture.busy:
+            if body.action in ('session_stop','record_stop'):
+                return await (s.capture.stop_scan() if s.capture.data['mode']=='scan' else s.capture.stop_camera_recording())
+            if body.action not in ('diagnose','glim_stop','cancel'): raise ValueError('Use Stop Scan / Stop Camera before advanced controls')
         async with s.lock:
             a=body.action
             if a=='driver_start': return await s.start_driver()
@@ -157,7 +269,9 @@ def make_app(root=ROOT,mock=None):
                 await s.start_recording(body.session or '')
                 if a=='session_start':
                     try: await s.start_glim(body.session or '',body.preset)
-                    except Exception: await s.stop_session(); raise
+                    except Exception as error:
+                        s.errors.append('Live GLIM failed to start; recording continues: '+str(error))
+                        return {'ok':True,'warning':str(error),'recording_continues':True}
             elif a=='session_stop': await s.stop_session()
             elif a=='process': return await s.offline(body.session or '',body.preset)
             elif a=='validator_start': return await s.start_validator()
@@ -178,14 +292,15 @@ def make_app(root=ROOT,mock=None):
         async with s.lock:
             if any(s.pm.active(k) for k in s.pm.items) or s.active: raise ValueError('Stop all processes and the active session before changing network settings')
             sensor={**s.config['sensor'],**body.model_dump()}; validate_sensor(sensor)
-            from .config import wired_host_ip
-            sensor['host_ip']=wired_host_ip(sensor)
+            from .config import wired_connection
+            sensor['interface_setting']=body.interface
+            sensor['interface'],sensor['host_ip']=wired_connection(sensor)
             if s.config.get('camera'):
                 from .camera_config import validate_camera
                 validate_camera(s.config['camera'],sensor)
             if sensor['ros_domain_id']==s.config['system'].get('offline_ros_domain_id',230): raise ValueError('Acquisition and offline ROS domains must differ')
             import yaml
-            p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump({key:value for key,value in sensor.items() if key!='host_ip'},sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor
+            p=root/'config/livox/mid360.yaml'; tmp=p.with_suffix('.tmp'); tmp.write_text(yaml.safe_dump({**{key:value for key,value in sensor.items() if key not in ('host_ip','interface_setting')},'interface':body.interface},sort_keys=False)); tmp.replace(p); s.config['sensor']=sensor
             s.event('network_config_updated'); return {'ok':True}
     @app.post('/api/camera/intrinsics')
     async def import_intrinsics(body:IntrinsicsImport):
@@ -193,7 +308,7 @@ def make_app(root=ROOT,mock=None):
         from .calibration_data import parse_intrinsics,replace_intrinsics
         s=app.state.service
         async with s.lock:
-            if s.active or any(s.pm.active(k) for k in s.pm.items): raise ValueError('Stop active processes before replacing intrinsics')
+            if s.capture.busy or s.active or any(s.pm.active(k) for k in s.pm.items): raise ValueError('Stop active processes before replacing intrinsics')
             if not s.config.get('camera'):raise ValueError('Camera configuration is missing')
             try:obj=yaml.safe_load(body.yaml_text);parse_intrinsics(obj,s.config['camera'])
             except (yaml.YAMLError,TypeError,AttributeError) as e:raise ValueError('Invalid ROS intrinsic calibration YAML') from e
@@ -247,7 +362,7 @@ def make_app(root=ROOT,mock=None):
         return service.camera_calibration()
 
     def intrinsic_change_allowed(service):
-        if service.active or any(service.pm.active(key) for key in ('recording','glim','calibration_record','calibration_tool','offline','export')):
+        if service.capture.busy or service.active or any(service.pm.active(key) for key in ('recording','glim','calibration_record','calibration_tool','offline','export')):
             raise ValueError('Stop recording and calibration jobs before changing camera intrinsics')
 
     @app.post('/api/camera/intrinsics/calibrate')
@@ -308,7 +423,14 @@ def make_app(root=ROOT,mock=None):
     @app.get('/api/sessions/{sid}/edits')
     async def edits(sid:str):
         p=app.state.service.sessions.get(sid)
-        return [read_json(f) for f in sorted((p/'edits').glob('*/workspace.json'))]
+        result=[]
+        for f in sorted((p/'edits').glob('*/workspace.json')):
+            meta=read_json(f,{})
+            # Derived workspace paths are local to this imported session.
+            meta['maps']=[str(d) for d in sorted(f.parent.glob('map_[0-9][0-9]')) if d.is_dir()]
+            meta['save_target']=str(f.parent/'saved_map')
+            result.append(meta)
+        return result
     def artifact(sid,path):
         p=app.state.service.sessions.get(sid); f=(p/path).resolve()
         if p.resolve() not in f.parents or not f.is_file() or any(x.is_symlink() for x in [p/path,*(p/path).parents] if x!=p.parent): raise ValueError('Invalid artifact path')

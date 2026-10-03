@@ -13,4 +13,4 @@ shutdown:
   recording_timeout: 60
   glim_timeout: 180
 camera:
-  enabled: false
+  enabled: true

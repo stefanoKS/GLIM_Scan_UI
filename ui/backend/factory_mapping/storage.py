@@ -130,6 +130,39 @@ class Sessions:
                 config=read_json(staged/'active_config.json')
                 if not isinstance(config,dict) or not isinstance(config.get('system'),dict) or not isinstance(config.get('sensor'),dict) or not (staged/'config_snapshot/system.yaml').is_file():
                     raise ValueError('Project configuration snapshot is incomplete')
+                # Checksums protect transfer integrity; separately validate the
+                # values later handed to ROS/GLIM and paths inside bag metadata.
+                from .config import validate_sensor
+                from .camera_config import validate_camera
+                try:
+                    validate_sensor(config['sensor'])
+                    if config.get('camera'): validate_camera(config['camera'],config['sensor'])
+                    if type(config['system']['camera']['enabled']) is not bool: raise ValueError('Invalid camera setting')
+                except (KeyError,TypeError,AttributeError,ValueError) as error:
+                    raise ValueError('Project acquisition configuration is invalid') from error
+                if metadata.get('kind','scan') not in ('scan','camera'): raise ValueError('Unsupported recording kind')
+                if not isinstance(metadata.get('name'),str) or not isinstance(metadata.get('notes',''),str): raise ValueError('Invalid project metadata')
+                bag=staged/'raw_bag'
+                if (bag/'metadata.yaml').is_file():
+                    import yaml
+                    try:
+                        info=yaml.safe_load((bag/'metadata.yaml').read_text())['rosbag2_bagfile_information']
+                        paths=info['relative_file_paths']+[item['path'] for item in info.get('files',[])]
+                        if not paths: raise ValueError('Bag has no data files')
+                        for relative in paths:
+                            if not isinstance(relative,str) or len(PurePosixPath(relative).parts)!=1 or relative in ('.','..') or '\\' in relative or not (bag/relative).is_file():
+                                raise ValueError('Bag data path must name a file inside raw_bag')
+                    except (KeyError,TypeError,AttributeError,yaml.YAMLError,ValueError) as error:
+                        raise ValueError('Invalid project bag metadata: '+str(error)) from error
+                # A transferred process cannot still be running on this host.
+                if metadata.get('state') in ('recording','mapping','stopping'):
+                    metadata.update(state='interrupted',recovery_note='Imported unfinished acquisition; raw data retained')
+                    atomic_json(staged/'metadata.json',metadata)
+                for job_path in (staged/'processing').glob('*/job.json'):
+                    job=read_json(job_path,{})
+                    if job.get('state')=='running':
+                        job.update(state='interrupted',recovery_note='Transferred processing job must be restarted on this host')
+                        atomic_json(job_path,job)
                 for folder in ('glim_dump','exports','logs','processing'):(staged/folder).mkdir(exist_ok=True)
                 staged.rename(destination)
             finally:

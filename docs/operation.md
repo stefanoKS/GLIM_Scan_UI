@@ -1,18 +1,20 @@
 # Operation
 
-1. Power the Mid-360 and connect Ethernet. Ensure host and sensor addresses share a subnet.
-2. Start `scripts/run_system.sh` and open http://127.0.0.1:8080.
-3. Start Mid-360. Verify **both** LiDAR and IMU rates, latest timestamps, network state and driver status. A process alone is not a connection test.
-4. Create a session (leave the name blank for a date-time name) and enter notes. Start Record-only Session automatically starts the sensor and records LiDAR + IMU without launching GLIM. Use Start Recording + GLIM for live mapping as well. The separate Start Recording button remains available after manually starting the sensor. CPU is the preset for this test PC.
-5. Walk slowly, avoid violent rotations, keep the sensor unobstructed, revisit locations and return near the start. Prefer several overlapping factory zones over a single enormous recording.
-6. Stop Session. Wait for rosbag metadata and GLIM dump finalization before powering off. Stopping recording separately leaves live GLIM active until Stop GLIM/Stop Session.
-7. Select a session, choose a preset, and Process/Reprocess. Watch the processing log. Each attempt gets a separate run directory and state.
-8. Inspect trajectory statistics and exported map. These describe the reconstruction and do not establish metrological accuracy.
-9. Export to PLY using upstream GLIM. The exporter needs an OpenGL display even when invoked by the backend; use a desktop workstation for headless Jetson sessions. PCD conversion preserves all exported points and intensity when present. Exported PLY can be previewed in the browser.
+1. Power the Mid-360 and connect Ethernet. Host and sensor must share a subnet. Connect the optional DFK33UX287 over USB3 (720×540).
+2. Start `scripts/run_system.sh` and open http://127.0.0.1:8080. LiDAR and the configured camera start automatically for live preview; this does not create a session or record a bag.
+3. In **Settings**, choose whether to include the camera. Live mapping is optional and off by default; automatic processing is on when GLIM is installed. The application selects CPU/GPU from the local installation.
+4. Press **START SCAN**. The backend creates a dated session, starts the required sensors, verifies LiDAR/IMU and enabled camera streams, then starts one raw rosbag. There is no need to create a session or start individual processes. Optional live GLIM starts after recording; its failure does not stop the bag.
+5. Walk slowly, keep the sensor unobstructed, revisit locations and return near the start. Prefer overlapping zones over one enormous recording.
+6. Press **STOP SCAN**. Wait through Saving recording and, when available, Processing scan. Do not power down while finalization is running. A record-only Jetson saves the scan without launching GLIM.
+7. Open **Library** to rename the scan, add notes, process/reprocess, inspect run history, export projects/maps, or use **Edit Map**, **Clean Map**, and **Merge Maps**. Native tools open on the server desktop. Edit Map includes manual loop closure, constraints and optimization; Clean Map exposes upstream segmentation/cleanup; Merge Maps starts with separate copies of the selected completed maps.
+8. **RECORD CAMERA** records only RGB and CameraInfo in a separate rosbag, independently of the scan's camera preference. **STOP CAMERA** finalizes it. It does not need LiDAR/IMU or run GLIM. Concurrent scan and standalone camera recording are intentionally mutually exclusive; enable the camera in Settings for a combined scan.
+9. **Calibration** guides camera intrinsics and camera–LiDAR alignment. Low-level process controls, presets, topics, frames, network and timestamp diagnostics are under **Settings → Advanced / Diagnostics**.
+
+Health indicators distinguish a connected device from a healthy publishing stream. Storage shows free space. The elapsed timer runs while recording. Errors retain the raw files and appear on Capture; use Library and Advanced Diagnostics for recovery. A disconnected required sensor prevents capture from claiming success.
 
 The live browser preview is raw LiDAR in its sensor frame, not a moving optimized world map. A preview is intentionally downsampled; archived bags remain full data. GLIM itself applies its normal estimation filtering, so the optimized export is not a replacement for the raw bag.
 
-To move a mapping project to a workstation, stop its session and any processing, select it under **Sessions**, and choose **Export selected**. The downloaded `.fmproject.zip` contains the entire session directory: raw bag, GLIM dump and processing runs, map exports, logs, `metadata.json`, `active_config.json`, and `config_snapshot/` (including the intrinsics/extrinsics and GLIM presets captured for that session). On a server running this application, choose **Project ZIP** and **Import project**. The manifest verifies file sizes and SHA-256 hashes before importing into `data/sessions/`; an existing session ID is never overwritten. Importing does not change the workstation's live camera, LiDAR, ROS domain, or network settings. The target still needs compatible ROS 2/rosbag storage and GLIM installed to process a raw bag. Archives are not a way to move binaries between architectures. Dedicated calibration datasets under `data/calibrations/` are not part of a mapping session project; copy those separately if their history is needed.
+To move a mapping project to a workstation, stop its session and any processing, select it in **Library**, and choose **Export selected**. The downloaded `.fmproject.zip` contains the entire session directory: raw bag, GLIM dump and processing runs, map exports, logs, `metadata.json`, `active_config.json`, and `config_snapshot/` (including the intrinsics/extrinsics and GLIM presets captured for that session). On a server running this application, choose **Project ZIP** and **Import project**. The manifest verifies file sizes and SHA-256 hashes before importing into `data/sessions/`; an existing session ID is never overwritten. Importing does not change the workstation's live camera, LiDAR, ROS domain, or network settings. The target still needs compatible ROS 2/rosbag storage and GLIM installed to process a raw bag. Archives are not a way to move binaries between architectures. Dedicated calibration datasets under `data/calibrations/` are not part of a mapping session project; copy those separately if their history is needed.
 
 Alternatively, copy a **completed entire session directory** to the workstation's `data/sessions/` manually. Preserve `metadata.json`, `active_config.json`, and `config_snapshot/`. The application never mutates a bag during processing. No raw-bag deletion endpoint exists. Delete Derived Run only removes the selected generated run after processing has stopped.
 
@@ -32,7 +34,7 @@ For exact GLIM commands and dependencies see `upstream_interfaces.md` and `depen
 
 ## Jetson record-only operation
 
-Record-only ignores the GLIM preset, does not require CUDA or installed GLIM binaries, and retains full PointCloud2 + IMU data for later processing. It still verifies both message streams and free disk space before recording. If live GLIM is already running, stop it before choosing record-only. Stop Session finalizes the bag and metadata; Stop Mid-360 then shuts down the sensor driver and preview.
+Without GLIM installed, **START SCAN** automatically uses record-only operation. It retains full PointCloud2 + IMU data (plus camera when enabled), checks streams and free space, and finalizes the bag on **STOP SCAN**. On a machine with GLIM, disable both live mapping and automatic processing in Settings for the same acquisition-only workflow. Sensors remain available for preview between captures and stop when the backend closes.
 
 The dashboard and CLI do not require a token. For terminal control of an already running backend:
 
@@ -47,3 +49,17 @@ After shutdown completes, copy the entire session to the workstation. Select it 
 ## Optional camera extension
 
 See [camera acquisition and calibration](camera_calibration.md) for opt-in installation, fixed pipeline setup, one-bag RGB recording, intrinsic import, static calibration datasets and the workstation manual/NID workflow. GLIM remains LiDAR + IMU only. Camera-disabled and record-only workflows above remain supported.
+
+## Level the live LiDAR view
+
+Under Calibration, keep the mounted sensor stationary and click **Orient LiDAR View** once. The app immediately uses the latest fresh, stable IMU window already collected in the background; there is no two-second wait after clicking. Motion, stale or missing measurements are rejected immediately. If the sensor was stopped, the app starts it; retry once healthy IMU data is available. The saved roll/pitch correction applies only to the live browser cloud; raw bags, GLIM inputs, extrinsics, optimized map previews and exports are unchanged. No point preprocessing is added. Gravity cannot determine heading. Reorient after changing the mounting angle; **Reset orientation** restores the original display. The setting is machine-local in `.state/view_orientation.json`.
+
+Ethernet defaults to automatic selection of a single active physical adapter on the configured LiDAR subnet. The app does not assign IP addresses or change OS networking. Explicit selection remains available under Advanced Diagnostics when multiple wired adapters match.
+
+## PC dense mapping
+
+Settings → Capture preferences → Mapping quality selects the preset used by Start Scan for automatic processing (and live mapping if enabled). Save preferences also selects that preset for Library → Process / Reprocess; Advanced / Diagnostics retains the per-job selector. Existing processing runs and exports are not rewritten.
+
+`PC dense · CPU · 5 cm detail` targets the current Ryzen 5 5600G / 16 GB workstation. It uses six CPU threads, a 20,000-point preprocessing target, 0.05 m minimum point separation within submap voxels, at most 500 points per voxel and 200,000 points per submap. These are sampling settings, not guaranteed accuracy or uniform spacing. CPU odometry and pose-graph mapping remain compatible with the installed CPU-only GLIM build. The RTX 5060 is present, but CUDA presets require a CUDA-enabled GLIM installation.
+
+Leave live mapping off and automatic processing on for this PC. Dense processing uses more memory and time; long routes still need memory/performance testing. Raw bags are unchanged. Browser previews remain limited to 50,000 points; use the exported PLY/native viewer to evaluate full map detail.

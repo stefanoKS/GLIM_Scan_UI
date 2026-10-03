@@ -78,8 +78,11 @@
       "url": "https://github.com/koide3/direct_visual_lidar_calibration.git",
       "sha": "02a0dc039f5509708f384be4ff3228e0ae09352d",
       "optional": true,
-      "validation": "source_interfaces_inspected_not_built",
-      "arm64_validated": false
+      "validation": "built_and_cli_smoke_tested_on_x86_64",
+      "arm64_validated": false,
+      "patches": [
+        "patches/direct-visual-lidar-calibration-native-compat.patch"
+      ]
     }
   },
   "frontend": {

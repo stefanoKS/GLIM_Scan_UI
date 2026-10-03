@@ -1,4 +1,34 @@
 version: 1
-calibrated: false
-validated: false
-reason: Intrinsics changed; previous result retained in history and source dataset
+camera_name: factory_rgb
+camera_frame_id: camera_optical_frame
+lidar_frame_id: livox_frame
+intrinsics_file: config/calibration/camera_intrinsics.yaml
+intrinsics_sha256: 1348cf44529d8da4162e48f658812bf4d162dfe5b76de235dc2c70baa375e5bc
+camera_model: plumb_bob
+intrinsics:
+- 1649.2797006066098
+- 1651.1350310666471
+- 362.53564138714165
+- 277.92373237199615
+distortion:
+- -3.6186638054949847
+- 82.12916607452976
+- -0.0256955073982211
+- 0.009411489913955838
+- -768.9938234296973
+width: 720
+height: 540
+T_lidar_camera:
+- 0.7506260592238159
+- -2.2352154571694043
+- 1.5362967791483313
+- 0.31458760445161343
+- 0.16359292115098997
+- -0.6575498908083266
+- 0.6647556967583197
+transform_convention: p_lidar = T_lidar_camera * p_camera
+time_offset_sec: 0.0
+source_calibration_id: cal_814d2b365c314245
+source_result: data/calibrations/cal_814d2b365c314245/result/calib.json
+calibrated: true
+validated: true

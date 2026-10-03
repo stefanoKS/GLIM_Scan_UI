@@ -4,11 +4,9 @@ import time
 import asyncio
 import pytest
 import yaml
-import cv2
 import numpy as np
 from factory_mapping.config import load
 from factory_mapping.camera_config import validate_camera
-from factory_mapping.camera_intrinsics import board, add_view, calibrate, detect, printable_board
 from factory_mapping import commands
 
 
@@ -28,7 +26,30 @@ def test_camera_configuration(root):
     assert c['camera']['image_topic']=='/camera/image_raw'
 
 
+def test_camera_parameters_preserve_spaces_in_calibration_path(root,tmp_path):
+    import shutil
+    from factory_mapping.commands import camera
+    c=enable(root)
+    spaced_root=tmp_path/'factory mapping'
+    shutil.copytree(root/'config',spaced_root/'config')
+    (spaced_root/'.state').mkdir()
+    matrix=lambda rows,cols,data:dict(rows=rows,cols=cols,data=data)
+    calibration=dict(image_width=720,image_height=540,camera_name='factory_rgb',distortion_model='plumb_bob',
+                    camera_matrix=matrix(3,3,[600,0,360,0,600,270,0,0,1]),
+                    distortion_coefficients=matrix(1,5,[0,0,0,0,0]),
+                    rectification_matrix=matrix(3,3,[1,0,0,0,1,0,0,0,1]),
+                    projection_matrix=matrix(3,4,[600,0,360,0,0,600,270,0,0,0,1,0]))
+    (spaced_root/'config/calibration/camera_intrinsics.yaml').write_text(yaml.safe_dump(calibration))
+    argv=camera(spaced_root,c)
+    params=yaml.safe_load((spaced_root/'.state/camera.params.yaml').read_text())['/**']['ros__parameters']
+    assert params['camera_info_url']=='file://'+str((spaced_root/c['camera']['intrinsics_file']).resolve())
+    assert '%20' not in params['camera_info_url']
+    assert argv[0:4]==['ros2','run','gscam2','gscam_main']
+
+
 def test_charuco_board_capture_and_solver(root):
+    cv2=pytest.importorskip("cv2",reason="Optional camera stack is not installed")
+    from factory_mapping.camera_intrinsics import board, add_view, calibrate, detect, printable_board
     image=cv2.imdecode(np.frombuffer(printable_board(),np.uint8),cv2.IMREAD_COLOR)
     if hasattr(cv2.aruco,'CharucoDetector'):
         assert len(detect(image)[1])>100
@@ -36,27 +57,51 @@ def test_charuco_board_capture_and_solver(root):
         add_view(views,image,1)
         with pytest.raises(ValueError,match='new camera frame'):add_view(views,image,1)
         with pytest.raises(ValueError,match='Move or rotate'):add_view(views,image,2)
-    points=board().getChessboardCorners()
+    target=board();points=target.getChessboardCorners() if hasattr(target,'getChessboardCorners') else target.chessboardCorners
     matrix=np.array([[630.,0,360.],[0,635.,270.],[0,0,1.]])
     samples=[]
     for index in range(9):
         projected,_=cv2.projectPoints(points,np.array([.08*index,.04*(index%3),-.03*index]),
                                       np.array([-.3+.015*index,-.2+.013*index,1.1+.04*index]),matrix,np.zeros(5))
         samples.append(dict(ids=np.arange(len(points)),corners=projected.reshape(-1,2).astype(np.float32),size=(720,540)))
-    with pytest.raises(ValueError,match='at least 8'):calibrate(samples[:7],load(root)['camera'])
-    measured,quality=calibrate(samples,load(root)['camera'])
+    with pytest.raises(ValueError,match='at least 4'):calibrate(samples[:3],load(root)['camera'])
+    measured,quality=calibrate(samples[:4],load(root)['camera'])
+    assert quality['views']==4
     assert quality['rms']<.01
     assert abs(measured['camera_matrix']['data'][0]-630)<1
 
 
+@pytest.mark.parametrize('rms',[12.01,float('nan'),float('inf')])
+def test_intrinsic_solver_rejects_bad_quality(root,monkeypatch,rms):
+    cv2=pytest.importorskip('cv2',reason='Optional camera stack is not installed')
+    from factory_mapping.camera_intrinsics import calibrate
+    samples=[dict(ids=np.arange(12),corners=np.zeros((12,2),np.float32),size=(720,540)) for index in range(4)]
+    monkeypatch.setattr(cv2,'calibrateCameraExtended',lambda *args:(rms,np.eye(3),np.zeros((1,5))))
+    with pytest.raises(ValueError,match='Reset views and recapture at least 4 sharp, distinct views'):
+        calibrate(samples,load(root)['camera'])
+
+
+def test_intrinsic_solver_accepts_rms_below_new_limit(root,monkeypatch):
+    cv2=pytest.importorskip('cv2',reason='Optional camera stack is not installed')
+    from factory_mapping.camera_intrinsics import calibrate
+    samples=[dict(ids=np.arange(12),corners=np.zeros((12,2),np.float32),size=(720,540)) for index in range(4)]
+    matrix=np.array([[630.,0,360.],[0,635.,270.],[0,0,1.]])
+    monkeypatch.setattr(cv2,'calibrateCameraExtended',lambda *args:(11.99,matrix,np.zeros((1,5))))
+    _,quality=calibrate(samples,load(root)['camera'])
+    assert quality['rms']==11.99
+
+
 def test_intrinsic_browser_capture_save_and_delete(root,monkeypatch):
+    cv2=pytest.importorskip("cv2",reason="Optional camera stack is not installed")
+    from factory_mapping.camera_intrinsics import board
     from fastapi.testclient import TestClient
     from factory_mapping.api import make_app
     from factory_mapping.calibration_data import intrinsics_status
     enable(root)
     with TestClient(make_app(root,True)) as client:
         assert client.get('/api/camera/intrinsics/board').headers['content-type']=='image/png'
-        assert client.get('/api/camera/intrinsics/views').json()['views']==0
+        progress=client.get('/api/camera/intrinsics/views').json()
+        assert progress['views']==0 and progress['required']==4
         assert client.post('/api/camera/intrinsics/views').status_code==409
         assert client.post('/api/action',json={'action':'camera_start'}).status_code==200
         service=client.app.state.service
@@ -73,8 +118,8 @@ def test_intrinsic_browser_capture_save_and_delete(root,monkeypatch):
             assert captured.json()['corners']>=12
             assert client.post('/api/camera/intrinsics/views').status_code==409
         assert client.delete('/api/camera/intrinsics/views').json()['views']==0
-        points=board().getChessboardCorners();matrix=np.array([[630.,0,360.],[0,635.,270.],[0,0,1.]])
-        for index in range(9):
+        target=board();points=target.getChessboardCorners() if hasattr(target,'getChessboardCorners') else target.chessboardCorners;matrix=np.array([[630.,0,360.],[0,635.,270.],[0,0,1.]])
+        for index in range(4):
             projected,_=cv2.projectPoints(points,np.array([.08*index,.04*(index%3),-.03*index]),
                                           np.array([-.3+.015*index,-.2+.013*index,1.1+.04*index]),matrix,np.zeros(5))
             service.intrinsic_samples.append(dict(ids=np.arange(len(points)),corners=projected.reshape(-1,2).astype(np.float32),size=(720,540)))

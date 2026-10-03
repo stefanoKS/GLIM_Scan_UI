@@ -71,3 +71,20 @@ def test_project_archive_rejects_traversal_tampering_and_symlinks(root,tmp_path)
     assert not (target/'data/sessions'/session['id']).exists()
     (folder/'outside').symlink_to(tmp_path)
     with pytest.raises(ValueError,match='symlink'):sessions.export_archive(session['id'],tmp_path/'unsafe.zip')
+
+
+@pytest.mark.parametrize('invalid',['bag_path','camera_config'])
+def test_project_import_validates_semantics_after_checksums(root,tmp_path,invalid):
+    import yaml
+    sessions=Sessions(root);m=sessions.create('portable_validation','',load(root));folder=sessions.get(m['id'])
+    if invalid=='bag_path':
+        bag=folder/'raw_bag';bag.mkdir();(bag/'data.db3').write_bytes(b'fixture')
+        (bag/'metadata.yaml').write_text(yaml.safe_dump({'rosbag2_bagfile_information':{'relative_file_paths':['../outside.db3']}}))
+    else:
+        config=json.loads((folder/'active_config.json').read_text());config['camera']['width']=0
+        atomic_json(folder/'active_config.json',config)
+    archive=tmp_path/'invalid.zip';sessions.export_archive(m['id'],archive)
+    target=Sessions(tmp_path/'target')
+    with pytest.raises(ValueError,match='(bag metadata|configuration is invalid)'):target.import_archive(archive)
+    assert not (target.base/m['id']).exists()
+    assert not list(target.base.glob('.import-*'))

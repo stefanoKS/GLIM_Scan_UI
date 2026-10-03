@@ -1,8 +1,8 @@
-import asyncio, json, os, shutil, sys, time, uuid
+import asyncio, copy, json, os, shutil, sys, time, uuid
 from datetime import datetime
 from pathlib import Path
 from . import commands, glim_tools
-from .config import ROOT, PRESETS, load, validate_sensor, wired_host_ip
+from .config import ROOT, PRESETS, load, validate_sensor, wired_connection
 from .storage import Sessions, atomic_json, read_json, now, size
 from .processes import ProcessManager
 from .health import network, system_status
@@ -24,6 +24,8 @@ class Service:
             for f in (p/'processing').glob('*/job.json'):
                 job=read_json(f,{})
                 if job.get('state')=='running': job.update(state='interrupted'); atomic_json(f,job)
+        from .capture import CaptureController
+        self.capture=CaptureController(self)
     def event(self,kind,**fields):
         entry=dict(time=now(),event=kind,**fields)
         path=self.root/'.state/application.jsonl'
@@ -42,7 +44,7 @@ class Service:
         processes=self.pm.view(); h=self.health(); h['camera']=self.camera_health()
         detection={'camera':detect_camera(self.config.get('camera',{})), 'mid360':dict(detected=self.net.get('state')=='reachable',basis='Configured IP responds to ICMP; stream health is separate')}
         if self.mock: detection={k:dict(detected=False,basis='MOCK: physical detection is not performed') for k in detection}
-        return dict(detection=detection,mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,camera_calibration=self.camera_calibration(),network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
+        return dict(capture=self.capture.view(),detection=detection,mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,camera_calibration=self.camera_calibration(),network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
     async def start_process(self,key,args,log,out=None,done=None):
         if self.mock:
             args=[sys.executable,'-m','factory_mapping.mock_worker',key,str(out or self.root/'.state/mock')]
@@ -55,7 +57,7 @@ class Service:
         self.event('process_start',role=key,pid=result['pid']); return result
     async def start_driver(self):
         if not self.mock:
-            self.config['sensor']['host_ip']=wired_host_ip(self.config['sensor'])
+            self.config['sensor']['interface'],self.config['sensor']['host_ip']=wired_connection(self.config['sensor'])
             self.net=await network(self.config['sensor'])
             if self.net['state']!='reachable': raise ValueError(self.net['action'])
         result=await self.start_process('driver',commands.driver(self.root,self.config),self.root/'.state/driver.log')
@@ -75,6 +77,24 @@ class Service:
         if not self.mock and not all(self.health().get(k,{}).get('state')=='healthy' for k in ('lidar','imu')): raise ValueError('LiDAR and IMU must both have healthy message rates; run diagnostics')
         if self.config['system']['camera']['enabled'] and self.config['camera']['required_for_mapping'] and not self.camera_health()['healthy']: raise ValueError('Required camera frames are not healthy; start camera and check rates/geometry')
         if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
+    async def start_preview_sensors(self):
+        if self.mock: return
+        async with self.lock:
+            if not self.pm.active('driver'):
+                try: await self.start_driver()
+                except Exception as error: self.errors.append('LiDAR preview unavailable at startup: '+str(error))
+            if self.config.get('camera') and not self.pm.active('camera'):
+                try: await self.start_camera(force=True)
+                except Exception as error: self.errors.append('Camera preview unavailable at startup: '+str(error))
+    async def prepare_camera(self):
+        if 'camera' not in self.config: raise ValueError('Camera is not configured')
+        if not self.pm.active('camera'): await self.start_camera(force=True)
+        for attempt in range(16):
+            h=self.camera_health()
+            if h['healthy'] and h['camera_info_seen']: return
+            if attempt==15: raise ValueError('Camera frames or CameraInfo are unavailable; check camera diagnostics')
+            await asyncio.sleep(1)
+
     async def prepare_recording(self):
         # Enabling RGB means Record must acquire both sensors. Disabling it keeps
         # the independent LiDAR-only / record-only path available.
@@ -93,21 +113,39 @@ class Service:
                 if attempt==15: raise
                 await asyncio.sleep(1)
 
-    async def start_recording(self,sid):
+    async def start_recording(self,sid,camera_only=False):
         if self.pm.active('recording'): raise ValueError('Recording is already active; stop the current session before starting another')
-        if self.pm.active('calibration_record'): raise ValueError('Finish calibration capture before mapping recording')
+        if any(self.pm.active(k) for k in ('calibration_record','calibration_tool','offline','export','tool')): raise ValueError('Finish processing, editing or calibration before recording')
         p=self.sessions.get(sid)
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if (p/'raw_bag').exists(): raise ValueError('This session already contains a raw bag; create another session')
-        await self.prepare_recording()
+        if camera_only:
+            if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
+            await self.prepare_camera()
+        else: await self.prepare_recording()
+        acquisition=copy.deepcopy(self.config)
+        if camera_only: acquisition['system']['camera']['enabled']=True
         # Re-snapshot at acquisition time, not merely when a name is reserved.
-        shutil.copytree(self.root/'config',p/'config_snapshot',dirs_exist_ok=True); atomic_json(p/'active_config.json',self.config)
+        shutil.copytree(self.root/'config',p/'config_snapshot',dirs_exist_ok=True); atomic_json(p/'active_config.json',acquisition)
         self.active=p; self.rate_baseline={k:self.health().get(k,{}).get('count',0) for k in ('lidar','imu')}
         async def done(item):
             if item['state']=='failed': self.errors.append('Recorder exited unexpectedly; inspect recording.log and bag metadata'); self.sessions.update(p,state='failed')
-        try: result=await self.start_process('recording',commands.record(p,self.config),p/'logs/recording.log',p/'raw_bag',done)
-        except Exception: self.active=None; raise
-        self.record_started=time.time(); self.sessions.update(p,state='recording',start_time=now(),topics=commands.acquisition_topics(self.config),camera=camera_metadata(self.root,self.config),lidar_ip=self.config['sensor']['lidar_ip'])
+        try:
+            result=await self.start_process('recording',commands.record(p,acquisition,camera_only=camera_only),p/'logs/recording.log',p/'raw_bag',done)
+            # Do not announce SCANNING before the recorder has initialized its
+            # signal handlers/output. An immediate Stop must finalize safely.
+            for attempt in range(100):
+                if not self.pm.active('recording'): raise ValueError('Recorder exited during startup; inspect recording.log')
+                ready=('MOCK recording started' in (p/'logs/recording.log').read_text(errors='replace')) if self.mock else any((p/'raw_bag').glob('*.db3'))
+                if ready: break
+                await asyncio.sleep(.05)
+            else: raise ValueError('Recorder did not create its bag within 5 seconds')
+        except Exception:
+            await self.pm.stop('recording',5)
+            self.sessions.update(p,state='failed',failure_stage='recorder_start')
+            self.active=None
+            raise
+        self.record_started=time.time(); self.sessions.update(p,state='recording',start_time=now(),kind='camera' if camera_only else 'scan',topics=commands.acquisition_topics(acquisition,camera_only=camera_only),camera=camera_metadata(self.root,acquisition),lidar_ip=self.config['sensor']['lidar_ip'])
         return result
     async def stop_recording(self):
         if not self.active or self.record_started is None: return
@@ -117,16 +155,28 @@ class Service:
         ok=bool(item and item['returncode']==0 and not item['forced'] and finalized)
         h=self.health(); rates={k:(h.get(k,{}).get('count',0)-self.rate_baseline.get(k,0))/duration if duration and not self.mock else None for k in ('lidar','imu')}
         camera_stats={}
+        acquired=read_json(p/'active_config.json',self.config)
+        recording_errors=[]
         if finalized and not self.mock:
             import yaml
-            info=yaml.safe_load((p/'raw_bag/metadata.yaml').read_text())['rosbag2_bagfile_information']
-            seconds=info['duration']['nanoseconds']/1e9
-            for entry in info['topics_with_message_count']:
-                if self.config['system']['camera']['enabled'] and entry['topic_metadata']['name']==self.config['camera']['image_topic']:
-                    camera_stats=dict(image_count=entry['message_count'],measured_image_hz=entry['message_count']/seconds if seconds else None)
-                for kind,key in [('lidar','points_topic'),('imu','imu_topic')]:
-                    if entry['topic_metadata']['name']==self.config['sensor'][key]: rates[kind]=entry['message_count']/seconds if seconds else None
-        self.sessions.update(p,state='recorded' if ok else 'failed',end_time=now(),duration=duration,average_lidar_hz=rates['lidar'],average_imu_hz=rates['imu'],disk_usage_bytes=size(p),bag_finalized=finalized)
+            try:
+                info=yaml.safe_load((p/'raw_bag/metadata.yaml').read_text())['rosbag2_bagfile_information']
+                seconds=info['duration']['nanoseconds']/1e9
+                entries={entry['topic_metadata']['name']:entry for entry in info['topics_with_message_count']}
+                expected=read_json(p/'metadata.json',{}).get('topics',{})
+                for topic in expected.values():
+                    if entries.get(topic,{}).get('message_count',0)<=0: recording_errors.append('No recorded messages on '+topic)
+                if seconds<=0: recording_errors.append('Recording has no positive duration')
+                for topic,entry in entries.items():
+                    if acquired['system']['camera']['enabled'] and topic==acquired['camera']['image_topic']:
+                        camera_stats=dict(image_count=entry['message_count'],measured_image_hz=entry['message_count']/seconds if seconds else None)
+                    for kind,key in [('lidar','points_topic'),('imu','imu_topic')]:
+                        if topic==acquired['sensor'][key]: rates[kind]=entry['message_count']/seconds if seconds else None
+            except (OSError,KeyError,TypeError,ValueError,yaml.YAMLError) as error:
+                finalized=False;recording_errors.append('Invalid bag metadata: '+str(error))
+            if recording_errors: ok=False;self.errors.extend(recording_errors)
+        if read_json(p/'metadata.json',{}).get('kind')=='camera': rates={'lidar':None,'imu':None}
+        self.sessions.update(p,state='recorded' if ok else 'failed',end_time=now(),duration=duration,average_lidar_hz=rates['lidar'],average_imu_hz=rates['imu'],disk_usage_bytes=size(p),bag_finalized=finalized,recording_errors=recording_errors)
         meta=read_json(p/'metadata.json',{})
         if meta.get('camera',{}).get('enabled'):
             camera_stats.setdefault('image_count',0);camera_stats.setdefault('measured_image_hz',None)
@@ -138,7 +188,7 @@ class Service:
     def check_preset(self,preset):
         if preset not in PRESETS: raise ValueError('Unknown GLIM preset')
         if not self.glim_available(): raise ValueError('GLIM is not installed here. Use Record-only Session and process the completed session on the workstation, or install GLIM.')
-        if not self.mock and preset!='jetson_cpu' and (not read_json(self.root/'.state/build_capabilities.json',{}).get('cuda',False) or not (self.root/'ros2_ws/install/glim/lib/libodometry_estimation_gpu.so').exists()):
+        if not self.mock and preset in ('jetson_gpu','offline_quality') and (not read_json(self.root/'.state/build_capabilities.json',{}).get('cuda',False) or not (self.root/'ros2_ws/install/glim/lib/libodometry_estimation_gpu.so').exists()):
             raise ValueError('This installation has no CUDA GLIM module; select the CPU preset or build CUDA support')
     async def start_glim(self,sid,preset,viewer=False):
         self.check_preset(preset)
@@ -149,6 +199,7 @@ class Service:
         p=self.sessions.get(sid)
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if self.pm.active('glim'): raise ValueError('GLIM is already active')
+        if read_json(p/'metadata.json',{}).get('kind')=='camera': raise ValueError('Camera-only recordings cannot be processed by LiDAR/IMU GLIM')
         out=p/'glim_dump'
         if any(out.iterdir()): raise ValueError('Live output exists; use a new session or offline reprocessing')
         cfg=p/'config_snapshot'/('live_'+uuid.uuid4().hex[:8]); commands.preset_snapshot(self.root,p,preset,cfg)
@@ -182,10 +233,11 @@ class Service:
     async def offline(self,sid,preset):
         self.check_preset(preset)
         if self.config['system']['loop_closure']['enabled']: raise ValueError('ScanContext is unavailable until validated')
-        if any(self.pm.active(k) for k in ('glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('GLIM or export is already active')
+        if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('GLIM or export is already active')
         p=self.sessions.get(sid)
         if self.active==p or read_json(p/'metadata.json',{})['state'] in ('created','recording','interrupted','failed'): raise ValueError('Session needs a finalized recording before processing')
         if not self.mock and not (p/'raw_bag/metadata.yaml').exists(): raise ValueError('No finalized ROS bag found')
+        if read_json(p/'metadata.json',{}).get('kind')=='camera': raise ValueError('Camera-only recordings cannot be processed by LiDAR/IMU GLIM')
         runs=p/'processing'; i=1
         while (runs/f'run_{i:03d}').exists(): i+=1
         run=runs/f'run_{i:03d}'; run.mkdir(); cfg=commands.preset_snapshot(self.root,p,preset,run/'config'); dump=run/'glim_dump'
@@ -208,7 +260,7 @@ class Service:
         p=self.sessions.get(sid); run=self.get_run(p,run_id); job=read_json(run/'job.json',{})
         if job.get('state')!='completed': raise ValueError('Process this session successfully before export')
         if self.mock: raise ValueError('Mock results cannot be exported as maps')
-        if any(self.pm.active(k) for k in ('glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('GLIM or export is active')
+        if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('GLIM or export is active')
         if not os.environ.get('DISPLAY'): raise ValueError('Official GLIM exporter needs an OpenGL display; run on a desktop workstation or configured Xvfb')
         output=p/'exports'/f'{run_id}_{uuid.uuid4().hex[:8]}.ply'
         async def done(item):
@@ -221,11 +273,11 @@ class Service:
         if not run.is_dir() or run.is_symlink(): raise ValueError('Processing run not found')
         return run
     def delete_run(self,sid,rid):
-        if any(self.pm.active(k) for k in ('glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Stop processing before deleting derived data')
+        if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Stop processing before deleting derived data')
         run=self.get_run(self.sessions.get(sid),rid); shutil.rmtree(run)
     async def open_tool(self,sid,rid,kind,additional):
         if self.mock: raise ValueError('Native GLIM editing requires a real saved map')
-        if any(self.pm.active(k) for k in ('glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Finish GLIM processing or close the current editor first')
+        if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Finish GLIM processing or close the current editor first')
         if not os.environ.get('DISPLAY'): raise ValueError('GLIM editing opens on the server desktop. Use a local display on Jetson or copy the session to a workstation.')
         def source(sid,rid):
             p=self.sessions.get(sid); run=self.get_run(p,rid)
@@ -252,7 +304,7 @@ class Service:
         if not p.is_dir() or p.is_symlink(): raise ValueError('Edit workspace not found')
         return p
     async def export_edit(self,sid,eid):
-        if any(self.pm.active(k) for k in ('glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Close editing and finish processing before export')
+        if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Close editing and finish processing before export')
         if not os.environ.get('DISPLAY'): raise ValueError('Official GLIM exporter requires a display')
         workspace=self.edit_workspace(sid,eid); dump=workspace/'saved_map'
         # Native tools must save explicitly into the displayed output location.
@@ -267,6 +319,7 @@ class Service:
         while not self.closed:
             try:
                 if not self.mock: await self.refresh_host_ip()
+                async with self.lock: await self.capture.reconcile()
                 self.net={'state':'mock'} if self.mock else await network(self.config['sensor'])
                 if (self.pm.active('recording') or self.pm.active('calibration_record')) and shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9:
                     async with self.lock:
@@ -277,17 +330,18 @@ class Service:
             await asyncio.sleep(2)
     async def refresh_host_ip(self):
         async with self.lock:
-            sensor=self.config['sensor']; current=wired_host_ip(sensor)
-            if current==sensor['host_ip']: return
+            sensor=self.config['sensor']; interface,current=wired_connection(sensor)
+            if (interface,current)==(sensor['interface'],sensor['host_ip']): return
             was_running=self.pm.active('driver')
             if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
-            if self.active: await self.stop_session()
+            if self.active and read_json(self.active/'metadata.json',{}).get('kind')!='camera': await self.stop_session()
             if was_running: await self.stop_driver()
-            previous=sensor['host_ip']; sensor['host_ip']=current
+            previous=sensor['host_ip']; sensor['host_ip']=current; sensor['interface']=interface
             self.event('host_ip_changed',previous=previous,current=current)
             if was_running and current: await self.start_driver()
     async def close(self):
         self.closed=True
+        await self.capture.close()
         if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
         await self.stop_session()
         for k in ('calibration_record','calibration_tool','offline','export','tool','validator','camera_preview','camera_monitor','camera','preview','monitor','driver'):
@@ -305,7 +359,7 @@ class Service:
         return dict(intrinsics=intr,extrinsics=ext)
 
     def camera_health(self):
-        enabled=self.config['system']['camera']['enabled'];running=self.pm.active('camera')
+        running=self.pm.active('camera');enabled=self.config['system']['camera']['enabled'] or running
         base=dict(state='disabled' if not enabled else 'stopped',healthy=False,camera_running=running,hz=0,image_hz=0,image_age=None,last_image_timestamp=None,width=None,height=None,camera_info_seen=False,camera_info_valid=False,frame_id=None)
         if not enabled or not running:return base
         if self.mock:
@@ -315,8 +369,8 @@ class Service:
         if not self.pm.active('camera_monitor') or time.time()-data.get('updated_at',0)>3:return dict(base,state='monitor_stale')
         return {**base,**data,'camera_running':running}
 
-    async def start_camera(self):
-        if not self.config['system']['camera']['enabled']:raise ValueError('Camera is disabled in config/system.yaml')
+    async def start_camera(self,force=False):
+        if not force and not self.config['system']['camera']['enabled']:raise ValueError('Camera is disabled in config/system.yaml')
         if self.pm.active('camera'):raise ValueError('Camera is already running')
         if not self.mock:
             args=commands.camera(self.root,self.config)

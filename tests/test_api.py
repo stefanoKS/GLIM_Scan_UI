@@ -79,14 +79,19 @@ def test_record_only_session_never_calls_glim(root, monkeypatch):
         assert meta['end_time'] and meta['finalized_at']
         assert c.get('/api/status').json()['active_session'] is None
 
-def test_missing_glim_rejected_before_recording_or_driver_start(root):
+def test_missing_glim_rejected_without_starting_capture_processes(root):
     app=make_app(root,False)
     with TestClient(app) as c:
         sid=c.post('/api/sessions',json={'name':'no glim installed'}).json()['id']
-        assert c.get('/api/status').json()['glim_available'] is False
+        status=c.get('/api/status').json()
+        assert status['glim_available'] is False
+        # Live preview starts at app startup, independently of a mapping action.
+        preview_pids={key:item['pid'] for key,item in status['processes'].items()}
         response=c.post('/api/action',json={'action':'session_start','session':sid})
         assert response.status_code==409 and 'not installed' in response.json()['detail']
-        assert c.get('/api/status').json()['processes']=={}
+        processes=c.get('/api/status').json()['processes']
+        assert {key:item['pid'] for key,item in processes.items()}==preview_pids
+        assert 'recording' not in processes and 'glim' not in processes
 
 def test_mock_record_process_and_raw_protection(root):
     app=make_app(root,True)
@@ -115,7 +120,7 @@ def test_host_ip_change_finalizes_recording_and_restarts_driver(root,monkeypatch
         sid=c.post('/api/sessions',json={'name':'network change'}).json()['id']
         assert c.post('/api/action',json={'action':'record_start','session':sid}).status_code==200
         old_pid=service.pm.items['driver']['pid']
-        monkeypatch.setattr('factory_mapping.service.wired_host_ip',lambda sensor:'192.168.1.240')
+        monkeypatch.setattr('factory_mapping.service.wired_connection',lambda sensor:(sensor['interface'],'192.168.1.240'))
         c.portal.call(service.refresh_host_ip)
         status=c.get('/api/status').json()
         assert status['config']['sensor']['host_ip']=='192.168.1.240'
@@ -128,7 +133,7 @@ def test_network_save_omits_detected_host_ip(root):
     app=make_app(root,True)
     with TestClient(app) as c:
         sensor=c.get('/api/status').json()['config']['sensor']
-        body={key:value for key,value in sensor.items() if key not in ('host_ip','serial_number','frame_id','imu_frame_id','expected_imu_hz','T_lidar_imu')}
+        body={key:value for key,value in sensor.items() if key not in ('host_ip','interface_setting','serial_number','frame_id','imu_frame_id','expected_imu_hz','T_lidar_imu')}
         response=c.put('/api/network',json=body)
         assert response.status_code==200,response.text
         assert 'host_ip' not in (root/'config/livox/mid360.yaml').read_text()

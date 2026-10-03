@@ -5,7 +5,7 @@ import yaml
 from .camera_config import validate_camera, config_path
 
 ROOT = Path(os.environ.get('FACTORY_MAPPING_ROOT', Path(__file__).resolve().parents[3])).resolve()
-PRESETS = ('jetson_cpu', 'jetson_gpu', 'offline_quality')
+PRESETS = ('jetson_cpu', 'jetson_gpu', 'offline_quality', 'pc_dense')
 
 def load(root=ROOT):
     system = yaml.safe_load((root/'config/system.yaml').read_text())
@@ -16,7 +16,8 @@ def load(root=ROOT):
         system['camera']['enabled']=enabled
     sensor = yaml.safe_load((root/'config/livox/mid360.yaml').read_text())
     validate_sensor(sensor)
-    sensor['host_ip'] = wired_host_ip(sensor)
+    sensor['interface_setting'] = sensor['interface']
+    sensor['interface'], sensor['host_ip'] = wired_connection(sensor)
     if not 0 <= system.get('offline_ros_domain_id',230) <= 232 or system.get('offline_ros_domain_id',230)==sensor['ros_domain_id']: raise ValueError('Offline ROS domain must be valid and different from acquisition')
     if system['preset'] not in PRESETS: raise ValueError('Unknown GLIM preset')
     if system['loop_closure']['enabled'] not in (False, 'scan_context'): raise ValueError('Invalid loop closure mode')
@@ -39,6 +40,25 @@ def wired_host_ip(sensor):
     addresses=psutil.net_if_addrs().get(sensor['interface'],[])
     matches=[address.address for address in addresses if address.family==socket.AF_INET and address.netmask and lidar_ip in ipaddress.IPv4Network(f'{address.address}/{address.netmask}',strict=False)]
     return matches[0] if len(matches)==1 else None
+
+def wired_connection(sensor, sys_net=Path('/sys/class/net')):
+    """Resolve one physical, up Ethernet adapter on the sensor subnet.
+
+    Ambiguous networks fail closed; no Wi-Fi, bridges or OS route changes.
+    An explicit interface remains available under Advanced Diagnostics.
+    """
+    setting=sensor.get('interface_setting',sensor['interface'])
+    if setting!='auto': return setting,wired_host_ip({**sensor,'interface':setting})
+    stats=psutil.net_if_stats();candidates=[]
+    for name in psutil.net_if_addrs():
+        node=sys_net/name
+        try:
+            ethernet=(node/'device').exists() and (node/'type').read_text().strip()=='1' and not (node/'wireless').exists()
+        except OSError: ethernet=False
+        if not ethernet or name not in stats or not stats[name].isup: continue
+        address=wired_host_ip({**sensor,'interface':name})
+        if address: candidates.append((name,address))
+    return candidates[0] if len(candidates)==1 else ('auto',None)
 
 def validate_sensor(s):
     ipaddress.IPv4Address(s['lidar_ip'])

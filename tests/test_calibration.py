@@ -103,7 +103,7 @@ def test_nonfinite_result_rejected(root):
     with pytest.raises(ValueError):parse_result(p,intr)
 
 
-def test_capture_statistics_reject_missing_or_slow_camera(root):
+def test_capture_statistics_accepts_slow_camera_but_rejects_missing_streams(root):
     c=enabled(root);bag=root/'bag';bag.mkdir()
     info={'duration':{'nanoseconds':10_000_000_000},'topics_with_message_count':[]}
     entries=info['topics_with_message_count']
@@ -112,7 +112,7 @@ def test_capture_statistics_reject_missing_or_slow_camera(root):
     def save(): (bag/'metadata.yaml').write_text(yaml.safe_dump({'rosbag2_bagfile_information':info}))
     save();assert bag_statistics(bag,c)['topics']['image_topic']['hz']==15
     entries[1]['message_count']=1;save()
-    with pytest.raises(ValueError,match='rate'):bag_statistics(bag,c)
+    assert bag_statistics(bag,c)['topics']['image_topic']['hz']==.1
     entries[1]['message_count']=150;entries.pop();save()
     with pytest.raises(ValueError,match='CameraInfo'):bag_statistics(bag,c)
 

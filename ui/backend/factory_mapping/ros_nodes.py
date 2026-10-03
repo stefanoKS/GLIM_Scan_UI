@@ -15,6 +15,8 @@ def run(kind):
     from sensor_msgs_py.point_cloud2 import read_points
     rclpy.init(); node=Node('factory_mapping_'+kind)
     rates={'lidar':Rates(),'imu':Rates()}; last=[0.0]
+    from .orientation import GravityWindow
+    gravity=GravityWindow()
     def stamp(m): return m.header.stamp.sec+m.header.stamp.nanosec*1e-9
     def cloud(m):
         if kind=='monitor': rates['lidar'].add(stamp(m),m.width*m.height); return
@@ -30,10 +32,14 @@ def run(kind):
         out=ROOT/'.state/preview.bin'; tmp=out.with_suffix('.tmp'); tmp.write_bytes(payload); tmp.replace(out)
     node.create_subscription(PointCloud2,sensor['points_topic'],cloud,qos_profile_sensor_data)
     if kind=='monitor':
-        node.create_subscription(Imu,sensor['imu_topic'],lambda m:rates['imu'].add(stamp(m)),qos_profile_sensor_data)
+        def imu(m):
+            rates['imu'].add(stamp(m))
+            a=m.linear_acceleration;g=m.angular_velocity
+            gravity.add(time.time(),[a.x,a.y,a.z],[g.x,g.y,g.z])
+        node.create_subscription(Imu,sensor['imu_topic'],imu,qos_profile_sensor_data)
         def report():
             topics=dict(node.get_topic_names_and_types())
-            obj={'updated_at':time.time(),'topics':topics,'lidar':rates['lidar'].view(),'imu':rates['imu'].view()}
+            obj={'updated_at':time.time(),'topics':topics,'gravity':gravity.view(time.time()),'lidar':rates['lidar'].view(),'imu':rates['imu'].view()}
             for key,topic,expected in [('lidar',sensor['points_topic'],sensor['publish_freq']),('imu',sensor['imu_topic'],sensor['expected_imu_hz'])]:
                 r=obj[key]
                 r['state']='topic_missing' if topic not in topics else ('no_messages' if r['hz']==0 else ('rate_abnormal' if not expected*.7<=r['hz']<=expected*1.3 else 'healthy'))

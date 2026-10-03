@@ -65,3 +65,23 @@ Added an explicit **Start Record-only Session** action that starts the driver an
 The browser review used an isolated mock repository under `.state/record-only-browser-review/`, with no GLIM installation. It opened without login, created a session, started record-only with the CUDA preset selected, kept GLIM stopped, and finalized the session as recorded with `glim_live=false` and `bag_finalized=true`. This was a mock lifecycle check; the disconnected sensor was not contacted and production sessions were not changed.
 
 `bootstrap_jetson.sh --record-only` skips GLIM and CUDA setup; `verify_jetson.sh --record-only` checks acquisition prerequisites without requiring GLIM. Selective fetching of the two official Livox repositories was exercised on this PC. The full fresh ARM64 installation and live record-only hardware acceptance remain to be run on Jetson.
+
+## Semantic capture and simplified UI regression
+
+See [capture system analysis](capture_refactor_analysis.md) for the current module review, capture failure tests, browser acceptance, real 1.15 GB project export/import → native GLIM → PLY replay, raw-file hash verification and remaining disconnected-sensor/Jetson checks. The user's current camera calibration/configuration was preserved.
+
+## Ethernet auto-detection and display orientation
+
+89 regression tests passed (`.state/orientation-final-tests.log`), including Ethernet exclusion/ambiguity, level/inverted/tilted gravity, motion/stale rejection, and persisted orientation/reset without configuration changes. On the connected PC, auto-detection selected enp6s0 / 192.168.1.135; Mid-360 streamed about 10 Hz and IMU about 200 Hz. Browser Orient succeeded with real IMU measurements; Reset was also verified and left at original orientation. Evidence is in `.state/ethernet-orientation-acceptance.json`. No recording or GLIM job was started for this check.
+
+## Optional calibration native build — 2026-10-03
+
+Built and installed `direct_visual_lidar_calibration` on the x86_64 Humble PC with the system Ceres 2.0 and pinned GTSAM 4.3. The tracked native compatibility patch preserves Sophus right-multiplicative SE(3) updates through the older Ceres API and uses GTSAM's pointer type for the continuous-time ICP/GICP factors. Patch application and repeat-install detection were checked against the pinned source. A native finite-difference check passed for the SE(3) Jacobian at five poses, along with unit-quaternion, zero-update and Ceres parameter-block checks.
+
+ROS lists the installed package executables; `preprocess`, `initial_guess_manual` and `calibrate` passed `--help` launch checks. The 69 camera, calibration, capture and API tests passed across the suite run and the corrected-test rerun. One stale API test was updated to account for automatic live-preview startup while still verifying that rejected mapping requests start no capture processes. No calibration timing, live-preview behavior, camera configuration or measured intrinsics were changed. Physical camera–LiDAR calibration accuracy, the newer Ceres branch and ARM64 builds remain unvalidated.
+
+## PC dense preset — 2026-10-03
+
+Detected Ryzen 5 5600G (6 cores / 12 threads), 16 GB RAM and RTX 5060 (8 GB VRAM); installed GLIM reports CUDA disabled. Added `pc_dense` with CPU modules and selectable, persisted mapping quality. Forty existing capture/core/API tests and three new preset-selection, CPU-compatibility and invalid-preset tests passed.
+
+Reprocessed the real bag from `20261003_140604_Scan_2026-10-03_14_06_04` in `.state/pc-dense-validation`, preserving the session's existing outputs. Native processing completed successfully. The single submap retained 9,205 points versus 2,102 in the baseline result (approximately 4.4×). This short-bag check establishes compatibility and increased retained detail, not long-route performance or improved geometric accuracy.

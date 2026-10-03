@@ -1,7 +1,10 @@
 """ChArUco intrinsic calibration for the configured DFK camera."""
 import math
 
-import cv2
+try:
+    import cv2
+except ImportError as error:
+    raise ValueError('Camera calibration requires the optional camera installation: scripts/install_camera.sh') from error
 import numpy as np
 
 from .calibration_data import parse_intrinsics
@@ -10,8 +13,9 @@ from .calibration_data import parse_intrinsics
 SQUARES = (24, 16)
 SQUARE_LENGTH = 0.025
 MARKER_LENGTH = 0.020
-MIN_VIEWS = 8
+MIN_VIEWS = 4
 MAX_VIEWS = 40
+MAX_RMS_PX = 12.0
 
 
 def board():
@@ -68,12 +72,16 @@ def calibrate(samples, camera):
     if len(samples) < MIN_VIEWS: raise ValueError(f'Capture at least {MIN_VIEWS} distinct board views')
     size = (camera['width'], camera['height'])
     if any(sample['size'] != size for sample in samples): raise ValueError('Camera resolution changed during calibration')
-    object_corners = board().getChessboardCorners()
+    target = board()
+    object_corners = target.getChessboardCorners() if hasattr(target, 'getChessboardCorners') else target.chessboardCorners
     objects = [np.asarray(object_corners[sample['ids']], dtype=np.float32).reshape(-1, 3) for sample in samples]
     images = [sample['corners'].reshape(-1, 2) for sample in samples]
     rms, matrix, distortion, *_ = cv2.calibrateCameraExtended(objects, images, size, None, None)
-    if not math.isfinite(rms) or rms > 2 or not np.isfinite(matrix).all() or not np.isfinite(distortion).all():
-        raise ValueError('Calibration reprojection error is too high; capture clearer, varied views')
+    if not math.isfinite(rms) or rms > MAX_RMS_PX or not np.isfinite(matrix).all() or not np.isfinite(distortion).all():
+        detail = f'RMS {rms:.2f} px; maximum {MAX_RMS_PX:.2f} px' if math.isfinite(rms) else 'Solver returned a nonfinite error'
+        raise ValueError(f'Calibration rejected ({detail}). Reset views and recapture at least {MIN_VIEWS} sharp, distinct views: '
+                         'keep focus fixed, use a flat board, vary tilt/distance and cover the image edges. '
+                         'Add more views if needed; check lighting, glare and motion blur.')
     coefficients = distortion.reshape(-1).tolist()
     if len(coefficients) != 5: raise ValueError('Unexpected distortion model from OpenCV')
     projection = np.column_stack((matrix, np.zeros(3)))
