@@ -107,7 +107,8 @@ class Service:
                 if self.config['system']['camera']['enabled']:
                     h=self.camera_health()
                     if not h['healthy'] or not h['camera_info_seen']:
-                        raise ValueError('Camera-enabled recording requires 720×540 images and CameraInfo; check camera diagnostics or disable RGB for LiDAR-only recording')
+                        camera=self.config['camera']
+                        raise ValueError(f"Camera-enabled recording requires {camera['width']}×{camera['height']} {camera['model']} images and CameraInfo; check camera diagnostics or disable RGB for LiDAR-only recording")
                 return
             except ValueError:
                 if attempt==15: raise

@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, ConfigDict
-from .config import ROOT, validate_sensor
+from .config import ROOT, validate_sensor, load_camera_profile
 from .service import Service
 from .glim_tools import capabilities
 from .storage import atomic_json, read_json
@@ -76,6 +76,10 @@ class ToolRequest(BaseModel):
 class CameraEnabled(BaseModel):
     model_config=ConfigDict(extra="forbid")
     enabled: bool=Field(strict=True)
+
+class CameraProfile(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    profile: Literal['d405','dfk33ux287']
 
 class IntrinsicsImport(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -218,6 +222,24 @@ def make_app(root=ROOT,mock=None):
             atomic_json(root/'.state/camera_enabled.json',{'enabled':body.enabled})
             s.config['system']['camera']['enabled']=body.enabled
             return {'enabled':body.enabled}
+
+    @app.put('/api/camera/profile')
+    async def camera_profile(body:CameraProfile):
+        s=app.state.service
+        async with s.lock:
+            if s.capture.busy or s.active: raise ValueError('Finish capture before changing the camera')
+            s.calibrations.idle()
+            if s.config['system']['camera']['profile']==body.profile:
+                return {'profile':body.profile}
+            camera=load_camera_profile(root,body.profile,s.config['sensor'])
+            was_running=s.pm.active('camera')
+            if was_running: await s.stop_camera()
+            atomic_json(root/'.state/camera_profile.json',{'profile':body.profile})
+            s.config['system']['camera']['profile']=body.profile
+            s.config['camera']=camera
+            if was_running and s.config['system']['camera']['enabled']:
+                await s.start_camera()
+            return {'profile':body.profile}
     @app.get('/api/camera/preview')
     async def camera_preview():
         s=app.state.service

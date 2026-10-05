@@ -31,7 +31,10 @@ separate.
 Factory calibration does **not** know the camera-to-Mid-360 mounting transform.
 Complete the existing alignment workflow for the replacement camera. Its separate
 `d405_lidar_camera.yaml` starts uncalibrated; the DFK's calibration is preserved.
-To return to DFK, select `camera.profile: dfk33ux287` and restart the backend.
+To return to DFK, choose **Settings → RGB camera → DFK 33UX287**. The selection
+persists locally and the camera stream restarts; the backend reads the selected
+profile's expected dimensions and calibration paths. D405 remains the default
+when no local profile has been selected.
 The tiscamera installation and printed-board instructions below apply to DFK.
 
 ## Three independent calibrations

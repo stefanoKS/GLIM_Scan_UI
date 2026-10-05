@@ -8,6 +8,7 @@ export function setupCamera(context){
  $('wizard-cancel').onclick=async()=>{try{await ctx.json(`calibrations/${selected}/action`,{action:'cancel'});await ctx.refresh()}catch(e){ctx.error(e)}};
 
  $("camera-enabled").onchange=async()=>{try{await ctx.json("camera/enabled",{enabled:$("camera-enabled").checked});await ctx.refresh()}catch(e){ctx.error(e);$("camera-enabled").checked=cameraEnabled}};
+ $('camera-profile').onchange=async()=>{try{await ctx.json('camera/profile',{profile:$('camera-profile').value},'PUT');await ctx.refresh()}catch(e){ctx.error(e);await ctx.refresh()}};
  $('camera-preview').onerror=()=>{$('camera-preview').hidden=true;};
  $('import-intrinsics').onclick=async()=>{
   try{const file=$('intrinsics-file').files[0];if(!file)throw Error('Select a measured ROS calibration YAML file');if(file.size>65536)throw Error('Intrinsic YAML must be <=64 KiB');await ctx.json('camera/intrinsics',{yaml_text:await file.text()});await ctx.refresh();}catch(e){ctx.error(e)}
@@ -25,7 +26,7 @@ export function setupCamera(context){
  },1000);
 }
 export async function refreshCamera(s){
- cameraEnabled=!!s.config.system.camera.enabled;$('camera-enabled').checked=cameraEnabled;const c=s.health.camera||{};cameraRunning=!!c.camera_running;
+ cameraEnabled=!!s.config.system.camera.enabled;$('camera-enabled').checked=cameraEnabled;$('camera-profile').value=s.config.system.camera.profile||'d405';$('camera-profile').disabled=!!s.capture?.busy||!s.capture?.can_start;const c=s.health.camera||{};cameraRunning=!!c.camera_running;
  $('camera-status').textContent=`${s.detection?.camera?.detected?'✓':'○'} ${s.config.camera?.model||'Camera'} ${s.detection?.camera?.detected?'detected (USB)':'not detected'}\n${cameraEnabled?'ENABLED':'DISABLED'} · ${c.state||'unknown'}\nProcess ${cameraRunning?'running':'stopped'}\nImage FPS ${(c.hz||0).toFixed(2)} · ${c.width||'—'} × ${c.height||'—'}\nLast frame age ${c.image_age==null?'—':c.image_age.toFixed(3)+' s'}\nSource timestamp ${c.last_image_timestamp??'—'}\nCameraInfo ${c.camera_info_valid?'VALID':c.camera_info_seen?'INVALID':'MISSING'}\nFrame ${c.frame_id||'—'}\nTimestamp jitter ${c.timestamp_jitter_sec??'—'} s`;
  const factory=s.config.camera?.source==='realsense';
  document.querySelectorAll('a[href="/intrinsics.html"]').forEach(link=>link.hidden=factory);

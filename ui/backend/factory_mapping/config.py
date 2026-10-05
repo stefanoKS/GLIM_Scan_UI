@@ -6,6 +6,7 @@ from .camera_config import validate_camera, config_path
 
 ROOT = Path(os.environ.get('FACTORY_MAPPING_ROOT', Path(__file__).resolve().parents[3])).resolve()
 PRESETS = ('jetson_cpu', 'jetson_gpu', 'offline_quality', 'pc_dense')
+CAMERA_PROFILES = ('d405', 'dfk33ux287')
 
 def deployment_mode(root=ROOT):
     """Host-local policy; never inherited from an imported recording."""
@@ -25,6 +26,11 @@ def load(root=ROOT):
         enabled=json.loads(preference.read_text()).get('enabled')
         if type(enabled) is not bool: raise ValueError('Local camera preference must be boolean')
         system['camera']['enabled']=enabled
+    profile_preference=root/'.state/camera_profile.json'
+    if profile_preference.is_file():
+        profile=json.loads(profile_preference.read_text()).get('profile')
+        if profile not in CAMERA_PROFILES: raise ValueError('Local camera profile is invalid')
+        system['camera']['profile']=profile
     sensor = yaml.safe_load((root/'config/livox/mid360.yaml').read_text())
     validate_sensor(sensor)
     sensor['interface_setting'] = sensor['interface']
@@ -38,15 +44,19 @@ def load(root=ROOT):
         raise ValueError('Preview limits: 1–5 Hz, 100–100000 points, 0.01–5 m voxels')
     result={'system': system, 'sensor': sensor}
     profile=system['camera'].get('profile','d405')
-    if profile not in ('d405','dfk33ux287'): raise ValueError('Unknown camera profile')
+    if profile not in CAMERA_PROFILES: raise ValueError('Unknown camera profile')
     camera_file=root/f'config/camera/{profile}.yaml'
-    if camera_file.exists():
-        camera=yaml.safe_load(camera_file.read_text())
-        validate_camera(camera,sensor)
-        for key in ('intrinsics_file','extrinsics_file'): config_path(root,camera[key])
-        result['camera']=camera
+    if camera_file.exists(): result['camera']=load_camera_profile(root,profile,sensor)
     elif system['camera']['enabled']: raise ValueError('Camera configuration is missing')
     return result
+
+
+def load_camera_profile(root, profile, sensor):
+    if profile not in CAMERA_PROFILES: raise ValueError('Unknown camera profile')
+    camera=yaml.safe_load((root/f'config/camera/{profile}.yaml').read_text())
+    validate_camera(camera,sensor)
+    for key in ('intrinsics_file','extrinsics_file'): config_path(root,camera[key])
+    return camera
 
 def wired_host_ip(sensor):
     lidar_ip=ipaddress.IPv4Address(sensor['lidar_ip'])

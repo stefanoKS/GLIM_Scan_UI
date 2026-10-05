@@ -265,6 +265,28 @@ def test_record_button_starts_both_and_saves_one_bag(root):
     assert load(root)['system']['camera']['enabled']
 
 
+def test_camera_profile_setting_persists_and_defaults_to_d405(root):
+    from fastapi.testclient import TestClient
+    from factory_mapping.api import make_app
+    with TestClient(make_app(root,True)) as client:
+        assert client.get('/api/status').json()['config']['system']['camera']['profile']=='dfk33ux287'
+        response=client.put('/api/camera/profile',json={'profile':'d405'})
+        assert response.status_code==200,response.text
+        status=client.get('/api/status').json()
+        assert status['config']['system']['camera']['profile']=='d405'
+        assert status['config']['camera']['model']=='Intel RealSense D405'
+        assert (status['config']['camera']['width'],status['config']['camera']['height'])==(1280,720)
+        response=client.put('/api/camera/profile',json={'profile':'dfk33ux287'})
+        assert response.status_code==200,response.text
+        status=client.get('/api/status').json()
+        assert status['config']['camera']['model']=='DFK 33UX287'
+        assert (status['config']['camera']['width'],status['config']['camera']['height'])==(720,540)
+        assert client.put('/api/camera/profile',json={'profile':'unsupported'}).status_code==422
+    config=load(root)
+    assert config['system']['camera']['profile']=='dfk33ux287'
+    assert config['camera']['source']=='tiscamera'
+
+
 def test_camera_start_failure_prevents_incomplete_combined_bag(root):
     from factory_mapping.service import Service
     async def go():
