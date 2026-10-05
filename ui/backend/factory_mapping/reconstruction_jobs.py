@@ -17,6 +17,13 @@ def safe_trajectory(session, relative):
     return path
 
 
+def preparation_state(run, job):
+    if job.get('state') in ('completed','PREPARED') and (run/'input/nksr_input.npz').is_file():
+        return 'PREPARED'
+    if job.get('state') in ('completed','PREPARED'): return 'NOT_PREPARED'
+    return {'running':'PREPARING','failed':'FAILED','cancelled':'CANCELLED','interrupted':'INTERRUPTED'}.get(job.get('state'),job.get('state','NOT_PREPARED'))
+
+
 def view(service, sid):
     session = service.sessions.get(sid)
     trajectories = []
@@ -33,9 +40,19 @@ def view(service, sid):
         job['metadata'] = read_json(path.parent/'validation/comparison.json', {})
         if job.get('state') == 'running' and not service.pm.active('reconstruction'):
             job['state'] = 'interrupted'
+        job['state']=preparation_state(path.parent,job)
+        from .nksr_jobs import mesh_state
+        job['mesh']=mesh_state(path.parent)
+        if job['mesh']['state']=='RUNNING':
+            worker=service.pm.items.get('nksr',{})
+            if not service.pm.active('nksr') or str(path.parent/'job.log')!=worker.get('log'):
+                job['mesh'].update(state='FAILED',stage='FAILED',message='Worker interrupted; inspect logs')
+            elif worker.get('state')=='orphaned':
+                job['mesh'].update(stage='INTERRUPTED',message='Previous worker is still alive; inspect process recovery before restarting')
         jobs.append(job)
     jobs.sort(key=lambda job: job.get('created_at', ''))
-    return dict(trajectories=trajectories, jobs=jobs)
+    from .nksr_jobs import health
+    return dict(trajectories=trajectories, jobs=jobs, nksr=health(service), raw_bag=(session/'raw_bag/metadata.yaml').is_file())
 
 
 async def start(service, sid, trajectory, voxel_size_m, save_full_density=False):
@@ -45,7 +62,7 @@ async def start(service, sid, trajectory, voxel_size_m, save_full_density=False)
     if service.mock:
         raise ValueError('Reconstruction preparation requires a real raw bag and trajectory')
     if service.capture.busy or service.active or any(service.pm.active(k) for k in
-            ('recording', 'glim', 'offline', 'tool', 'calibration_record', 'calibration_tool', 'reconstruction')):
+            ('recording', 'glim', 'offline', 'tool', 'calibration_record', 'calibration_tool', 'reconstruction', 'nksr', 'nksr_check')):
         raise ValueError('Finish capture and processing before preparing reconstruction')
     if not (session/'raw_bag/metadata.yaml').is_file():
         raise ValueError('Raw bag metadata is missing')
@@ -62,7 +79,7 @@ async def start(service, sid, trajectory, voxel_size_m, save_full_density=False)
     if save_full_density:
         args.append('--save-full-density')
     async def done(item):
-        job.update(state=item['state'], ended_at=now(), returncode=item['returncode'])
+        job.update(state='PREPARED' if item['state']=='completed' and (run/'input/nksr_input.npz').is_file() else ('failed' if item['state']=='completed' else item['state']), ended_at=now(), returncode=item['returncode'])
         atomic_json(run/'job.json', job)
     try:
         # The managed subprocess supports recovery, shutdown and log capture.

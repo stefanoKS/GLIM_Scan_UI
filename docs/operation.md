@@ -108,3 +108,8 @@ Compare spatial agreement with GLIM's optimized export; its processed submaps
 naturally have a different point count. No equality check is applied and the
 metadata does not claim a spatial validation has been performed. Existing
 `exports/run_*.ply` and GLIM export commands are unchanged.
+
+**Reconstruct Mesh** is the separate pretrained NKSR step after preparation.
+See [NKSR setup, modes, diagnostics, and commands](nksr.md). PREPARED only means
+point input is available; COMPLETED requires a verified triangle mesh and a
+successful worker exit. The GLIM optimized export remains independent.

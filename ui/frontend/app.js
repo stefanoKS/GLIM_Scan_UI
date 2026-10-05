@@ -86,20 +86,20 @@ async function openTool(tool,merge=false){try{if(merge&&!$('merge-inputs').selec
 $('merge-maps').onclick=()=>openTool('offline_viewer',true);
 $('open-viewer').onclick=()=>openTool('offline_viewer');$('open-editor').onclick=()=>openTool('map_editor');$('stop-tool').onclick=()=>{if(confirm('Stop the native tool? Save your edits in its window first; unsaved edits may be lost.'))action('tool_stop')};
 
-let reconstructionPending=false;
-async function reconstructionPanel(){
- const sid=selected;
- $('prepare-reconstruction').disabled=!sid||reconstructionPending||!!latestStatus?.capture?.busy||['running','stopping','orphaned'].includes(latestStatus?.processes?.reconstruction?.state);
- if(!sid){$('reconstruction-trajectory').replaceChildren();$('reconstruction-status').textContent='Select a scan first.';$('reconstruction-results').replaceChildren();return}
- const data=await json(`sessions/${sid}/reconstruction`);if(sid!==selected)return;
- const select=$('reconstruction-trajectory'),old=select.value;select.replaceChildren();
- for(const path of data.trajectories){const option=el('option',path);option.value=path;select.append(option)}
- if(data.trajectories.includes(old))select.value=old;
- $('prepare-reconstruction').disabled ||= !data.trajectories.length;
- const job=data.jobs.at(-1),meta=job?.metadata;
- $('reconstruction-status').textContent=!data.trajectories.length?'No traj_lidar.txt found. Save a GLIM map with its trajectory first.':job?`${job.state} · ${job.progress||''}`:'Ready to prepare reconstruction.';
- $('reconstruction-results').replaceChildren();
- if(job?.state==='completed'&&meta?.points_after_voxel!==undefined){
+let reconstructionPending=false,reconstructionData=null,reconstructionSession=null;
+function nksrSettings(){
+ return {preparation_voxel_size_m:Number($('voxel-size-cm').value)/100.0,mode:$('nksr-mode').value,device:$('nksr-device').value,
+  detail_level:Number($('nksr-detail').value),chunk_size:$('nksr-chunk').value?Number($('nksr-chunk').value):null,
+  normal_knn:Number($('nksr-knn').value),normal_drop_angle_deg:Number($('nksr-angle').value),mise_iter:Number($('nksr-mise').value)};
+}
+function renderReconstruction(){
+ const data=reconstructionData,job=data?.jobs.find(j=>j.id===$('nksr-input-run').value),meta=job?.metadata;
+ const busy=reconstructionPending||['running','stopping','orphaned'].includes(latestStatus?.processes?.nksr?.state);
+ const prepared=job?.state==='PREPARED',stale=prepared&&(Math.abs(meta.voxel_size_m-Number($('voxel-size-cm').value)/100)>1e-12||job.trajectory!==$('reconstruction-trajectory').value);
+ $('reconstruction-results').replaceChildren();$('nksr-mesh-results').replaceChildren();
+ const preparing=data?.jobs.find(j=>j.state==='PREPARING');
+ $('reconstruction-status').textContent=preparing?`PREPARING · ${preparing.progress}`:stale?'Prepared input is stale. Prepare again with the selected trajectory and voxel size.':prepared?'PREPARED · ready for mesh reconstruction.':data?.jobs.at(-1)?.state||'NOT_PREPARED';
+ if(prepared&&meta?.points_after_voxel!==undefined){
   const label=meta.voxel_size_m===0?'sampling disabled':`after ${(meta.voxel_size_m*100).toFixed(1)} cm voxel sampling`;
   $('reconstruction-results').append(el('p',`Points: ${meta.points_before_voxel.toLocaleString()} raw → ${meta.points_after_voxel.toLocaleString()} ${label}`));
   for(const [name,file] of [['Download NKSR input','input/nksr_input.npz'],['Preview input','validation/reconstructed_from_bag.ply'],['Metadata','validation/comparison.json']]){
@@ -107,11 +107,48 @@ async function reconstructionPanel(){
    button.onclick=()=>name==='Preview input'?showCloud(path):download(path);$('reconstruction-results').append(button);
   }
  }
- if(job){const button=el('button','Preparation log');button.onclick=()=>download(`reconstruction/${job.id}/job.log`);$('reconstruction-results').append(button)}
+ const h=data?.nksr;
+ $('nksr-health').textContent=h?`NKSR: ${h.status}${h.gpu_name?' · GPU: '+h.gpu_name:''}${h.message?' · '+h.message:''}`:'NKSR: select a scan to check availability';
+ $('nksr-check').disabled=!h||h.status==='NKSR_NOT_INSTALLED'||h.status==='CHECKING'||busy;
+ const ready=h?.smoke_passed&&(h.status==='READY'||(h.cpu_ready&&$('nksr-device').value!=='cuda'));
+ $('reconstruct-mesh').disabled=!prepared||stale||!ready||busy||!!preparing||!!latestStatus?.capture?.busy;
+ $('nksr-detail').disabled=$('nksr-mode').value==='chunked';
+ const mesh=job?.mesh;
+ $('cancel-mesh').hidden=mesh?.state!=='RUNNING';
+ $('nksr-mesh-status').textContent=mesh?`${mesh.stage||mesh.state}${mesh.message?' · '+mesh.message:''}${mesh.progress?.message?' · '+mesh.progress.message:''}`:'NOT_RECONSTRUCTED';
+ if(mesh?.state==='COMPLETED'){
+  const m=mesh.metadata;
+  $('nksr-mesh-results').append(el('p',`NKSR mesh · ${m.vertex_count.toLocaleString()} vertices · ${m.face_count.toLocaleString()} triangles · ${m.actual_mode}${m.chunk_size?' · '+m.chunk_size+' m chunks':''} · Bounds: ${m.validation_status}`));
+  const button=el('button','Download Mesh');button.onclick=()=>download(`reconstruction/${job.id}/output/mesh.ply`);$('nksr-mesh-results').append(button);
+ }
+ if(job){const button=el('button','Preparation / reconstruction log');button.onclick=()=>download(`reconstruction/${job.id}/job.log`);$('reconstruction-results').append(button)}
+}
+async function reconstructionPanel(){
+ const sid=selected;
+ $('prepare-reconstruction').disabled=!sid||reconstructionPending||!!latestStatus?.capture?.busy||['running','stopping','orphaned'].includes(latestStatus?.processes?.reconstruction?.state)||['running','stopping','orphaned'].includes(latestStatus?.processes?.nksr?.state);
+ if(!sid){reconstructionData=null;$('reconstruction-trajectory').replaceChildren();$('nksr-input-run').replaceChildren();renderReconstruction();return}
+ const data=await json(`sessions/${sid}/reconstruction`);if(sid!==selected)return;
+ reconstructionData=data;
+ $('reconstruction-input-status').textContent=`${data.raw_bag?'✓':'○'} Raw bag · ${data.trajectories.length?'✓':'○'} GLIM trajectory`;
+ const select=$('reconstruction-trajectory'),old=select.value;select.replaceChildren();
+ for(const path of data.trajectories){const option=el('option',path);option.value=path;select.append(option)}
+ if(data.trajectories.includes(old))select.value=old;
+ $('prepare-reconstruction').disabled ||= !data.trajectories.length||!data.raw_bag;
+ const runs=$('nksr-input-run'),previous=reconstructionSession===sid?runs.value:'';runs.replaceChildren();
+ for(const job of data.jobs){const option=el('option',`${job.id} · ${job.state}`);option.value=job.id;runs.append(option)}
+ if(data.jobs.some(j=>j.id===previous))runs.value=previous;else if(runs.options.length)runs.selectedIndex=runs.options.length-1;
+ reconstructionSession=sid;renderReconstruction();
 }
 $('reconstruction-form').onsubmit=async event=>{
  event.preventDefault();if(reconstructionPending||!selected)return;
  const cm=Number($('voxel-size-cm').value);if(!Number.isFinite(cm)||cm<0.2||cm>20){error(Error('Voxel size must be between 0.2 and 20 cm'));return}
  reconstructionPending=true;$('prepare-reconstruction').disabled=true;
- try{await json(`sessions/${selected}/reconstruction`,{trajectory:$('reconstruction-trajectory').value,voxel_size_m:cm/100.0});await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
+ try{await json(`sessions/${selected}/reconstruction`,{trajectory:$('reconstruction-trajectory').value,voxel_size_m:cm/100.0});reconstructionSession=null;await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };
+for(const id of ['voxel-size-cm','reconstruction-trajectory','nksr-input-run','nksr-mode','nksr-device','nksr-detail','nksr-chunk','nksr-knn','nksr-angle','nksr-mise'])$(id).addEventListener('input',renderReconstruction);
+$('nksr-check').onclick=async()=>{try{await json('nksr/check',{device:$('nksr-device').value});await refresh()}catch(e){error(e)}};
+$('reconstruct-mesh').onclick=async()=>{
+ if(reconstructionPending)return;reconstructionPending=true;renderReconstruction();
+ try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/mesh`,nksrSettings());await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
+};
+$('cancel-mesh').onclick=async()=>{try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/cancel`,{});await refresh()}catch(e){error(e)}};

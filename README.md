@@ -77,3 +77,7 @@ No ARM64 build result is claimed from the x86_64 test machine. No AVX/native arc
 RGB recording is enabled by default: Start Scan records camera images and CameraInfo alongside LiDAR and IMU. Disabling RGB in Settings shows a warning and still allows LiDAR-only scans. Verify the DFK 33UX287 pipeline on each acquisition host. `scripts/install_camera.sh` adds the optional tiscamera/gscam2 acquisition stack. `scripts/install_calibration.sh` adds the separate workstation calibrator. Neither is required for LiDAR-only or record-only operation.
 
 See [camera setup, calibration conventions and hardware acceptance commands](docs/camera_calibration.md). The dashboard has camera health/JPEG preview, intrinsic YAML import and a separate persistent calibration workflow: static captures → preprocessing → manual alignment → NID → result import → independent validation. SuperGlue and final colorization are not integrated.
+
+Optional surface reconstruction: [install and run pretrained NVIDIA NKSR](docs/nksr.md).
+Point preparation and mesh reconstruction are separate steps; neither changes the
+existing GLIM optimized PLY export.

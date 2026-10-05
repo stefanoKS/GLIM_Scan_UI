@@ -25,3 +25,9 @@ config/calibration/history/
 
 /ros2_ws/src/gscam2
 /ros2_ws/src/direct_visual_lidar_calibration
+
+# Reconstruction inputs/checkpoints and optional isolated NKSR environments
+*.npz
+*.pth
+*.pt
+.nksr-env/

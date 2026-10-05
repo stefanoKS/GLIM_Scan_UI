@@ -22,6 +22,22 @@ class ReconstructionRequest(BaseModel):
     voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0, allow_inf_nan=False)
     save_full_density: bool=False
 
+class MeshRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid', allow_inf_nan=False)
+    preparation_voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0)
+    device: Literal['auto','cuda','cpu']='auto'
+    mode: Literal['auto','full','chunked']='auto'
+    detail_level: float=Field(default=.5, ge=0, le=1)
+    chunk_size: float | None=Field(default=None, gt=0)
+    overlap_ratio: float=Field(default=.05, ge=0, lt=1)
+    normal_knn: int=Field(default=64, ge=1, le=1024)
+    normal_drop_angle_deg: float=Field(default=85, gt=0, le=90)
+    mise_iter: int=Field(default=1, ge=0, le=4)
+
+class NKSRCheck(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    device: Literal['auto','cuda','cpu']='auto'
+
 class CaptureAction(BaseModel):
     model_config=ConfigDict(extra='forbid')
     action: Literal['start_scan','stop_scan','start_camera_recording','stop_camera_recording']
@@ -209,6 +225,29 @@ def make_app(root=ROOT,mock=None):
         p=Path(__file__).with_name('mock_camera.jpg') if s.mock else root/'.state/camera_preview.jpg'
         if not s.mock and (not s.pm.active('camera_preview') or not p.is_file() or time.time()-p.stat().st_mtime>max(3,2/s.config['camera']['preview_hz'])): raise HTTPException(404,'Camera preview is stale or unavailable; recording is independent')
         return Response(await asyncio.to_thread(p.read_bytes),media_type='image/jpeg',headers={'Cache-Control':'no-store'})
+    @app.get('/api/nksr')
+    async def nksr_health():
+        from .nksr_jobs import health
+        return health(app.state.service)
+
+    @app.post('/api/nksr/check', status_code=202)
+    async def check_nksr(body:NKSRCheck):
+        from .nksr_jobs import check
+        s=app.state.service
+        async with s.lock: return await check(s,body.device)
+
+    @app.post('/api/sessions/{sid}/reconstruction/{rid}/mesh', status_code=202)
+    async def reconstruct_mesh(sid:str,rid:str,body:MeshRequest):
+        from .nksr_jobs import reconstruct
+        s=app.state.service
+        async with s.lock: return await reconstruct(s,sid,rid,body.model_dump())
+
+    @app.post('/api/sessions/{sid}/reconstruction/{rid}/cancel')
+    async def cancel_mesh(sid:str,rid:str):
+        from .nksr_jobs import cancel
+        s=app.state.service
+        async with s.lock: return await cancel(s,sid,rid)
+
     @app.get('/api/sessions/{sid}/reconstruction')
     async def reconstruction_status(sid:str):
         from .reconstruction_jobs import view
@@ -224,7 +263,7 @@ def make_app(root=ROOT,mock=None):
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
     def project_transfer_ready(service):
-        if service.capture.busy or service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')):
+        if service.capture.busy or service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool','reconstruction','nksr','nksr_check')):
             raise ValueError('Stop recording and processing before transferring a project')
     @app.get('/api/sessions/{sid}/project')
     async def export_project(sid:str):
