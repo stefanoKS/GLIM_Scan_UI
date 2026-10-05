@@ -1,91 +1,123 @@
-# Factory Mapping — GLIM + Mid-360
+# GLIM Scan UI — factory recording and mapping
 
-Local ROS 2 acquisition, immutable raw bags, GLIM processing jobs and a lightweight browser interface. GLIM uses **only the Mid-360 LiDAR and its IMU**. Optional parallel RGB acquisition and manual LiDAR–camera calibration are available. The Jetson records raw sensor data only; the workstation performs mapping and surfacing.
+Record Livox Mid-360 LiDAR/IMU and optional RGB in a local browser dashboard, then process completed recordings with GLIM and optional NKSR on a workstation.
 
-## Install from GitHub
+**The Jetson records only. Mapping, map editing and surface reconstruction run on the workstation.** GLIM uses only the Mid-360 LiDAR and built-in IMU; RGB is saved alongside them for separate camera/calibration work.
 
-Use Ubuntu 22.04 with ROS 2 Humble already installed. On Jetson, use a JetPack 6 image with Ubuntu 22.04 and ROS 2 Humble; do not upgrade JetPack. For a new Ubuntu workstation, install ROS 2 Humble from the [official installation guide](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html) before continuing.
+## Choose the installation
 
-Clone the private repository using your GitHub access, then run the bootstrap from its root:
+Run commands from the repository root. The installer targets Ubuntu 22.04 with ROS 2 Humble already installed at `/opt/ros/humble`; use system Python 3.10, not Conda, for the application environment. The supported Jetson target is Orin with JetPack 6 / Ubuntu 22.04. Other JetPack/Ubuntu combinations are not covered by this installer.
 
 ```bash
 git clone https://github.com/stefanoKS/GLIM_Scan_UI.git
 cd GLIM_Scan_UI
-scripts/check_system.sh
-scripts/bootstrap_jetson.sh
 ```
 
-Bootstrap installs the OS build prerequisites, creates the Python environment, downloads the exact upstream GLIM and Livox revisions pinned in `dependencies.lock`, builds and installs them into this checkout, then builds the ROS 2 workspace. GLIM is fetched automatically; do not clone or install it separately. The first build needs internet access, `sudo` for apt packages, and can take a while. Use `BUILD_JOBS=1 scripts/bootstrap_jetson.sh` on memory-constrained machines. CUDA is detected automatically and falls back to CPU when unavailable.
+| Machine | Bootstrap command | Installed role |
+| --- | --- | --- |
+| Recording Jetson | `BUILD_JOBS=1 scripts/bootstrap_jetson.sh --record-only` | Livox driver, recorder, monitoring, preview and dashboard |
+| Processing workstation | `scripts/bootstrap_jetson.sh --workstation` | Acquisition stack plus pinned GLIM dependencies and native tools |
 
-For the recording Jetson, use `scripts/bootstrap_jetson.sh --record-only` (also the default on ARM64). This skips GLIM/CUDA and never installs NKSR. It saves a host-local recording-only policy in `.state/deployment.json`: live mapping, automatic processing, map tools and surfacing are blocked even if older installations remain. Choose **START SCAN**, then **STOP SCAN**, wait for completion, and export the project from Library. Import it on the workstation for mapping and surfacing. Project transfers do not change either machine's deployment mode.
+Despite its name, `bootstrap_jetson.sh` supports both roles. Without a flag it selects recording-only on ARM64 and workstation on x86_64. Prefer the explicit commands above. Installation needs internet access and sudo for distribution packages; it builds native dependencies locally and does not upgrade JetPack or the OS.
 
-The supported Jetson target is **JetPack 6 / Ubuntu 22.04 / ROS 2 Humble**, on supported Orin hardware; older Nano/TX2 images and JetPack 5 or 7 are not supported by this installer. See [NVIDIA's JetPack 6 platform details](https://developer.nvidia.com/embedded/jetpack-sdk-60). Bootstrap stops on a different Ubuntu version without modifying it. Use `--workstation` only on a machine intended to process data.
+The role is saved in `.state/deployment.json`. Recording-only mode blocks live/automatic GLIM, map tools, reconstruction preparation and NKSR even if older processing binaries remain installed. Transferring a project does not change the receiving machine's role. Workstation bootstrap probes CUDA and can use CPU GLIM when CUDA is unavailable; it does not install NKSR automatically.
 
-RGB is enabled by default. After bootstrap, run `scripts/install_d405.sh` and configure USB access before recording with the D405, or disable RGB in dashboard Settings for LiDAR/IMU-only recording. Bootstrap supplies OpenCV and cv_bridge for the camera path. Camera SDK installation and actual USB capture must be checked on the target device.
+See [installation and upgrades](docs/installation_jetson.md) for prerequisites, build controls, network setup and source-only transfer.
 
-Run `scripts/verify_jetson.sh --record-only` on the Jetson for software checks. With the dashboard stopped and sensors connected, run `scripts/verify_jetson.sh --record-only --hardware` for a 30-second finalized recording. Before deployment, also record for the intended route duration on the target storage, check for dropped messages, memory/thermal issues and disk capacity, then transfer and process that recording on the workstation. Passing workstation tests does not certify Jetson hardware throughput.
+## Add the cameras you use
 
-Start the dashboard after bootstrap completes:
+RGB is **requested by default**, with **Auto — D405 preferred** selection. Vendor camera stacks are installed separately:
+
+| Camera | Target stream | Setup |
+| --- | --- | --- |
+| Intel RealSense D405 | 1280×720 RGB at 30 FPS | `scripts/install_d405.sh` — pins `pyrealsense2==2.58.2.10647`; standard librealsense USB permissions are also required |
+| Imaging Source DFK 33UX287 | 720×540 RGB at 15 FPS | `BUILD_JOBS=1 scripts/install_camera.sh` — gscam2/tiscamera stack |
+
+Install both stacks if you want either camera to be usable. Match device serials in `config/camera/` to your hardware. Bootstrap supplies OpenCV/cv_bridge prerequisites; the D405 installer does not install USB rules. D405 publishes rectified images with factory intrinsics; DFK uses its configured lens calibration. Both need their own camera–LiDAR mounting alignment when that alignment is used.
+
+Auto tries D405, then DFK. An explicit D405/DFK choice is a preference and allows the other camera as fallback. USB detection alone is insufficient: the publisher must deliver fresh images and CameraInfo at the expected geometry and measured rate.
+
+- **START SCAN:** if neither camera works, records LiDAR/IMU only, displays a warning, and records why RGB was unavailable. Include RGB stays enabled for the next scan.
+- **RECORD CAMERA / calibration:** require a working camera and fail clearly if none is usable.
+- **During acquisition:** the camera cannot switch. The snapshot records the actual camera and its calibration paths; calibration datasets remain bound to their original camera.
+
+See [camera setup and calibration](docs/camera_calibration.md) and [selection, D405 performance and hardware diagnostics](docs/camera_auto_resolution.md). A 30 FPS target is not a claim of measured Jetson throughput.
+
+## Start and record
+
+Give the host Ethernet interface an address on the LiDAR subnet using the OS network settings. The tracked LiDAR IP is `192.168.1.120`; `interface: auto` discovers one suitable physical Ethernet interface. The host IP and interface name are not fixed to the development PC. The app does not change OS networking.
 
 ```bash
 scripts/run_system.sh
 ```
 
-Open http://127.0.0.1:8080. For network and hardware setup, see [installation](docs/installation_jetson.md) and [operation](docs/operation.md).
+Open [the dashboard](http://127.0.0.1:8080). For another browser on a trusted LAN, run `scripts/run_system.sh --host 0.0.0.0` and open port 8080 on the recording host's actual IP. There is no login; do not expose the dashboard to the Internet. Only one backend per checkout is allowed.
 
-## Quick start on this PC
+1. Check **Capture** sensor status. Preview startup does not record a bag.
+2. Choose **START SCAN**. The app creates a session, checks sensors, resolves RGB if requested, snapshots acquisition settings and starts one raw bag.
+3. Choose **STOP SCAN** and wait for finalization before disconnecting sensors or powering down.
+4. In **Library**, rename/add notes and **Export selected**. Import the `.fmproject.zip` on the workstation to process, export maps or reconstruct surfaces.
 
-```bash
-scripts/run_system.sh
-```
+A recording-only Jetson never automatically processes the scan. On a workstation, live mapping defaults off and automatic processing defaults on when GLIM is available; Settings controls these preferences. **RECORD CAMERA** makes a separate camera-only bag without requiring LiDAR/IMU.
 
-Open http://127.0.0.1:8080. For another PC on the trusted LAN, use `scripts/run_system.sh --host 0.0.0.0`, then open `http://192.168.1.135:8080`. The UI has no login; use it only on a trusted network and do not expose it to the Internet. One backend instance per repository is allowed.
+**“Ready for next scan” is a capture-state label, not a guarantee that Start is enabled.** If it is accompanied by “A previous sensor process is still running,” recovery is required. “Previous scan: recorded” describes the prior finalized recording. See [process recovery](docs/troubleshooting.md#previous-sensor-process-is-still-running).
 
-Use `--mock` for development without ROS hardware. Mock sessions are marked and filtered separately; they cannot be exported as genuine maps. Stop with Ctrl-C to finalize recording and GLIM. `scripts/stop_system.sh` finalizes the active session while keeping the dashboard running.
+Stop the server with Ctrl-C and allow shutdown to complete. `scripts/stop_system.sh` asks a running backend to finalize the current session; it leaves the dashboard and preview sensors running. For hardware-free development, use `scripts/run_system.sh --mock` after installing the base environment; mock data is clearly marked and cannot be exported as genuine maps.
 
-The configured device is `192.168.1.120`, host `192.168.1.135`, interface `enp6s0`. Network edits only update project configuration; they do not change host networking or sensor firmware settings.
+## Record on Jetson, process on the workstation
 
-## Terminal-only test
-
-With the UI stopped:
+With the dashboard stopped, a terminal recording uses the same acquisition checks:
 
 ```bash
 scripts/record_test.sh --name terminal_test --seconds 30
-# Copy the session ID printed by the recorder:
-scripts/process_bag.sh YYYYMMDD_HHMMSS_terminal_test --preset jetson_cpu
 ```
 
-Each run writes a new `processing/run_NNN/` directory. Inspect `job.log`, `job.json` and `glim_dump/`. Never pass an unfinished bag to GLIM.
+Transfer the entire completed session, including its raw bag, metadata, `active_config.json` and `config_snapshot/`. Prefer Library project export/import, which verifies hashes. Keep the original until the transfer is verified. Dedicated calibration datasets are transferred separately.
 
-## Simple operator workflow
+On the **workstation**, with its dashboard stopped, use the printed/imported session ID:
 
-**Capture** has START/STOP SCAN, RECORD/STOP CAMERA, sensor health, elapsed time, a LiDAR view and camera preview. **Library** holds completed recordings, names/notes, transfer, processing, run history and map editing. **Calibration** provides the guided setup; **Settings → Advanced / Diagnostics** retains all engineering controls. The backend owns capture sequencing and keeps raw recording running if live GLIM fails.
+```bash
+scripts/process_bag.sh SESSION_ID --preset jetson_cpu
+```
 
-See the [system analysis and verification](docs/capture_refactor_analysis.md) for the inspected modules, fixes and remaining hardware checks.
+`jetson_cpu` is the CPU GLIM preset's historical name; it does not enable processing on a recording-only Jetson. Each processing attempt creates a new `processing/run_NNN/`. Raw bags remain unchanged. Library also provides processing and the upstream native editing tools; native windows open on the workstation's desktop, not inside a remote browser.
 
-## Official GLIM editing tools
+Optional [NKSR surface reconstruction](docs/nksr.md) uses a separate workstation environment. Preparing point input and reconstructing a mesh are separate steps from GLIM optimized PLY export.
 
-The dashboard includes launchers for **manual loop closure, map merging, plane constraints, optimization, graph recovery, MinCut/region-growing segmentation and map cleanup**. They use the installed upstream `offline_viewer` and `map_editor` on the server desktop, starting from separate working copies. The native live viewer and upstream sensor validator are also available. See [toolkit workflows](docs/glim_tools.md).
+## Verify this build
 
-## Installation and verification
+The latest recorded implementation run for the camera-selection build (`ba70f6d`, 2026-10-05) reported **178 passed, 1 skipped, 1 warning** on x86_64. The skip was opt-in NKSR inference; native RealSense projection tests ran without physical cameras. JavaScript checks also passed. See [validation history and remaining checks](docs/validation.md). These results do not certify Jetson hardware or sustained 30 FPS recording.
 
-See [installation](docs/installation_jetson.md), [environment report](docs/environment_report.md), [validation results](docs/validation.md), [operation](docs/operation.md) and [upstream interfaces/preset changes](docs/upstream_interfaces.md).
+To rerun software tests:
 
 ```bash
 source scripts/env.sh
 .venv/bin/python -m pytest -q --basetemp=.state/pytest
 ```
 
-No ARM64 build result is claimed from the x86_64 test machine. No AVX/native architecture options are enabled. Dependency revisions and build evidence are in `dependencies.lock`. Build/install/log trees, raw bags and map outputs are excluded from Git.
+On the Jetson, with the dashboard stopped:
 
-## Optional RGB camera and calibration
+```bash
+scripts/verify_jetson.sh --record-only
+# Mid-360 attached: create and finalize a 30-second recording.
+scripts/verify_jetson.sh --record-only --hardware
+```
 
-RGB is requested by default. **Auto** tries D405, then DFK 33UX287; a saved D405/DFK choice is a preference with fallback. A camera must deliver fresh frames and CameraInfo at the expected size and rate before acquisition. If both fail, Start Scan records LiDAR/IMU only with a warning and explicit metadata; the Include RGB preference stays enabled for the next scan. Camera-only recording and calibration require a working camera. The chosen camera and its calibration paths are frozen for each acquisition.
+Run the [four camera hardware cases](docs/camera_auto_resolution.md#jetson-commands), then a full-duration route on target storage. Check delivered FPS, bag topic counts, USB stability, free space, memory and temperature, and process the transferred recording on the workstation.
 
-D405 targets 1280×720 at 30 FPS with factory intrinsics and `pyrealsense2==2.58.2.10647`; run `scripts/install_d405.sh`. DFK keeps 720×540 at 15 FPS and uses `scripts/install_camera.sh`. Camera–LiDAR mounting alignment is still required; `scripts/install_calibration.sh` installs the workstation calibrator. See [camera selection and Jetson verification](docs/camera_auto_resolution.md) for the state machine, diagnostics and four hardware cases.
+## Documentation
 
-See [camera setup, calibration conventions and hardware acceptance commands](docs/camera_calibration.md). The dashboard has camera health/JPEG preview, intrinsic YAML import and a separate persistent calibration workflow: static captures → preprocessing → manual alignment → NID → result import → independent validation. SuperGlue and final colorization are not integrated.
+| Guide | Contents |
+| --- | --- |
+| [Installation](docs/installation_jetson.md) | Jetson/workstation roles, native builds, upgrades and networking |
+| [Operation](docs/operation.md) | Capture, shutdown, transfer and workstation processing |
+| [Troubleshooting](docs/troubleshooting.md) | Orphan recovery, camera fallback, recording and processing faults |
+| [Camera setup](docs/camera_calibration.md) | D405/DFK installation, intrinsics and alignment datasets |
+| [Camera selection](docs/camera_auto_resolution.md) | State machine, performance tests and hardware commands |
+| [GLIM tools](docs/glim_tools.md) | Native editing, merging and cleanup on the workstation |
+| [NKSR](docs/nksr.md) | Workstation surface preparation, reconstruction and validation |
+| [Architecture](docs/architecture.md) | Process ownership, snapshots, camera isolation and recovery |
+| [Validation](docs/validation.md) | Dated evidence and hardware limitations |
+| [Upstream contracts](docs/upstream_interfaces.md) | Pinned driver/GLIM interfaces and preset behavior |
 
-Optional surface reconstruction: [install and run pretrained NVIDIA NKSR](docs/nksr.md).
-Point preparation and mesh reconstruction are separate steps; neither changes the
-existing GLIM optimized PLY export.
+`dependencies.lock` pins upstream source; `requirements.lock` pins the app/test Python environment. Build artifacts, local preferences, acquisition data and generated maps are excluded from Git. [Original requirements](docs/requirements.md), [early capture analysis](docs/capture_refactor_analysis.md) and the [environment report](docs/environment_report.md) are historical records, not fresh-install instructions.

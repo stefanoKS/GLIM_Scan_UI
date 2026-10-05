@@ -1,3 +1,9 @@
+# Original project requirements (historical)
+
+This is the original Phase 1 brief, retained for provenance. Its camera-disabled and Jetson-local mapping instructions describe that initial milestone, not current deployment. The latest build records on Jetson, processes on a workstation, supports Auto D405/DFK RGB acquisition and optional workstation NKSR. Follow the [README](../README.md), [installation](installation_jetson.md) and [operation](operation.md) for current behavior.
+
+---
+
 You are building a new production-oriented repository for factory 3D mapping.
 
 The target hardware is an **NVIDIA Jetson Orin Nano, ARM64/aarch64**, with a **Livox Mid-360**. The first milestone must use **LiDAR + the Mid-360 built-in IMU only**. Do NOT add the camera to the active SLAM pipeline yet.

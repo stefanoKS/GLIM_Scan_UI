@@ -1,7 +1,7 @@
 # Portable RGB acquisition and Jetson verification
 
 The Jetson remains a recording host; mapping and surfacing run on the workstation.
-This change was developed against `a46730e` and preserves its recording-only policy,
+The camera-selection build is committed as `ba70f6d` (developed against `a46730e`) and preserves its recording-only policy,
 project transfer, DFK stack and existing GLIM pipeline. RGB is never passed to GLIM.
 
 ## Root causes

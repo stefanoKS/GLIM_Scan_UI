@@ -1,6 +1,6 @@
 # GLIM toolkit
 
-All five executables in the pinned official `glim_ros2` build are included:
+The workstation GLIM build includes the five official `glim_ros2` executables below. These controls are blocked on the recording-only Jetson, even if an older installation left binaries behind. Transfer completed recordings to the workstation first:
 
 | Executable | Project access | Purpose |
 |---|---|---|
@@ -10,7 +10,7 @@ All five executables in the pinned official `glim_ros2` build are included:
 | map_editor | Object segmentation / cleanup | Point selection, segmentation, annotation and removal |
 | validator_node | Start upstream validator | Upstream timestamp and sensor-data checks |
 
-These are the actual official programs, not placeholder browser reimplementations. Native tools open on the **server's desktop**. A browser on another PC does not receive the native window; use a desktop session on the server or process the copied session on that PC. A Jetson needs a local display/OpenGL environment to interact. Headless Jetsons can record and run GLIM without these windows.
+These are the actual official programs, not placeholder browser reimplementations. Native tools open on the **server's desktop**. A browser on another PC does not receive the native window; use a desktop session on the server or process the copied session on that PC. The processing workstation needs a working display/OpenGL environment for native tools and export. The recording Jetson does not run GLIM.
 
 ## Non-destructive workspaces
 
@@ -42,9 +42,11 @@ scripts/open_glim_tool.sh offline_viewer SESSION_A run_001 --add-map SESSION_B r
 scripts/open_glim_tool.sh map_editor SESSION_ID run_002
 ```
 
-For the direct upstream diagnostic, after sourcing `scripts/env.sh`:
+For the direct upstream diagnostic on a workstation, use the acquisition ROS domain (41 by default; adjust to `config/livox/mid360.yaml`):
 
 ```bash
+source scripts/env.sh
+export ROS_DOMAIN_ID=41
 ros2 run glim_ros validator_node --ros-args -r imu:=/livox/imu -r points:=/livox/lidar
 ```
 
@@ -52,4 +54,4 @@ The dashboard remaps those diagnostic names from project configuration automatic
 
 ## Extensions
 
-`glim_ext` is a separate optional ecosystem, not required by these core tools. Its pinned source was inspected. ScanContext declares a CC BY-NC-SA 4.0 dependency in upstream README, so it remains disabled/unvalidated for this production-oriented factory repository. The native manual-loop tools above do not require ScanContext. Camera/DBoW and alternative odometry backends remain inactive as required by Phase 1. IMU prediction/validation, gravity, velocity suppression, GNSS and deskewing extensions need individual compatibility and use-case tests before enabling them. Their presence in an upstream repository is not evidence that all are appropriate for this sensor or Jetson.
+`glim_ext` is a separate optional ecosystem, not required by these core tools. Its pinned source was inspected. ScanContext declares a CC BY-NC-SA 4.0 dependency in upstream README, so it remains disabled/unvalidated for this production-oriented factory repository. The native manual-loop tools above do not require ScanContext. GLIM camera/DBoW input and alternative odometry backends remain inactive; the separate RGB recorder is supported. IMU prediction/validation, gravity, velocity suppression, GNSS and deskewing extensions need individual compatibility and use-case tests before enabling them. Their presence in an upstream repository is not evidence that all are appropriate for this sensor or Jetson.

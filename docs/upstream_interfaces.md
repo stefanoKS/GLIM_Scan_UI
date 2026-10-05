@@ -1,8 +1,8 @@
 # Verified upstream contracts
 
-Inspected official source pinned in `dependencies.lock` on 2026-10-01.
+The source-contract evidence below was inspected against the revisions in `dependencies.lock` on 2026-10-01. Current wrappers retain those LiDAR/IMU interfaces; GLIM runs on the workstation and parallel RGB acquisition is documented in [camera setup](camera_calibration.md).
 
-- [GLIM source installation](https://koide3.github.io/glim/installation.html): GTSAM 4.3a0, gtsam_points, optional Iridescence. The scripts build into `.local`, disable native architecture flags, and default to two compiler jobs. CUDA is detected; use `USE_CUDA=OFF` for an explicit CPU fallback.
+- [GLIM source installation](https://koide3.github.io/glim/installation.html): GTSAM 4.3a0, gtsam_points, optional Iridescence. The scripts build into `.local`, disable native architecture flags, and select compiler-job count by host RAM. CUDA is detected; use `USE_CUDA=OFF` for an explicit CPU fallback.
 - [GLIM ROS2](https://github.com/koide3/glim_ros2): package `glim_ros`; executables `glim_rosnode` and `glim_rosbag`. Both accept ROS parameters `config_path` and `dump_path`; the bag executable also accepts `auto_quit`. No permanent `/tmp/dump` is needed.
 - `glim_ros2/src/offline_viewer.cpp` implements `offline_viewer DUMP --export_path OUTPUT.ply --config_path CONFIG`. It is a real upstream interface, but **still requires an OpenGL display**. Its export path exits when finished. XYZ and available intensity are written by GLIM, using optimized submap poses.
 - [Livox driver](https://github.com/Livox-SDK/livox_ros_driver2): `xfer_format=0`, `multi_topic=0` publish PointCloud2 on `/livox/lidar` and Imu on `/livox/imu`. These are source-discovered defaults, verified on the connected device, and remapped at the driver boundary from YAML. `/PointCloud2` and `/Imu` are message types in the request, not the driver's actual default topic names.
@@ -17,7 +17,7 @@ All JSON starts from pinned upstream `glim/config/*.json`. Comments are removed 
 
 # Loop detection
 
-`loop_closure.enabled: false` means no extra place-recognition module. GLIM's own geometric constraints remain active; OFF does not disable all backend geometric loop constraints. `scan_context` reports UNAVAILABLE and is rejected at live launch until compatible glim_ext builds and real loop tests exist. No camera is subscribed by our packages or recorded. Upstream optional camera support is compiled off.
+`loop_closure.enabled: false` means no extra place-recognition module. GLIM's own geometric constraints remain active; OFF does not disable all backend geometric loop constraints. `scan_context` reports UNAVAILABLE and is rejected at live launch until compatible glim_ext builds and real loop tests exist. The application records RGB/CameraInfo in parallel when a usable camera is resolved. GLIM never consumes that RGB: its optional camera integration is compiled off and camera-enabled acquisition snapshots give GLIM an unused image-topic name.
 
 # Offline/live isolation verified on real data
 

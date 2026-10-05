@@ -4,7 +4,10 @@
 Mid-360 -> official Livox driver -> PointCloud2 + Imu
                                   |             |
                                   +-- rosbag2 --+ -> immutable raw_bag
-                                  +-- GLIM live -> session glim_dump
+                                  +-- GLIM live (workstation only) -> session glim_dump
+D405 / DFK -> resolved RGB + CameraInfo -> same rosbag2 (when usable)
+
+On the workstation:
 raw_bag -> upstream glim_rosbag -> processing/run_NNN/glim_dump
 GLIM dump -> upstream offline_viewer exporter -> PLY -> optional PCD
 PointCloud2 -> visualization-only voxel/cap -> binary WebSocket -> browser
@@ -18,13 +21,19 @@ Sessions snapshot configuration at recording start. ROS bag creation owns `raw_b
 
 Backend restart marks unfinished sessions/jobs interrupted. PID records include creation time; stale identities are discarded. A matching surviving orphan is surfaced and blocks a duplicate role, rather than signalling an unknown process. The operator must inspect and stop that PID. Linux flock prevents two backends. The same lock is used by terminal test commands.
 
-A bounded latest-frame file is shared between preview and HTTP server; slow WebSocket consumers cannot grow an unbounded queue. FMPC v1 has `<4sId` magic/count/seconds followed by little-endian float32 XYZI. Preview max defaults to 50,000 at 3 Hz and 0.1 m voxels. The raw bag and archival GLIM export never use these preview parameters.
+A bounded latest-frame file is shared between preview and HTTP server; slow WebSocket consumers cannot grow an unbounded queue. FMPC v1 has `<4sId` magic/count/seconds followed by little-endian float32 XYZI. Preview max defaults to 50,000 at 5 Hz and 0.1 m voxels. The raw bag and archival GLIM export never use these preview parameters.
 
-Optional future plugins belong after stable acquisition. ScanContext is currently UNAVAILABLE when selected. `false` disables extra place recognition, not GLIM's existing geometric constraints. No camera runtime dependency is enabled.
+Optional future plugins belong after stable acquisition. ScanContext is currently UNAVAILABLE when selected. `false` disables extra place recognition, not GLIM's existing geometric constraints. Parallel RGB recording is enabled by preference, with vendor dependencies installed separately; camera input to GLIM remains disabled.
 
 ## Optional parallel camera acquisition
 
-`camera_config.py` validates trusted local camera YAML. `commands.camera` writes fixed gscam2 ROS parameters; camera, camera_monitor and camera_preview are separately managed subprocesses. FastAPI never imports rclpy/cv_bridge. Camera health uses its own atomic state file and JPEG preview uses its own endpoint, separate from the cloud WebSocket. The recorder includes image and CameraInfo topics only when enabled; GLIM RGB subscriptions are assigned an unused name for camera-enabled sessions.
+`camera_config.py` validates trusted local camera YAML. `commands.camera` launches the D405 Python/librealsense publisher or writes fixed DFK gscam2 ROS parameters; camera, camera_monitor and camera_preview are separately managed subprocesses. FastAPI never imports rclpy/cv_bridge. Camera health uses its own atomic state file and JPEG preview uses its own endpoint, separate from the cloud WebSocket. The recorder includes image and CameraInfo topics only when enabled; GLIM RGB subscriptions are assigned an unused name for camera-enabled sessions.
+
+`camera_selection.py` separates saved preference, independent USB detection, dependency checks and actual stream health. Auto tries D405 then DFK; an explicit preference reverses the order when appropriate. Each failed attempt stops preview, monitor and publisher before another publisher can use the shared camera topics. `.state/camera_active.json` supplies the resolved profile to monitor/preview subprocesses; a generation token rejects stale health from an earlier candidate.
+
+A normal scan with no usable RGB camera disables camera topics only in its acquisition copy. The persisted Include RGB preference remains unchanged. Camera-only recording and calibration require a usable camera. `active_config.json` freezes the actual profile, calibration paths, requested RGB and fallback provenance before recording; final session metadata adds observed RGB message counts/FPS and whether RGB was recorded. Camera switches are rejected during acquisition, and calibration datasets remain bound to their original camera across captures.
+
+The D405 publisher saves factory intrinsics from the started color pipeline, constructs vectorized Brown/inverse-Brown maps once and uses native OpenCV remapping; no-distortion images bypass it. The image and zero-distortion CameraInfo describe the same rectified geometry. Original factory coefficients remain in calibration provenance. D405 targets 30 FPS; health reports measured delivery.
 
 `calibration_data.py` owns intrinsic/transform validation; `calibration.py` owns persistent independent calibration datasets and fixed manual tool commands. Calibration bags are hashed, originals are never passed to preprocess, and every tool stage copies the prior derived output. Imported results retain intrinsic hashes, transform convention and time offset for a future independent projection/colorization subsystem.
 
@@ -37,3 +46,9 @@ Optional future plugins belong after stable acquisition. ScanContext is currentl
 The recorder must initialize its output before SCANNING is reported. Finalization checks metadata and positive counts on all requested topics. Live GLIM is best effort after raw recording starts; its startup or runtime failure is a warning and never rolls back acquisition. Heavy processing/editing/transfer work is blocked during capture. Automatic offline processing uses the existing immutable-bag path and independent ROS domain. Camera-only acquisition snapshots its own enabled camera setting without changing the scan preference.
 
 `capture.js` only requests semantic actions and renders state. `app.js` retains the existing library/viewer/tool handling; `camera.js` maps internal calibration stages onto a guided flow. Calibration's detailed state machine and separate data layout remain unchanged. Project archives validate hashes plus configuration and bag-relative paths; imported edit workspace paths are rebased to the receiving host.
+
+## Deployment roles and local preferences
+
+`config.py` loads `.state/deployment.json` when present, otherwise defaults to recording-only on ARM64 and workstation on other supported hosts. Bootstrap writes the explicit host role. The backend rejects GLIM/map tools, reconstruction preparation and NKSR jobs on recording-only hosts even when binaries exist. Workstation processing remains separate from acquisition and uses the recorded configuration, not the current camera preference.
+
+`.state/camera_profile.json` preserves Auto/D405/DFK preference; malformed profile data uses Auto with a warning without deleting the original file. `.state/camera_enabled.json` stores Include RGB. These are host-local files and are not imported with recording projects. `camera-status.js` keeps current camera readiness separate from the previous capture outcome.

@@ -1,13 +1,13 @@
 # Optional RGB acquisition and LiDAR–camera calibration
 
-The Mid-360 LiDAR + IMU remain GLIM's only inputs. Camera RGB and CameraInfo are parallel acquisition streams in the same raw rosbag. Camera-disabled operation retains the original two-topic recording, mock mode, native GLIM toolkit and record-only Jetson option. No GLIM core code is modified. No final colorizer, mesh or texture processing is included.
+The Mid-360 LiDAR + IMU remain GLIM's only inputs. Camera RGB and CameraInfo are parallel acquisition streams in the same raw rosbag. Camera-disabled operation retains the original two-topic recording, mock mode, native GLIM toolkit and record-only Jetson option. No GLIM core code is modified. No RGB colorizer or texture pipeline is integrated. Optional workstation [NKSR geometry reconstruction](nksr.md) is a separate stage.
 
 ## Auto selection and D405 RGB camera
 
 `config/system.yaml` selects `camera.profile: auto` by default (D405 preferred, DFK fallback). The profile in
 `config/camera/d405.yaml` selects attached serial `230322276078`, color only,
 1280×720 at a target 30 FPS. On the existing camera host, run `scripts/install_d405.sh`
-to install the pinned Python RealSense SDK. OpenCV, ROS and cv_bridge must already
+to install `pyrealsense2==2.58.2.10647`. OpenCV, ROS and cv_bridge must already
 be installed; USB access uses the standard librealsense udev rules.
 
 At camera startup the SDK reads the selected color profile's factory intrinsics
@@ -49,7 +49,7 @@ Camera is initially free-running. gscam2's `use_gst_timestamps=true` uses GStrea
 
 ## Optional installation
 
-First install the existing acquisition stack as described in installation_jetson.md. Camera and calibration packages are never pulled by default or record-only bootstrap.
+First install the acquisition stack as described in [installation](installation_jetson.md). Bootstrap supplies OpenCV/cv_bridge; vendor camera stacks and the heavy calibration toolchain are separate installs. Use `scripts/install_d405.sh` for D405. The following installation commands are for DFK only.
 
 On the camera acquisition host:
 
@@ -96,12 +96,13 @@ scripts/check_camera.sh CAMERA_SERIAL
 
 Inspect supported formats, dimensions and rates. Validate a source/conversion pipeline that produces the requested raw RGB geometry for gscam2 (which supplies its own sink). Store the exact validated pipeline in **local trusted YAML**, along with matching serial, geometry, FPS and `pipeline_validated: true`. No HTTP endpoint accepts or modifies pipelines or arbitrary command strings. The gscam2 ROS parameters are written as YAML, avoiding shell parsing. The configured `serial_number` is used for device diagnostics; the validated pipeline must select that same serial. If unset, recorded serial metadata remains null rather than claiming an identification.
 
-Enable **Include camera in scans** in Settings. START SCAN starts the camera automatically and requires its image and CameraInfo streams before the combined bag starts. RECORD CAMERA works independently of that preference. Engineering status and low-level camera controls remain in Advanced Diagnostics. Missing intrinsic calibration is allowed for acquisition; it is not labelled calibrated. Preview has separate processes/endpoints, so a preview failure does not stop raw recording.
+Leave **Include RGB images in recordings** enabled in Settings to request RGB. START SCAN resolves a working camera before snapshotting the bag configuration. If both supported cameras fail, the scan proceeds with LiDAR/IMU only, a warning and explicit fallback metadata. RECORD CAMERA works independently of that preference. Engineering status and low-level camera controls remain in Advanced Diagnostics. Missing intrinsic calibration is allowed for acquisition; it is not labelled calibrated. Preview has separate processes/endpoints, so a preview failure does not stop raw recording.
 
 Hardware acceptance commands after the camera is publishing:
 
 ```bash
 source scripts/env.sh
+export ROS_DOMAIN_ID=41  # use config/livox/mid360.yaml if changed
 ros2 topic info /camera/image_raw -v
 ros2 topic hz /camera/image_raw
 ros2 topic echo /camera/camera_info --once
@@ -109,7 +110,7 @@ ros2 topic echo /camera/image_raw --once --field header
 scripts/fm.py status
 ```
 
-Use configured topic names if changed. A camera-enabled scan requires healthy images and CameraInfo; disable camera inclusion for LiDAR-only acquisition. `required_for_mapping` still controls the legacy GLIM health check, but does not permit a one-click combined capture to silently omit requested images. Advanced Stop Camera retains its legacy independent behavior; normal capture uses STOP SCAN/STOP CAMERA to finalize recording.
+Use configured topic names if changed and set `ROS_DOMAIN_ID` to the acquisition domain (41 by default) before manual topic commands. A combined bag includes RGB only after fresh images and CameraInfo are observed; explicit fallback-to-LiDAR-only leaves the global Include RGB setting unchanged. `required_for_mapping` still controls the legacy GLIM health check. Advanced Stop Camera is blocked during recording/calibration; use STOP SCAN/STOP CAMERA to finalize first.
 
 ## Intrinsics import
 
@@ -117,7 +118,7 @@ No fake matrices are shipped. The current canonical intrinsic YAML contains the 
 
 Supported models are plumb_bob with five distortion terms, equidistant/fisheye with four, and omnidir with four plus a measured `xi` extension. Intrinsic files must contain K, R, P, distortion, image_width and image_height. Geometry must match configured acquisition. Omnidir's xi is passed explicitly to preprocessing because standard CameraInfo does not carry it. Unknown models are rejected rather than guessed.
 
-For browser-based camera intrinsics, open **Calibrate camera intrinsics** from Calibration (or `/intrinsics.html`). Download the 24 × 16 ChArUco board with `DICT_4X4_250`, 25 mm squares and 20 mm markers. Print at 600 × 400 mm and measure a square with a ruler; printing at "fit to page" without matching the physical size produces an incorrect calibration. With the camera running at its configured resolution, capture at least four distinct views with the board at different angles and positions, then choose **Calibrate & save**. The server detects corners in full-resolution frames, rejects duplicate poses and high reprojection error, and saves a ROS `plumb_bob` calibration at the configured `intrinsics_file`. The running camera is restarted to publish the new CameraInfo. Previous intrinsic files are archived, and any existing LiDAR–camera extrinsic is marked unvalidated because it was tied to the old intrinsic parameters. **Delete intrinsics** archives and replaces the active file with a missing-calibration marker, then restarts the camera. Neither change is allowed during recording or calibration jobs. Recheck intrinsics after changing lens, focus, crop, or resolution; camera intrinsics do not estimate LiDAR–camera extrinsics or timing offset.
+For DFK browser-based camera intrinsics (D405 uses factory calibration), open **Calibrate camera intrinsics** from Calibration (or `/intrinsics.html`). Download the 24 × 16 ChArUco board with `DICT_4X4_250`, 25 mm squares and 20 mm markers. Print at 600 × 400 mm and measure a square with a ruler; printing at "fit to page" without matching the physical size produces an incorrect calibration. With the camera running at its configured resolution, capture at least four distinct views with the board at different angles and positions, then choose **Calibrate & save**. The server detects corners in full-resolution frames, rejects duplicate poses and high reprojection error, and saves a ROS `plumb_bob` calibration at the configured `intrinsics_file`. The running camera is restarted to publish the new CameraInfo. Previous intrinsic files are archived, and any existing LiDAR–camera extrinsic is marked unvalidated because it was tied to the old intrinsic parameters. **Delete intrinsics** archives and replaces the active file with a missing-calibration marker, then restarts the camera. Neither change is allowed during recording or calibration jobs. Recheck intrinsics after changing lens, focus, crop, or resolution; camera intrinsics do not estimate LiDAR–camera extrinsics or timing offset.
 
 If calibration reports high reprojection error, the solver's RMS residual exceeds 12 pixels, or its error/matrix/distortion is nonfinite. The rejected result is not saved. RMS values near this permissive ceiling indicate a poor fit; treat them as low-confidence and recapture or independently verify before precision use. Reset views and recapture at least four sharp images of a rigid, flat board: keep focus fixed, avoid glare and motion blur, vary tilt and distance, and spread the board across the image including its edges. Do not use four nearly identical front-facing views. Four is a minimum, not a guarantee of accuracy; add more varied views if needed. Verify the printed geometry matches the downloaded board and leave camera resolution/crop unchanged throughout capture.
 
@@ -161,6 +162,8 @@ Copy an entire completed calibration directory between Jetson and workstation, p
 ## Fixed API surface
 
 - Existing `/api/action`: `camera_start`, `camera_stop` (no arbitrary config/commands).
+- PUT `/api/camera/profile`: persist `auto`, `d405` or `dfk33ux287` as a preference; blocked during acquisition.
+- GET `/api/status`: includes `camera_selection`, per-candidate detection/readiness and fallback reasons.
 - GET `/api/camera/preview`: bounded, fresh JPEG; 404 when unavailable; no-store.
 - POST `/api/camera/intrinsics`: bounded ROS YAML content, validated with safe YAML parsing; no arbitrary path.
 - GET/POST `/api/calibrations`; GET `/api/calibrations/{id}`.

@@ -1,4 +1,6 @@
-# Capture workflow analysis and verification
+# Historical capture workflow analysis and verification
+
+This is evidence from an earlier refactor, not the latest build report. Camera selection, RGB fallback, host deployment enforcement and UI recovery messages have since changed; use [operation](operation.md), [camera selection](camera_auto_resolution.md) and [validation](validation.md) for current behavior/results. Historical test counts and hardware availability below refer only to that pass.
 
 Reviewed against the user's committed camera/import-export changes at `194bbfb`. Source, tests, configuration, installation scripts and operator documentation were inspected before implementation. Changes retain the existing backend/session/process architecture and the user's measured camera intrinsics, pipeline and network configuration. All acceptance artifacts are under the repository's ignored `.state/` directory.
 

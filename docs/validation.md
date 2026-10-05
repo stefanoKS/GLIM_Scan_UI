@@ -1,4 +1,18 @@
-# Implementation and validation — 2026-10-01 / 2026-10-02
+# Validation results and history
+
+## Latest recorded software validation — 2026-10-05
+
+The camera-selection implementation now committed as `ba70f6d` was tested on **x86_64**, not Jetson. The prescribed run (`source scripts/env.sh` followed by `.venv/bin/python -m pytest -q --basetemp=.state/pytest`) reported **178 passed, 1 skipped, 1 warning in 88.06 seconds**. The skip is opt-in real NKSR inference; the warning is Starlette's AnyIO BlockingPortal alias deprecation. JavaScript behavior/module syntax, Python compilation, changed shell-script syntax and diff whitespace checks passed.
+
+Coverage includes Auto/preferred camera ordering, dependency/stream failures, cleanup, LiDAR-only fallback, required-camera failures, persisted preferences, actual-profile snapshots, recording/calibration locks, stale monitor generations, measured FPS and previous-error/current-status separation. Native SDK projection tests ran against `pyrealsense2==2.58.2.10647` without physical cameras; its CPython 3.10 ARM64 wheel was downloaded successfully.
+
+A synthetic x86_64 benchmark reduced 1280×720 inverse-Brown map creation from 1.397 seconds to a 0.0234-second median. This is not a Jetson measurement or proof of end-to-end 30 FPS recording. Full details are in [camera selection validation](camera_auto_resolution.md#validation-results-2026-10-05-x86_64).
+
+Remaining target acceptance: native ARM64 installation, the [four physical camera cases](camera_auto_resolution.md#jetson-commands), sustained RGB/LiDAR recording, USB and storage throughput, thermal/memory behavior and successful workstation processing of transferred bags. Jetson does not need CUDA/GLIM/NKSR acceptance for its recording role. Geometry/loop-closure/calibration accuracy requires independent workstation/hardware evaluation.
+
+The sections below preserve **historical** measurements and limitations as recorded. Their older test counts, host addresses and feature descriptions are not the current build's defaults. The documentation refresh did not rerun hardware tests.
+
+## Historical implementation — 2026-10-01 / 2026-10-02
 
 ## What was actually tested
 
@@ -47,11 +61,11 @@ metadata.yaml df3bd76ab607b0e4c44bf974eb3e704370615344a5f2ae6537e00609ae382ad9
 
 ## Limits and remaining acceptance work
 
-- Native Jetson Orin Nano build, CUDA test, memory/thermal soak and sustained acquisition still require the actual target. Source-only transfer and `verify_jetson.sh` are provided; the verifier refuses x86_64.
+- Native Jetson Orin Nano acquisition build, memory/thermal soak and sustained recording still require the actual target. CUDA/GLIM checks belong to processing-host acceptance, not the recording Jetson. Source-only transfer and `verify_jetson.sh` are provided; the verifier refuses x86_64.
 - The native toolkit is built and launch-checked. A walked multi-submap route is needed to validate meaningful manual loop constraints, cross-zone merges and edited-map save/export. These interactions are not falsely reported as completed by the launch smoke tests.
 - Native GLIM editors require a server desktop/OpenGL display. The browser can launch/track them but does not stream their windows.
 - Raw live preview is not an accumulated optimized world map. Exported PLY has a separate optimized preview.
-- ScanContext remains unavailable: optional source inspected, not built/validated; upstream declares a noncommercial dependency. Camera/visual-loop/reconstruction/splatting stages remain deliberately inactive.
+- ScanContext remains unavailable: optional source inspected, not built/validated; upstream declares a noncommercial dependency. At this early milestone camera/visual-loop/reconstruction/splatting stages were inactive. Parallel camera recording and optional NKSR have since been added; visual-loop and splatting remain outside the current pipeline.
 - LiDAR serial was not available through the current wrapper and is null in metadata. Network diagnostics distinguish assigned-host-address, reachability and actual message health; they are not a packet-capture analyzer.
 
 Detailed build/run logs remain under `.state/`, and sensor/job logs under each session. Dependencies are pinned in `dependencies.lock`; Python resolution is pinned in `requirements.lock`.
@@ -68,7 +82,7 @@ The browser review used an isolated mock repository under `.state/record-only-br
 
 ## Semantic capture and simplified UI regression
 
-See [capture system analysis](capture_refactor_analysis.md) for the current module review, capture failure tests, browser acceptance, real 1.15 GB project export/import → native GLIM → PLY replay, raw-file hash verification and remaining disconnected-sensor/Jetson checks. The user's current camera calibration/configuration was preserved.
+See [capture system analysis](capture_refactor_analysis.md) for the earlier module review, capture failure tests, browser acceptance, real 1.15 GB project export/import → native GLIM → PLY replay, raw-file hash verification and remaining disconnected-sensor/Jetson checks. The user's current camera calibration/configuration was preserved.
 
 ## Ethernet auto-detection and display orientation
 

@@ -1,5 +1,7 @@
 # Optional pretrained NKSR surface reconstruction
 
+Run this workflow on the **processing workstation** after transferring a completed Jetson project. Recording-only deployment blocks preparation, NKSR checks and mesh jobs in the backend even if an NKSR interpreter exists. The Jetson does not perform surfacing. See [installation roles](installation_jetson.md) and the [current validation summary](validation.md); test counts later in this document are historical NKSR-specific evidence.
+
 **Prepare Reconstruction** creates paired world-space point measurements.
 **Reconstruct Mesh** runs NVIDIA's pretrained kitchen-sink (`ks`) NKSR network,
 builds its implicit surface, and extracts a triangle mesh. No training is required.
@@ -39,7 +41,7 @@ compiler. It creates Python 3.10 and torch 2.7.0+cu128 in a dedicated environmen
 No packages are installed into ROS Humble, system Python, or the app's `.venv`.
 
 ```bash
-cd "/home/ubuntu-ros/Documents/GLIM Factory Mapping/factory_mapping"
+# Run from the workstation repository root.
 ./scripts/setup_nksr.sh
 ./scripts/check_nksr.sh
 ```
@@ -80,7 +82,7 @@ loading failures. The health file is `.state/nksr_health.json`; UI checks also w
 ## Start, prepare, reconstruct
 
 ```bash
-cd "/home/ubuntu-ros/Documents/GLIM Factory Mapping/factory_mapping"
+# Run from the workstation repository root.
 ./scripts/run_system.sh
 ```
 
@@ -103,7 +105,7 @@ Manual preparation, from a fresh shell (replace paths with your scan and choose
 a new output directory):
 
 ```bash
-cd "/home/ubuntu-ros/Documents/GLIM Factory Mapping/factory_mapping"
+# Run from the workstation repository root.
 source scripts/env.sh
 python tools/glim_nksr_prepare.py \
   --bag "data/sessions/SESSION/raw_bag" \
@@ -115,7 +117,7 @@ python tools/glim_nksr_prepare.py \
 Manual inference does not need ROS activation:
 
 ```bash
-cd "/home/ubuntu-ros/Documents/GLIM Factory Mapping/factory_mapping"
+# Run from the workstation repository root.
 NKSR_PYTHON="$(cat .state/nksr_python.txt)"
 env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH OMP_NUM_THREADS=4 \
   "$NKSR_PYTHON" tools/nksr_worker.py \
@@ -160,7 +162,7 @@ CPU inference and extraction can be very slow for large clouds.
 ## Tests and licensing
 
 ```bash
-cd "/home/ubuntu-ros/Documents/GLIM Factory Mapping/factory_mapping"
+# Run from the workstation repository root.
 PYTHONPATH="$PWD/ui/backend" .venv/bin/python -m pytest -q
 RUN_NKSR_INTEGRATION=1 PYTHONPATH="$PWD/ui/backend" \
   .venv/bin/python -m pytest tests/test_nksr.py::test_real_nksr_integration -q

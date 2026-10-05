@@ -1,15 +1,14 @@
-# Future camera integration — intentionally inactive
+# Camera roadmap and remaining integration
 
-Phase 1 contains no active camera source, camera recording or visual SLAM. `camera.enabled` must remain false.
+This file originally described camera work as entirely inactive. That is historical: the current build supports D405/DFK RGB recording, automatic camera resolution, camera-only bags, profile-specific intrinsics and camera–LiDAR calibration datasets. See [current camera setup](camera_calibration.md) and [selection/verification](camera_auto_resolution.md). Include RGB now defaults on; GLIM still consumes only Mid-360 LiDAR/IMU.
 
-Future hardware: Imaging Source DFK global-shutter camera, externally triggered by Jetson hardware timing. Preserve original frame timestamps and trigger provenance alongside raw images. Do not substitute receipt time for capture time.
+Optional workstation [NKSR surface reconstruction](nksr.md) is also implemented as a separate derived geometry stage. The Jetson remains recording-only.
 
-Planned interfaces:
+## Still outside the current acquisition pipeline
 
-- `CameraFrame(timestamp, clock_domain, trigger_id, image_path, intrinsics_id)`.
-- `Calibration(intrinsics, distortion, T_lidar_camera, time_offset, provenance)`; FAST-Calib2 may supply extrinsics once its compatibility is checked.
-- Offline colorization: hardware timestamp → calibrated camera poses from optimized LiDAR trajectory → occlusion-aware RGB projection → XYZRGB.
-- Visual place recognition: ORB/DBoW → candidate pairs → LiDAR geometric verification → a supported GLIM pose-graph extension. Candidates alone never create trusted constraints.
-- Reconstruction: optimized poses and RGB → TSDF/VDBFusion mesh. Optional Gaussian splatting uses calibrated images and optimized camera poses as a separate derived product.
+- Hardware exposure triggering/synchronization and automatic camera time-offset estimation. Current receipt/driver timestamps must not be described as synchronized exposure times.
+- Occlusion-aware offline RGB projection/colorization and texture generation using optimized LiDAR poses and independently validated camera alignment.
+- Visual place recognition with LiDAR geometric verification before adding trusted pose-graph constraints. Camera imagery does not currently drive GLIM.
+- RGB-based reconstruction and Gaussian-splat visualization as separate derived products.
 
-Keep raw acquisition immutable and version each calibration/colorization/reconstruction job independently. Camera synchronization, calibration and accuracy validation require their own milestone.
+Potential future interfaces should preserve timestamp clock domain, trigger provenance, camera identity, calibration hashes, transform convention and time offset. Raw recordings and completed calibration datasets must remain immutable; each colorization/reconstruction job should have its own versioned output. Existing recording-only deployment and camera fallback/locking must remain intact.
