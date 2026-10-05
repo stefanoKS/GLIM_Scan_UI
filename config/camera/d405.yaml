@@ -1,0 +1,24 @@
+driver: librealsense
+source: realsense
+model: Intel RealSense D405
+camera_name: factory_rgb_d405
+serial_number: "230322276078"
+# USB descriptor reports the ASIC serial; SDK uses the device serial above.
+usb_serial_number: "231323073367"
+frame_id: camera_optical_frame
+image_topic: /camera/image_raw
+camera_info_topic: /camera/camera_info
+width: 1280
+height: 720
+fps: 15.0
+expected_hz: 15.0
+# SDK color only, rectified with factory intrinsics; no depth or IR publication.
+use_gst_timestamps: false
+intrinsics_file: config/calibration/d405_intrinsics.yaml
+extrinsics_file: config/calibration/d405_lidar_camera.yaml
+required_for_mapping: false
+preview_hz: 2.0
+preview_max_width: 640
+time_offset_sec: 0.0
+gstreamer_pipeline: null
+pipeline_validated: true

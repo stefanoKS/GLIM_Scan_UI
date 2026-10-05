@@ -25,6 +25,8 @@ def worker_environment():
 
 
 def health(service):
+    if service.config['system']['deployment_mode'] == 'record_only':
+        return dict(status='RECORD_ONLY', message='Export recordings to the workstation for surfacing')
     python=interpreter(service.root)
     if not python.is_file(): return dict(status='NKSR_NOT_INSTALLED',message='Run scripts/setup_nksr.sh',python=str(python))
     result=read_json(service.root/'.state/nksr_health.json',{})
@@ -38,6 +40,7 @@ def worker_path(): return Path(__file__).resolve().parents[3]/'tools/nksr_worker
 
 
 async def check(service, device='auto'):
+    service.require_processing()
     python=interpreter(service.root)
     if not python.is_file(): raise ValueError('NKSR_NOT_INSTALLED: run scripts/setup_nksr.sh')
     if service.capture.busy or service.active or any(service.pm.active(k) for k in ('nksr','nksr_check','reconstruction','offline','glim','tool')):
@@ -79,6 +82,7 @@ def validate_completed(output, returncode):
 
 
 async def reconstruct(service,sid,rid,settings):
+    service.require_processing()
     from .reconstruction_jobs import preparation_state
     run=get_run(service,sid,rid)
     job=read_json(run/'job.json',{})

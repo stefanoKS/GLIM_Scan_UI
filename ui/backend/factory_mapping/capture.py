@@ -32,6 +32,8 @@ class CaptureController:
         jetson = platform.machine() == 'aarch64'
         defaults = dict(live_glim=False, auto_process=True, mapping_preset='auto')
         settings = {**defaults, **read_json(self.s.root / '.state/capture_settings.json', {})}
+        if self.s.config['system']['deployment_mode'] == 'record_only':
+            settings.update(live_glim=False, auto_process=False)
         preset = settings['mapping_preset']
         if preset == 'auto': preset = 'jetson_gpu' if gpu else 'jetson_cpu'
         return dict(processing=available, gpu=bool(gpu), cpu=available, camera='camera' in self.s.config,

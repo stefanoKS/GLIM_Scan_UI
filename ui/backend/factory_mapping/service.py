@@ -183,9 +183,15 @@ class Service:
             self.sessions.update(p,camera={**meta['camera'],**camera_stats})
         self.record_started=None
         if not ok: self.errors.append('Recording did not finalize cleanly; preserve raw_bag and inspect recording.log')
+    def require_processing(self):
+        if self.config['system']['deployment_mode'] == 'record_only':
+            raise ValueError('Recording-only host: export this session to the workstation for mapping and surfacing')
+
     def glim_available(self):
+        if self.config['system']['deployment_mode'] == 'record_only': return False
         return self.mock or all((self.root/'ros2_ws/install/glim_ros/lib/glim_ros'/name).is_file() for name in ('glim_rosnode','glim_rosbag'))
     def check_preset(self,preset):
+        self.require_processing()
         if preset not in PRESETS: raise ValueError('Unknown GLIM preset')
         if not self.glim_available(): raise ValueError('GLIM is not installed here. Use Record-only Session and process the completed session on the workstation, or install GLIM.')
         if not self.mock and preset in ('jetson_gpu','offline_quality') and (not read_json(self.root/'.state/build_capabilities.json',{}).get('cuda',False) or not (self.root/'ros2_ws/install/glim/lib/libodometry_estimation_gpu.so').exists()):
@@ -257,6 +263,7 @@ class Service:
         except Exception as e: job.update(state='failed',error=str(e)); atomic_json(run/'job.json',job); raise
         return job
     async def export(self,sid,run_id):
+        self.require_processing()
         p=self.sessions.get(sid); run=self.get_run(p,run_id); job=read_json(run/'job.json',{})
         if job.get('state')!='completed': raise ValueError('Process this session successfully before export')
         if self.mock: raise ValueError('Mock results cannot be exported as maps')
@@ -276,6 +283,7 @@ class Service:
         if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Stop processing before deleting derived data')
         run=self.get_run(self.sessions.get(sid),rid); shutil.rmtree(run)
     async def open_tool(self,sid,rid,kind,additional):
+        self.require_processing()
         if self.mock: raise ValueError('Native GLIM editing requires a real saved map')
         if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Finish GLIM processing or close the current editor first')
         if not os.environ.get('DISPLAY'): raise ValueError('GLIM editing opens on the server desktop. Use a local display on Jetson or copy the session to a workstation.')
@@ -294,6 +302,7 @@ class Service:
         except Exception as e: meta.update(state='failed',error=str(e));atomic_json(workspace/'workspace.json',meta);raise
         meta['state']='open';atomic_json(workspace/'workspace.json',meta);return meta
     async def start_validator(self):
+        self.require_processing()
         if not self.pm.active('driver'): raise ValueError('Start the sensor first')
         c=self.config['sensor']
         return await self.start_process('validator',['ros2','run','glim_ros','validator_node','--ros-args','-r',f"imu:={c['imu_topic']}",'-r',f"points:={c['points_topic']}"],self.root/'.state/validator.log')
@@ -304,6 +313,7 @@ class Service:
         if not p.is_dir() or p.is_symlink(): raise ValueError('Edit workspace not found')
         return p
     async def export_edit(self,sid,eid):
+        self.require_processing()
         if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Close editing and finish processing before export')
         if not os.environ.get('DISPLAY'): raise ValueError('Official GLIM exporter requires a display')
         workspace=self.edit_workspace(sid,eid); dump=workspace/'saved_map'
@@ -374,7 +384,7 @@ class Service:
         if self.pm.active('camera'):raise ValueError('Camera is already running')
         if not self.mock:
             args=commands.camera(self.root,self.config)
-            await check_camera_dependencies(self.config['camera'])
+            await check_camera_dependencies(self.config['camera'],self.root)
         else:args=[]
         for name in ('camera_health.json','camera_preview.jpg','camera_calibration_frame.jpg'):(self.root/'.state'/name).unlink(missing_ok=True)
         result=await self.start_process('camera',args,self.root/'.state/camera.log')

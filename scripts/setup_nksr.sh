@@ -35,6 +35,9 @@ unset PYTHONPATH PYTHONHOME
 "$PREFIX/bin/python" -m pip install 'torch==2.7.0+cu128' --index-url https://download.pytorch.org/whl/cu128
 "$PREFIX/bin/python" -m pip install torch-scatter --no-deps --only-binary=:all: -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
 "$PREFIX/bin/python" -m pip install -r "$SOURCE/requirements.txt"
+# NKSR imports pycg.vis at runtime; python-pycg leaves its Open3D extra optional.
+# This is an upstream import dependency, not our mesh writer or preparation.
+"$PREFIX/bin/python" -m pip install open3d
 if ! "$PREFIX/bin/python" - "$COMMIT" <<'PY_CHECK'
 import json, pathlib, sys
 assert json.loads((pathlib.Path(sys.prefix)/'nksr-provenance.json').read_text())['nksr_git_commit']==sys.argv[1]

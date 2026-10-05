@@ -368,6 +368,8 @@ def make_app(root=ROOT,mock=None):
         async with s.lock:
             if s.capture.busy or s.active or any(s.pm.active(k) for k in s.pm.items): raise ValueError('Stop active processes before replacing intrinsics')
             if not s.config.get('camera'):raise ValueError('Camera configuration is missing')
+            if s.config['camera'].get('source')=='realsense':
+                raise ValueError('D405 uses factory intrinsics automatically; manual calibration is unnecessary')
             try:obj=yaml.safe_load(body.yaml_text);parse_intrinsics(obj,s.config['camera'])
             except (yaml.YAMLError,TypeError,AttributeError) as e:raise ValueError('Invalid ROS intrinsic calibration YAML') from e
             replace_intrinsics(root,s.config['camera'],obj)
@@ -411,6 +413,8 @@ def make_app(root=ROOT,mock=None):
             return await asyncio.to_thread(add_view,s.intrinsic_samples,image,frame_id)
 
     async def apply_intrinsics(service,obj):
+        if service.config['camera'].get('source')=='realsense':
+            raise ValueError('D405 uses factory intrinsics automatically; manual calibration is unnecessary')
         from .calibration_data import replace_intrinsics
         running=service.pm.active('camera')
         if running:await service.stop_camera()

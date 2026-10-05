@@ -1,5 +1,5 @@
 from pathlib import Path
-import ipaddress, os, re, math, json, socket
+import ipaddress, os, re, math, json, socket, platform
 import psutil
 import yaml
 from .camera_config import validate_camera, config_path
@@ -7,8 +7,19 @@ from .camera_config import validate_camera, config_path
 ROOT = Path(os.environ.get('FACTORY_MAPPING_ROOT', Path(__file__).resolve().parents[3])).resolve()
 PRESETS = ('jetson_cpu', 'jetson_gpu', 'offline_quality', 'pc_dense')
 
+def deployment_mode(root=ROOT):
+    """Host-local policy; never inherited from an imported recording."""
+    path = root/'.state/deployment.json'
+    mode = json.loads(path.read_text()).get('mode') if path.is_file() else (
+        'record_only' if platform.machine() == 'aarch64' else 'workstation')
+    if mode not in ('record_only', 'workstation'):
+        raise ValueError('Deployment mode must be record_only or workstation')
+    return mode
+
+
 def load(root=ROOT):
     system = yaml.safe_load((root/'config/system.yaml').read_text())
+    system['deployment_mode'] = deployment_mode(root)
     preference=root/'.state/camera_enabled.json'
     if preference.is_file():
         enabled=json.loads(preference.read_text()).get('enabled')
@@ -26,7 +37,9 @@ def load(root=ROOT):
     if not 1 <= p['hz'] <= 5 or not 100 <= p['max_points'] <= 100000 or not 0.01 <= p['voxel_size'] <= 5:
         raise ValueError('Preview limits: 1–5 Hz, 100–100000 points, 0.01–5 m voxels')
     result={'system': system, 'sensor': sensor}
-    camera_file=root/'config/camera/dfk33ux287.yaml'
+    profile=system['camera'].get('profile','d405')
+    if profile not in ('d405','dfk33ux287'): raise ValueError('Unknown camera profile')
+    camera_file=root/f'config/camera/{profile}.yaml'
     if camera_file.exists():
         camera=yaml.safe_load(camera_file.read_text())
         validate_camera(camera,sensor)

@@ -53,7 +53,10 @@ to `MAX_JOBS=1` to fit a 16 GB workstation.
 The current upstream requirements mistakenly reference torch-scatter wheels for
 PyTorch 2.8 while pinning torch 2.7. The helper preinstalls the matching official
 PyG torch 2.7/CUDA 12.8 wheel before installing the remaining upstream requirements.
-Conda CUDA target headers are added through `CPATH`; NVIDIA source is not patched.
+NKSR also imports `pycg.vis`, so the helper installs Open3D as an upstream
+import dependency omitted by PyCG's default extras. Preparation and our PLY writer
+do not use Open3D. Conda CUDA target headers are added through `CPATH`; NVIDIA
+source is not patched.
 Re-running setup reuses the environment and matching installed NKSR build. To
 update upstream, review the new environment, API and chunk dispatch, update the
 verified commit in the helper, and rebuild explicitly. Nothing installs at web
@@ -175,3 +178,81 @@ The [upstream README](https://github.com/nv-tlabs/NKSR#testing-nksr-on-your-own-
 identifies the kitchen-sink weights as CC-BY-SA 4.0. Consult those upstream terms
 for use and distribution; this repository does not relicense or bundle the source
 or checkpoint.
+
+## Verified workstation run — 2026-10-05
+
+Official NKSR 1.0.3, commit `e40336845e67761343a756788e5a98b827d4a143`,
+compiled without source modifications. Python 3.10.21, torch 2.7.0+cu128,
+CUDA runtime/toolchain 12.8, torch-scatter 2.1.2+pt27cu128, Open3D 0.20.0.
+GPU: NVIDIA GeForce RTX 5060 (8 GB), driver 580.178.04.
+The kitchen-sink checkpoint downloaded successfully. Real CUDA and explicit CPU
+smoke tests each generated 1,394 vertices / 2,780 triangles. The opt-in test also
+passed on 20,000 actual prepared factory observations.
+
+Session `20261003_135316_Scan_2026-10-03_13_53_16`, run `run_22bfe735334d`:
+
+| Measurement | Result |
+| --- | --- |
+| Raw valid observations | 3,340,321 |
+| Prepared points, 1 cm sampling | 1,806,674 |
+| Input extent (meters) | 17.117 × 28.962 × 10.889 |
+| Requested / actual mode | AUTO / CHUNKED |
+| Chunk size / overlap | 5 m / 0.05 (56 upstream chunks) |
+| Normal KNN / drop threshold | 64 / 85 degrees, upstream CUDA estimator |
+| Detail level used | None (0.5 requested, inapplicable to chunks) |
+| NKSR internal voxel override | None |
+| OOM retries | 0 |
+| GPU total / free before (torch) | 7.517 / 6.885 GiB |
+| Peak torch allocated memory | 658.03 MiB (not total process/driver memory) |
+| NKSR inference | 15.90 s |
+| Dual mesh extraction (CPU) | 30.18 s |
+| Worker elapsed | 55.58 s |
+| Vertices / triangles | 323,786 / 629,328 |
+| Binary mesh file size | 12,066,875 bytes |
+| Bounds sanity result | PASS |
+
+The 20/10/5-meter candidates had maximum occupied-cell counts of
+509,039 / 505,227 / 356,239. AUTO chose its conservative 5-meter fallback.
+This run establishes a working chunk configuration on this machine; full mode
+was not attempted on the 1.8M-point dataset. Full mode passed the smaller tests.
+
+Input bounds: `[-2.813, -23.451, -5.408]` to `[14.305, 5.511, 5.481]` meters.
+Mesh bounds: `[-2.822, -23.625, -3.909]` to `[14.521, 5.464, 5.470]` meters.
+Maximum boundary differences per axis are 0.216 / 0.174 / 1.499 meters. This is
+a coarse world-space sanity check, not a surface-accuracy assessment; the lowest
+input points are not represented by the mesh. No ICP was applied.
+
+The actual successful call was:
+
+```python
+reconstructor = nksr.Reconstructor(torch.device('cuda:0'), config='ks')
+reconstructor.chunk_tmp_device = torch.device('cpu:0')
+preprocess_fn = nksr.get_estimate_normal_preprocess_fn(64, 85.0)
+field = reconstructor.reconstruct(
+    input_xyz, sensor=input_sensor,
+    detail_level=None, chunk_size=5.0, overlap_ratio=0.05,
+    approx_kernel_grad=True, fused_mode=True, preprocess_fn=preprocess_fn,
+)
+field.to_('cpu:0')
+reconstructor.network.to('cpu:0')
+mesh = field.extract_dual_mesh(mise_iter=1)
+```
+
+The successful production job and outputs are in:
+
+```text
+data/sessions/20261003_135316_Scan_2026-10-03_13_53_16/reconstruction/run_22bfe735334d/
+```
+
+`exports/run_003_13b1a4a9.ply` remained unchanged, SHA-256:
+`ded9f09b2e7429dc77660abaf128194548d92a9ca4da019652a1449e7c3e7ae4`.
+Existing GLIM export regression tests continue to pass, including missing-NKSR
+isolation. This task did not invoke GLIM's exporter to overwrite any existing file.
+
+Final validation: `RUN_NKSR_INTEGRATION=1 PYTHONPATH="$PWD/ui/backend" .venv/bin/python -m pytest -q`
+completed with **136 passed** (one existing Starlette/AnyIO deprecation warning).
+The ordinary suite completed with **135 passed, 1 opt-in test skipped**.
+Browser checks verified prepared/stale states, disabled detail level for chunks,
+READY GPU status, and the real completed mesh counts/download control, with no
+browser console errors. A second setup-helper run completed successfully without
+rebuilding the matching NKSR installation.

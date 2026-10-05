@@ -1,0 +1,67 @@
+image_width: 1280
+image_height: 720
+camera_name: factory_rgb_d405
+distortion_model: plumb_bob
+camera_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 653.3778076171875
+  - 0.0
+  - 648.0505981445312
+  - 0.0
+  - 651.61376953125
+  - 359.6151123046875
+  - 0.0
+  - 0.0
+  - 1.0
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+  - 653.3778076171875
+  - 0.0
+  - 648.0505981445312
+  - 0.0
+  - 0.0
+  - 651.61376953125
+  - 359.6151123046875
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+factory_calibration:
+  serial_number: '230322276078'
+  distortion_model: distortion.inverse_brown_conrady
+  coefficients:
+  - -0.05041173845529556
+  - 0.06052553653717041
+  - -0.0002856209175661206
+  - 0.002025777939707041
+  - -0.02092980593442917
+  rectified: true
+  stream: color
+  format: rgb8

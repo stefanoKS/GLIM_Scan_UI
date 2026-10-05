@@ -1,6 +1,6 @@
 # Factory Mapping — GLIM + Mid-360
 
-Local ROS 2 acquisition, immutable raw bags, GLIM processing jobs and a lightweight browser interface. GLIM uses **only the Mid-360 LiDAR and its IMU**. Optional parallel RGB acquisition and manual LiDAR–camera calibration are available. The PC can perform processing; the future Jetson can focus on acquisition.
+Local ROS 2 acquisition, immutable raw bags, GLIM processing jobs and a lightweight browser interface. GLIM uses **only the Mid-360 LiDAR and its IMU**. Optional parallel RGB acquisition and manual LiDAR–camera calibration are available. The Jetson records raw sensor data only; the workstation performs mapping and surfacing.
 
 ## Install from GitHub
 
@@ -17,7 +17,13 @@ scripts/bootstrap_jetson.sh
 
 Bootstrap installs the OS build prerequisites, creates the Python environment, downloads the exact upstream GLIM and Livox revisions pinned in `dependencies.lock`, builds and installs them into this checkout, then builds the ROS 2 workspace. GLIM is fetched automatically; do not clone or install it separately. The first build needs internet access, `sudo` for apt packages, and can take a while. Use `BUILD_JOBS=1 scripts/bootstrap_jetson.sh` on memory-constrained machines. CUDA is detected automatically and falls back to CPU when unavailable.
 
-For a Jetson used only to capture bags, use `scripts/bootstrap_jetson.sh --record-only`. This skips GLIM and CUDA builds. The UI detects that GLIM is absent: choose **START SCAN**, then **STOP SCAN** before copying the completed session to the workstation for GLIM processing.
+For the recording Jetson, use `scripts/bootstrap_jetson.sh --record-only` (also the default on ARM64). This skips GLIM/CUDA and never installs NKSR. It saves a host-local recording-only policy in `.state/deployment.json`: live mapping, automatic processing, map tools and surfacing are blocked even if older installations remain. Choose **START SCAN**, then **STOP SCAN**, wait for completion, and export the project from Library. Import it on the workstation for mapping and surfacing. Project transfers do not change either machine's deployment mode.
+
+The supported Jetson target is **JetPack 6 / Ubuntu 22.04 / ROS 2 Humble**, on supported Orin hardware; older Nano/TX2 images and JetPack 5 or 7 are not supported by this installer. See [NVIDIA's JetPack 6 platform details](https://developer.nvidia.com/embedded/jetpack-sdk-60). Bootstrap stops on a different Ubuntu version without modifying it. Use `--workstation` only on a machine intended to process data.
+
+RGB is enabled by default. After bootstrap, run `scripts/install_d405.sh` and configure USB access before recording with the D405, or disable RGB in dashboard Settings for LiDAR/IMU-only recording. Bootstrap supplies OpenCV and cv_bridge for the camera path. Camera SDK installation and actual USB capture must be checked on the target device.
+
+Run `scripts/verify_jetson.sh --record-only` on the Jetson for software checks. With the dashboard stopped and sensors connected, run `scripts/verify_jetson.sh --record-only --hardware` for a 30-second finalized recording. Before deployment, also record for the intended route duration on the target storage, check for dropped messages, memory/thermal issues and disk capacity, then transfer and process that recording on the workstation. Passing workstation tests does not certify Jetson hardware throughput.
 
 Start the dashboard after bootstrap completes:
 
@@ -74,7 +80,7 @@ No ARM64 build result is claimed from the x86_64 test machine. No AVX/native arc
 
 ## Optional RGB camera and calibration
 
-RGB recording is enabled by default: Start Scan records camera images and CameraInfo alongside LiDAR and IMU. Disabling RGB in Settings shows a warning and still allows LiDAR-only scans. Verify the DFK 33UX287 pipeline on each acquisition host. `scripts/install_camera.sh` adds the optional tiscamera/gscam2 acquisition stack. `scripts/install_calibration.sh` adds the separate workstation calibrator. Neither is required for LiDAR-only or record-only operation.
+RGB recording is enabled by default: Start Scan records camera images and CameraInfo alongside LiDAR and IMU. Disabling RGB in Settings shows a warning and still allows LiDAR-only scans. The default RGB camera is the D405, using factory intrinsics without a printed calibration board. `scripts/install_d405.sh` adds its SDK to the existing camera environment. Camera–LiDAR mounting alignment is still required. Set `camera.profile: dfk33ux287` in `config/system.yaml` to use the preserved DFK settings and `scripts/install_camera.sh` stack. `scripts/install_calibration.sh` adds the separate workstation calibrator. Neither is required for LiDAR-only or record-only operation.
 
 See [camera setup, calibration conventions and hardware acceptance commands](docs/camera_calibration.md). The dashboard has camera health/JPEG preview, intrinsic YAML import and a separate persistent calibration workflow: static captures → preprocessing → manual alignment → NID → result import → independent validation. SuperGlue and final colorization are not integrated.
 

@@ -10,8 +10,10 @@ def root(tmp_path):
     import yaml
     system=yaml.safe_load((tmp_path/'config/system.yaml').read_text())
     system['camera']['enabled']=False
+    system['camera']['profile']='dfk33ux287' # Existing DFK/ChArUco regression fixtures.
     (tmp_path/'config/system.yaml').write_text(yaml.safe_dump(system))
     (tmp_path/'config/calibration/camera_intrinsics.yaml').write_text('calibrated: false\n')
     (tmp_path/'ui/frontend').mkdir(parents=True);(tmp_path/'ui/frontend/index.html').write_text('test')
     (tmp_path/'.state').mkdir()
+    (tmp_path/'.state/deployment.json').write_text('{"mode":"workstation"}')
     return tmp_path

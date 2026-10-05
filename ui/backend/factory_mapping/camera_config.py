@@ -19,7 +19,9 @@ def config_path(root, value):
 
 
 def validate_camera(c, sensor=None):
-    if c.get('driver')!='gscam2' or c.get('source')!='tiscamera': raise ValueError('Camera driver/source must be gscam2/tiscamera')
+    if (c.get('driver'),c.get('source')) not in (('gscam2','tiscamera'),('librealsense','realsense')): raise ValueError('Unsupported camera driver/source')
+    if c.get('source')=='realsense' and (not c.get('serial_number') or c.get('fps') not in (5,15,30)):
+        raise ValueError('D405 requires a serial number and 5, 15 or 30 FPS')
     for key in ('image_topic','camera_info_topic'):
         if not topic(c.get(key)): raise ValueError('Invalid camera ROS topic: '+key)
     topics=[c['image_topic'],c['camera_info_topic']]

@@ -71,6 +71,8 @@ def camera(root,config):
     from .camera_config import validate_camera,config_path
     from .calibration_data import intrinsics_status
     c=config['camera'];validate_camera(c,config['sensor'])
+    if c['source']=='realsense':
+        return [sys.executable,'-m','factory_mapping.realsense_camera','--root',str(root),'--config',json.dumps(c)]
     if not c['pipeline_validated'] or not c.get('gstreamer_pipeline'): raise ValueError('Camera pipeline is not hardware-validated. Probe the DFK and set trusted local camera YAML first.')
     params=dict(gscam_config=c['gstreamer_pipeline'],use_gst_timestamps=c['use_gst_timestamps'],camera_name=c['camera_name'],frame_id=c['frame_id'],image_encoding='rgb8',sync_sink=False)
     if intrinsics_status(root,c)['status']=='VALID': params['camera_info_url']='file://'+str(config_path(root,c['intrinsics_file']).resolve())

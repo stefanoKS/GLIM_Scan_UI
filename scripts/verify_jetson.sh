@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -eo pipefail
-RECORD_ONLY=false
+RECORD_ONLY=true
 HARDWARE=false
 for arg in "$@"; do
  case "$arg" in
   --record-only) RECORD_ONLY=true;;
+  --workstation) RECORD_ONLY=false;;
   --hardware) HARDWARE=true;;
-  --help|-h) echo "Usage: $0 [--record-only] [--hardware]"; exit 0;;
+  --help|-h) echo "Usage: $0 [--record-only|--workstation] [--hardware]"; exit 0;;
   *) echo "Unknown option: $arg" >&2; exit 2;;
  esac
 done
@@ -26,7 +27,7 @@ done
 fi
 if [[ "$HARDWARE" == true ]]; then
  "$ROOT/scripts/record_test.sh" --name jetson_acceptance --seconds 30
- echo 'Next: copy the completed session to the workstation if needed, then process the printed session with scripts/process_bag.sh SESSION_ID --preset jetson_cpu (or jetson_gpu for a CUDA build).'
+ echo 'Next: transfer the completed session to the workstation for mapping and surfacing. Never process it on the recording Jetson.'
 fi
 if [[ "$RECORD_ONLY" == true ]]; then
  echo 'ARM64 acquisition software checks passed. Sustained LiDAR/IMU recording and thermal/memory checks still require the sensor.'

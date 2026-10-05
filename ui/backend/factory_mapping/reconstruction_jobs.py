@@ -56,6 +56,7 @@ def view(service, sid):
 
 
 async def start(service, sid, trajectory, voxel_size_m, save_full_density=False):
+    service.require_processing()
     size = validate_voxel_size(voxel_size_m)
     session = service.sessions.get(sid)
     source = safe_trajectory(session, trajectory)
