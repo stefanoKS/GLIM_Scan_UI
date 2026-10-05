@@ -2,23 +2,23 @@
 
 The Mid-360 LiDAR + IMU remain GLIM's only inputs. Camera RGB and CameraInfo are parallel acquisition streams in the same raw rosbag. Camera-disabled operation retains the original two-topic recording, mock mode, native GLIM toolkit and record-only Jetson option. No GLIM core code is modified. No final colorizer, mesh or texture processing is included.
 
-## Default D405 RGB camera
+## Auto selection and D405 RGB camera
 
-`config/system.yaml` selects `camera.profile: d405` by default. The profile in
+`config/system.yaml` selects `camera.profile: auto` by default (D405 preferred, DFK fallback). The profile in
 `config/camera/d405.yaml` selects attached serial `230322276078`, color only,
-1280×720 at 15 FPS. On the existing camera host, run `scripts/install_d405.sh`
+1280×720 at a target 30 FPS. On the existing camera host, run `scripts/install_d405.sh`
 to install the pinned Python RealSense SDK. OpenCV, ROS and cv_bridge must already
 be installed; USB access uses the standard librealsense udev rules.
 
 At camera startup the SDK reads the selected color profile's factory intrinsics
 and saves `config/calibration/d405_intrinsics.yaml`. No ArUco/ChArUco lens
 calibration is needed. The original inverse Brown–Conrady coefficients and device
-serial are retained in that file as provenance. SDK projection builds a remap that
+serial are retained in that file as provenance. A vectorized implementation of the pinned SDK projection builds a remap that
 rectifies RGB before publication, so the saved ROS matrices and CameraInfo use
 zero distortion and describe the **published** images. `/camera/image_raw` keeps
 its existing name for compatibility but contains rectified RGB for this profile.
 Depth and infrared streams are disabled; GLIM still uses only Mid-360 LiDAR/IMU.
-See the [SDK projection API](https://github.com/realsenseai/librealsense/blob/master/include/librealsense2/rsutil.h).
+See the [SDK projection API](https://github.com/realsenseai/librealsense/blob/v2.58.2/src/rs.cpp).
 
 The extracted focal lengths are fx=653.3778076171875, fy=651.61376953125,
 cx=648.0505981445312, cy=359.6151123046875 at 1280×720. Changing serial or resolution
@@ -32,9 +32,11 @@ Factory calibration does **not** know the camera-to-Mid-360 mounting transform.
 Complete the existing alignment workflow for the replacement camera. Its separate
 `d405_lidar_camera.yaml` starts uncalibrated; the DFK's calibration is preserved.
 To return to DFK, choose **Settings → RGB camera → DFK 33UX287**. The selection
-persists locally and the camera stream restarts; the backend reads the selected
-profile's expected dimensions and calibration paths. D405 remains the default
-when no local profile has been selected.
+persists locally as a preference, and the other supported camera is tried if it cannot stream.
+The backend snapshots the actual camera's dimensions and calibration paths before recording.
+Auto is the default when no preference is saved. A calibration dataset is bound to its original camera;
+if that camera is unavailable, its capture fails instead of switching to a different lens.
+See [camera selection and Jetson verification](camera_auto_resolution.md).
 The tiscamera installation and printed-board instructions below apply to DFK.
 
 ## Three independent calibrations

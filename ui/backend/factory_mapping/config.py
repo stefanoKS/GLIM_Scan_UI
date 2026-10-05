@@ -1,5 +1,5 @@
 from pathlib import Path
-import ipaddress, os, re, math, json, socket, platform
+import ipaddress, os, re, math, json, socket, platform, logging
 import psutil
 import yaml
 from .camera_config import validate_camera, config_path
@@ -26,11 +26,17 @@ def load(root=ROOT):
         enabled=json.loads(preference.read_text()).get('enabled')
         if type(enabled) is not bool: raise ValueError('Local camera preference must be boolean')
         system['camera']['enabled']=enabled
+    warnings=[]
+    profile=system['camera'].get('profile','auto')
     profile_preference=root/'.state/camera_profile.json'
-    if profile_preference.is_file():
-        profile=json.loads(profile_preference.read_text()).get('profile')
-        if profile not in CAMERA_PROFILES: raise ValueError('Local camera profile is invalid')
-        system['camera']['profile']=profile
+    try:
+        if profile_preference.is_file(): profile=json.loads(profile_preference.read_text())['profile']
+        if profile not in ('auto', *CAMERA_PROFILES): raise ValueError('unknown profile')
+    except (OSError, ValueError, KeyError, TypeError):
+        profile='auto'
+        warnings.append('Invalid camera preference; using Auto. Choose a preference in Settings to replace .state/camera_profile.json.')
+        logging.getLogger(__name__).warning(warnings[-1])
+    system['camera']['profile']=profile
     sensor = yaml.safe_load((root/'config/livox/mid360.yaml').read_text())
     validate_sensor(sensor)
     sensor['interface_setting'] = sensor['interface']
@@ -42,11 +48,10 @@ def load(root=ROOT):
     p = system['preview']
     if not 1 <= p['hz'] <= 5 or not 100 <= p['max_points'] <= 100000 or not 0.01 <= p['voxel_size'] <= 5:
         raise ValueError('Preview limits: 1–5 Hz, 100–100000 points, 0.01–5 m voxels')
-    result={'system': system, 'sensor': sensor}
-    profile=system['camera'].get('profile','d405')
-    if profile not in CAMERA_PROFILES: raise ValueError('Unknown camera profile')
-    camera_file=root/f'config/camera/{profile}.yaml'
-    if camera_file.exists(): result['camera']=load_camera_profile(root,profile,sensor)
+    result={'system': system, 'sensor': sensor, 'warnings': warnings}
+    # This is a configuration template, not evidence of a selected/working camera.
+    template='d405' if profile=='auto' else profile
+    if (root/f'config/camera/{template}.yaml').is_file(): result['camera']=load_camera_profile(root,template,sensor)
     elif system['camera']['enabled']: raise ValueError('Camera configuration is missing')
     return result
 

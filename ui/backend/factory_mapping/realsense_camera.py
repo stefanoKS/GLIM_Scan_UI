@@ -2,6 +2,8 @@
 import argparse
 from array import array
 import json
+import time
+from importlib.metadata import version
 from pathlib import Path
 
 from .calibration_data import replace_intrinsics, parse_intrinsics
@@ -51,30 +53,61 @@ def save_calibration(root, camera, obj):
 
 
 def rectification_maps(intr):
-    """Use SDK projection for the exact device model (including inverse Brown)."""
+    """Rectified destination pixel -> source pixel, matching librealsense 2.58.2.
+
+    Inverse Brown uses the SDK's projection polynomial: tangential terms use
+    radially scaled x/y but the original r². It is NOT OpenCV ordinary Brown.
+    See src/rs.cpp rs2_project_point_to_pixel in the pinned SDK.
+    """
     import numpy as np
     import pyrealsense2 as rs
-    pixels = [rs.rs2_project_point_to_pixel(intr, [(x-intr.ppx)/intr.fx, (y-intr.ppy)/intr.fy, 1.])
-              for y in range(intr.height) for x in range(intr.width)]
-    maps = np.asarray(pixels, dtype=np.float32).reshape(intr.height, intr.width, 2)
-    return maps[:, :, 0].copy(), maps[:, :, 1].copy()
+    if intr.model == rs.distortion.none: return None
+    if intr.model not in (rs.distortion.brown_conrady, rs.distortion.inverse_brown_conrady):
+        raise ValueError('Unsupported rectification model: '+str(intr.model))
+    y,x=np.indices((intr.height,intr.width),dtype=np.float32)
+    x=(x-intr.ppx)/intr.fx; y=(y-intr.ppy)/intr.fy
+    r2=x*x+y*y
+    k1,k2,p1,p2,k3=intr.coeffs
+    radial=1+k1*r2+k2*r2*r2+k3*r2*r2*r2
+    xf=x*radial; yf=y*radial
+    if intr.model == rs.distortion.inverse_brown_conrady: x,y=xf,yf
+    mx=(xf+2*p1*x*y+p2*(r2+2*x*x))*intr.fx+intr.ppx
+    my=(yf+2*p2*x*y+p1*(r2+2*y*y))*intr.fy+intr.ppy
+    return mx,my
 
 
-def publish(camera, pipeline, config):
+def diagnostic(stage, started, **fields):
+    print(json.dumps(dict(stage=stage,seconds=time.monotonic()-started,**fields)),flush=True)
+
+
+def publish(camera, pipeline, config, root):
     import cv2
     import numpy as np
     import pyrealsense2 as rs
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import Image, CameraInfo
+    cv2.setNumThreads(2)
     rclpy.init()
     node = Node('factory_mapping_d405')
     images = node.create_publisher(Image, camera['image_topic'], 10)
     infos = node.create_publisher(CameraInfo, camera['camera_info_topic'], 10)
-    profile = pipeline.start(config)
+    pipeline_started=False
     try:
+        started=time.monotonic()
+        profile = pipeline.start(config)
+        pipeline_started=True
+        diagnostic("pipeline.start",started)
+        started=time.monotonic()
         intr, obj = calibration(camera, profile)
-        map_x, map_y = rectification_maps(intr)
+        save_calibration(root,camera,obj)
+        diagnostic('calibration',started)
+        started=time.monotonic()
+        maps = rectification_maps(intr)
+        # Native fixed-point maps reduce per-frame remap cost and memory bandwidth.
+        maps = cv2.convertMaps(*maps,cv2.CV_16SC2) if maps is not None else None
+        diagnostic('rectification_maps',started,remap=maps is not None)
+        first=True; waiting=time.monotonic()
         info = CameraInfo(width=intr.width, height=intr.height, distortion_model='plumb_bob')
         info.k = obj['camera_matrix']['data']; info.d = obj['distortion_coefficients']['data']
         info.r = obj['rectification_matrix']['data']; info.p = obj['projection_matrix']['data']
@@ -83,17 +116,24 @@ def publish(camera, pipeline, config):
             if not frame: continue
             # Host receipt time shares the ROS/LiDAR clock; never publish device uptime as epoch time.
             stamp = node.get_clock().now().to_msg()
-            rgb = cv2.remap(np.asanyarray(frame.get_data()), map_x, map_y, cv2.INTER_LINEAR)
+            rgb = np.asanyarray(frame.get_data())
+            if maps is not None: rgb = cv2.remap(rgb,*maps,cv2.INTER_LINEAR)
             msg = Image(width=intr.width, height=intr.height, encoding='rgb8', step=intr.width*3)
             msg.header.stamp = stamp; msg.header.frame_id = camera['frame_id']
             msg.data = array('B', rgb.tobytes()); info.header = msg.header
             images.publish(msg); infos.publish(info)
+            if first:
+                diagnostic('first_frame',waiting,width=intr.width,height=intr.height,total_startup_seconds=time.monotonic()-STARTED)
+                first=False
             rclpy.spin_once(node, timeout_sec=0)
     except KeyboardInterrupt:
         pass
     finally:
-        pipeline.stop(); node.destroy_node()
-        if rclpy.ok(): rclpy.shutdown()
+        try:
+            if pipeline_started: pipeline.stop()
+        finally:
+            node.destroy_node()
+            if rclpy.ok(): rclpy.shutdown()
 
 
 def main():
@@ -103,18 +143,18 @@ def main():
     parser.add_argument('--extract', action='store_true')
     args = parser.parse_args()
     camera = json.loads(args.config)
+    started=time.monotonic()
     pipeline, config, profile = resolve(camera)
-    _, obj = calibration(camera, profile)
+    diagnostic("resolve",started,pyrealsense2=version("pyrealsense2"))
     if args.extract:
+        _, obj = calibration(camera, profile)
         save_calibration(args.root, camera, obj)
         print(json.dumps(obj))
     else:
-        # Extraction is done before acquisition so session snapshots match the images.
-        import yaml
-        saved = yaml.safe_load(config_path(args.root, camera['intrinsics_file']).read_text())
-        if saved != obj: raise ValueError('D405 factory intrinsics changed; restart camera to extract them before recording')
-        publish(camera, pipeline, config)
+        publish(camera, pipeline, config, args.root)
 
+
+STARTED=time.monotonic()
 
 if __name__ == '__main__':
     main()

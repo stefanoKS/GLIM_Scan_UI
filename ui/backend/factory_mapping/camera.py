@@ -31,7 +31,7 @@ class CameraMetrics:
         healthy=expected*.7<=r['hz']<=expected*1.3 and (self.width,self.height)==(self.config['width'],self.config['height']) and self.frame_id==self.config['frame_id']
         mean=sum(self.deltas)/len(self.deltas) if self.deltas else None
         jitter=(sum((x-mean)**2 for x in self.deltas)/len(self.deltas))**.5 if mean is not None else None
-        return dict(r,state='healthy' if healthy else ('no_messages' if not r['hz'] else 'rate_or_geometry_abnormal'),healthy=healthy,image_hz=r['hz'],last_image_timestamp=r['stamp'],image_age=r['age'],width=self.width,height=self.height,frame_id=self.frame_id,camera_info_seen=self.info_seen,camera_info_valid=self.info_valid and self.info_time is not None and time.monotonic()-self.info_time<3,timestamp_age_sec=time.time()-r['stamp'] if r['stamp'] else None,timestamp_jitter_sec=jitter,timestamp_rewinds=self.rewinds)
+        return dict(r,state='healthy' if healthy else ('no_messages' if not r['hz'] else 'rate_or_geometry_abnormal'),healthy=healthy,image_hz=r['hz'],last_image_timestamp=r['stamp'],image_age=r['age'],width=self.width,height=self.height,frame_id=self.frame_id,camera_info_seen=self.info_seen,camera_info_age=time.monotonic()-self.info_time if self.info_time is not None else None,camera_info_valid=self.info_valid and self.info_time is not None and time.monotonic()-self.info_time<3,timestamp_age_sec=time.time()-r['stamp'] if r['stamp'] else None,timestamp_jitter_sec=jitter,timestamp_rewinds=self.rewinds)
 
 
 async def check_camera_dependencies(config, root=None):
@@ -39,13 +39,15 @@ async def check_camera_dependencies(config, root=None):
         if not shutil.which(args[0]): raise ValueError(args[0]+' unavailable; run scripts/install_camera.sh and source scripts/env.sh')
         p=await asyncio.create_subprocess_exec(*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.STDOUT)
         try:out,_=await asyncio.wait_for(p.communicate(),10)
+        except asyncio.CancelledError:
+            p.kill();await p.communicate();raise
         except asyncio.TimeoutError:
             p.kill();await p.communicate();raise ValueError('Camera diagnostic timed out: '+args[0])
         return p.returncode,out.decode(errors='replace')
     if config['source']=='realsense':
         import sys,json
         from .config import ROOT
-        rc,text=await run([sys.executable,'-m','factory_mapping.realsense_camera','--root',str(root or ROOT),'--config',json.dumps(config),'--extract'])
+        rc,text=await run([sys.executable,'-c','import pyrealsense2, cv2; from importlib.metadata import version; print(version("pyrealsense2"))'])
         if rc: raise ValueError('D405 unavailable; install scripts/install_d405.sh and check USB/serial: '+text[-2000:])
         return {'devices':text,'publisher':'librealsense RGB only'}
     rc,text=await run(['ros2','pkg','executables','gscam2'])

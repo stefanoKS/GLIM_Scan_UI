@@ -3,7 +3,7 @@ import os, time
 import numpy as np
 from .config import ROOT, load
 from .health import Rates
-from .storage import atomic_json
+from .storage import atomic_json, read_json
 from .preview import encode
 
 def run(kind):
@@ -56,7 +56,8 @@ def preview(): run('preview')
 
 
 def run_camera(kind):
-    config=load();c=config['camera']
+    active=read_json(ROOT/'.state/camera_active.json')
+    c=active['camera']
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data, QoSProfile
@@ -86,7 +87,7 @@ def run_camera(kind):
     node.create_subscription(Image,c['image_topic'],image,QoSProfile(depth=5) if kind=='camera_monitor' else qos_profile_sensor_data)
     if kind=='camera_monitor':
         node.create_subscription(CameraInfo,c['camera_info_topic'],lambda m:metrics.info(m.width,m.height,m.k,m.d,m.distortion_model,m.header.frame_id),QoSProfile(depth=5))
-        node.create_timer(.5,lambda:atomic_json(ROOT/'.state/camera_health.json',dict(updated_at=time.time(),**metrics.view())))
+        node.create_timer(.5,lambda:atomic_json(ROOT/'.state/camera_health.json',dict(updated_at=time.time(),camera_generation=active['generation'],**metrics.view())))
     try:rclpy.spin(node)
     except KeyboardInterrupt:pass
     finally:

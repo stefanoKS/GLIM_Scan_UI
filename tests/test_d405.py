@@ -56,3 +56,39 @@ def test_d405_usb_detection(root,tmp_path):
     assert detect_camera(c,usb.parent)['detected']
     c['usb_serial_number']='other'
     assert not detect_camera(c,usb.parent)['detected']
+
+
+@pytest.mark.parametrize('model',['brown_conrady','inverse_brown_conrady'])
+def test_vectorized_maps_match_native_projection(model):
+    rs=pytest.importorskip('pyrealsense2')
+    intr=rs.intrinsics();intr.width=1280;intr.height=720
+    intr.fx=660.;intr.fy=662.;intr.ppx=639.5;intr.ppy=359.5
+    intr.model=getattr(rs.distortion,model)
+    intr.coeffs=[-.0504,.0605,-.00028,.00202,-.0209]
+    mx,my=rectification_maps(intr)
+    for x,y in [(0,0),(1279,719),(640,360),(0,719),(1279,0),(91,603),(1110,115)]:
+        expected=rs.rs2_project_point_to_pixel(intr,[(x-intr.ppx)/intr.fx,(y-intr.ppy)/intr.fy,1.])
+        # float32 SIMD/SDK rounding at 1280 pixels; much smaller than the
+        # 1/32 pixel interpolation table quantization used by OpenCV remap.
+        np.testing.assert_allclose([mx[y,x],my[y,x]],expected,rtol=0,atol=3e-4)
+
+
+def test_no_distortion_skips_remap():
+    rs=pytest.importorskip('pyrealsense2')
+    intr=rs.intrinsics();intr.model=rs.distortion.none
+    assert rectification_maps(intr) is None
+
+
+def test_d405_delivered_rate_is_measured(root,monkeypatch):
+    from factory_mapping.camera import CameraMetrics
+    c=yaml.safe_load((root/'config/camera/d405.yaml').read_text())
+    assert c['fps']==c['expected_hz']==30
+    metrics=CameraMetrics(c)
+    clock=[100.]
+    monkeypatch.setattr('factory_mapping.health.time.monotonic',lambda:clock[0])
+    for i in range(60):
+        clock[0]=100+i/30;metrics.image(clock[0],c['width'],c['height'],c['frame_id'])
+    assert metrics.view()['healthy']
+    assert metrics.view()['image_hz']==pytest.approx(30)
+    clock[0]+=3
+    assert not metrics.view()['healthy']

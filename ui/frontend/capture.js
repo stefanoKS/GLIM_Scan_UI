@@ -1,3 +1,4 @@
+import {cameraLabel,captureMessages} from './camera-status.js';
 // The browser requests semantic actions; the server owns sequencing and recovery.
 const $=id=>document.getElementById(id);
 let ctx, latest, actionPending=false, settingsLoaded=false;
@@ -30,13 +31,16 @@ export function refreshCapture(s){
  $('rgb-recording-warning').hidden=!!s.config.system.camera.enabled;
  const set=(id,label,ok,text)=>{$(id).textContent=`${ok?'✓':'○'} ${label} · ${text}`;$(id).dataset.ready=String(ok)};
  for(const [key,label] of [['lidar','LiDAR'],['imu','IMU']]){const healthy=['healthy','mock'].includes(h[key]?.state);set('health-'+key,label,healthy,healthy?'Ready':key==='lidar'&&s.detection?.mid360?.detected?'Connected':'Waiting')}
- const cam=h.camera||{};set('health-camera','Camera',cam.healthy,cam.healthy?'Ready':s.detection?.camera?.detected?'Connected':!s.config.system.camera.enabled?'Optional':'Not detected');
+ const cam=h.camera||{}, label=cameraLabel(s);set('health-camera','Camera',label.ready,label.text);
+ $('health-camera').title=s.camera_selection?.fallback_reason||'';
  const free=s.system.disk_free/1e9;set('health-storage','Storage',free>=s.config.system.storage.minimum_free_gb,`${free.toFixed(0)} GB free`);
- const titles={READY:'Ready to scan',PREFLIGHT:'Checking sensors…',SCANNING:c.mode==='camera'?'Recording camera':'Scanning',FINALIZING:'Saving recording…',PROCESSING:'Processing scan…',COMPLETE:c.error?'Previous capture needs review':'Saved'};
+ const titles={READY:'Ready to scan',PREFLIGHT:'Checking sensors…',SCANNING:c.mode==='camera'?'Recording camera':'Scanning',FINALIZING:'Saving recording…',PROCESSING:'Processing scan…',COMPLETE:'Ready for next scan'};
  $('capture-state').textContent=titles[c.state]||c.state;
  const hints={READY:'Press Start Scan to begin.',PREFLIGHT:'Starting the required sensors and checking their data.',SCANNING:'Raw data is being saved.',FINALIZING:'Keep the application open while recording finishes.',PROCESSING:'The raw scan is safe. Building the map.',COMPLETE:capabilities.record_only?'Scan saved. Export it from Library to process on a workstation.':'Open Library to view, rename or export the recording.'};
  const blocked=!c.busy&&!c.can_start?(Object.values(s.processes).some(p=>p.state==='orphaned')?'A previous sensor process is still running. Review recovery in Settings → Advanced / Diagnostics.':'Finish the active session or job before starting another capture.'):null;
- $('capture-message').textContent=(c.error?(c.state==='COMPLETE'?'Previous capture: '+c.error:c.error):null)||blocked||c.warnings?.at(-1)||hints[c.state];
+ const messages=captureMessages(c,blocked,hints[c.state]);
+ $('capture-message').textContent=messages.current;
+ $('previous-capture').textContent=messages.previous;
  const seconds=Math.floor(s.recording_elapsed||0);$('capture-elapsed').textContent=`${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`;
  $('pip-empty').hidden=!!cam.camera_running;
  $('system-profile').textContent=`${capabilities.profile} · ${capabilities.record_only?'Recording only':capabilities.gpu?'GPU and CPU processing':'CPU processing'}`;

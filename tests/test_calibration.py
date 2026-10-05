@@ -73,7 +73,10 @@ def test_capture_immutable_and_independent_from_mapping(root):
 
 
 def test_real_result_import_preserves_original_and_does_not_validate(root):
-    enabled(root);measured_intrinsics(root);s=Service(root,False);cal=s.calibrations
+    enabled(root);measured_intrinsics(root);s=Service(root,False)
+    # These offline tool fixtures start from a previously resolved camera.
+    s.camera_selection.active_profile='dfk33ux287';s.camera_selection.usable=lambda h:True
+    cal=s.calibrations
     m=cal.create('import fixture');p=cal.get(m['id']);cap=p/'captures/capture_001';(cap/'raw_bag').mkdir(parents=True);(cap/'raw_bag/example').write_text('raw')
     atomic_json(cap/'metadata.json',dict(state='CAPTURED',raw_hashes=hashes(cap/'raw_bag')))
     work=p/'jobs/job_fixture/work';work.mkdir(parents=True)
@@ -129,7 +132,10 @@ def test_intrinsics_import_archives_previous_and_rejects_api_injection(root):
 
 
 def test_calibration_tool_requires_display_and_failed_job_can_retry(root,monkeypatch):
-    enabled(root);measured_intrinsics(root);s=Service(root,False);cal=s.calibrations;m=cal.create('native');p=cal.get(m['id'])
+    enabled(root);measured_intrinsics(root);s=Service(root,False)
+    # These offline tool fixtures start from a previously resolved camera.
+    s.camera_selection.active_profile='dfk33ux287';s.camera_selection.usable=lambda h:True
+    cal=s.calibrations;m=cal.create('native');p=cal.get(m['id'])
     cal.update(p,state='PREPROCESSED')
     monkeypatch.delenv('DISPLAY',raising=False)
     with pytest.raises(ValueError,match='DISPLAY'):asyncio.run(cal.run(m['id'],'initial_guess_manual'))
@@ -137,7 +143,10 @@ def test_calibration_tool_requires_display_and_failed_job_can_retry(root,monkeyp
 
 
 def test_manual_calibration_stages_preserve_prior_outputs(root,monkeypatch):
-    enabled(root);measured_intrinsics(root);s=Service(root,False);cal=s.calibrations;m=cal.create('stages');p=cal.get(m['id'])
+    enabled(root);measured_intrinsics(root);s=Service(root,False)
+    # These offline tool fixtures start from a previously resolved camera.
+    s.camera_selection.active_profile='dfk33ux287';s.camera_selection.usable=lambda h:True
+    cal=s.calibrations;m=cal.create('stages');p=cal.get(m['id'])
     cap=p/'captures/capture_001';(cap/'raw_bag').mkdir(parents=True);(cap/'raw_bag/data.db3').write_bytes(b'fixture raw')
     atomic_json(cap/'metadata.json',dict(state='CAPTURED',raw_hashes=hashes(cap/'raw_bag')));cal.update(p,state='CAPTURED')
     for stage in ('preprocess','initial_guess_manual','calibrate'):

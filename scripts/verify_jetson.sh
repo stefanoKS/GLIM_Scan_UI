@@ -2,12 +2,14 @@
 set -eo pipefail
 RECORD_ONLY=true
 HARDWARE=false
+CAMERA_CASE=
 for arg in "$@"; do
  case "$arg" in
   --record-only) RECORD_ONLY=true;;
   --workstation) RECORD_ONLY=false;;
+  --camera-case=*) CAMERA_CASE="${arg#*=}";;
   --hardware) HARDWARE=true;;
-  --help|-h) echo "Usage: $0 [--record-only|--workstation] [--hardware]"; exit 0;;
+  --help|-h) echo "Usage: $0 [--record-only|--workstation] [--hardware] [--camera-case=d405|dfk|both|neither]"; exit 0;;
   *) echo "Unknown option: $arg" >&2; exit 2;;
  esac
 done
@@ -24,6 +26,9 @@ ros2 pkg executables glim_ros
 for executable in glim_rosnode glim_rosbag offline_viewer map_editor validator_node; do
  [[ -x "$ROOT/ros2_ws/install/glim_ros/lib/glim_ros/$executable" ]] || { echo "Missing official tool: $executable. Rebuild with BUILD_VIEWER=ON."; exit 1; }
 done
+fi
+if [[ -n "$CAMERA_CASE" ]]; then
+ "$ROOT/.venv/bin/python" "$ROOT/scripts/diagnose_camera.py" --case "$CAMERA_CASE"
 fi
 if [[ "$HARDWARE" == true ]]; then
  "$ROOT/scripts/record_test.sh" --name jetson_acceptance --seconds 30

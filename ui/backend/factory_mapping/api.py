@@ -79,7 +79,7 @@ class CameraEnabled(BaseModel):
 
 class CameraProfile(BaseModel):
     model_config=ConfigDict(extra="forbid")
-    profile: Literal['d405','dfk33ux287']
+    profile: Literal['auto','d405','dfk33ux287']
 
 class IntrinsicsImport(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -195,7 +195,8 @@ def make_app(root=ROOT,mock=None):
             if body.action=='capture':
                 cal.idle()
                 if cal.detail(cid)['state'] not in ('CREATED','CAPTURED'): raise ValueError('Create a new alignment for additional captures')
-                await s.prepare_recording()
+                camera=cal.detail(cid)['config']['camera']
+                await s.prepare_recording(require_camera=True,camera_profile='d405' if camera['source']=='realsense' else 'dfk33ux287')
                 return await cal.capture_start(cid)
             if body.action=='stop': return await cal.capture_stop(cid)
             if body.action=='advance':
@@ -230,15 +231,20 @@ def make_app(root=ROOT,mock=None):
             if s.capture.busy or s.active: raise ValueError('Finish capture before changing the camera')
             s.calibrations.idle()
             if s.config['system']['camera']['profile']==body.profile:
+                atomic_json(root/'.state/camera_profile.json',{'profile':body.profile})
                 return {'profile':body.profile}
-            camera=load_camera_profile(root,body.profile,s.config['sensor'])
+            camera=load_camera_profile(root,'d405' if body.profile=='auto' else body.profile,s.config['sensor'])
             was_running=s.pm.active('camera')
             if was_running: await s.stop_camera()
             atomic_json(root/'.state/camera_profile.json',{'profile':body.profile})
             s.config['system']['camera']['profile']=body.profile
             s.config['camera']=camera
+            s.camera_selection.active_profile=None
+            s.camera_selection.fallback_used=False
+            s.camera_selection.fallback_reason=None
             if was_running and s.config['system']['camera']['enabled']:
-                await s.start_camera()
+                try: await s.start_camera()
+                except ValueError as error: s.errors.append(str(error))
             return {'profile':body.profile}
     @app.get('/api/camera/preview')
     async def camera_preview():
@@ -470,7 +476,11 @@ def make_app(root=ROOT,mock=None):
     @app.post('/api/calibrations')
     async def create_calibration(body:Create):
         s=app.state.service
-        async with s.lock:return await asyncio.to_thread(s.calibrations.create,body.name)
+        async with s.lock:
+            if s.capture.busy: raise ValueError('Finish capture first')
+            s.calibrations.idle()
+            await s.prepare_camera()
+            return await asyncio.to_thread(s.calibrations.create,body.name)
     @app.get('/api/calibrations/{cid}')
     async def calibration_detail(cid:str):return await asyncio.to_thread(app.state.service.calibrations.detail,cid)
     @app.post('/api/calibrations/{cid}/action')

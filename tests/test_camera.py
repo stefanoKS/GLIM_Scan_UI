@@ -287,16 +287,19 @@ def test_camera_profile_setting_persists_and_defaults_to_d405(root):
     assert config['camera']['source']=='tiscamera'
 
 
-def test_camera_start_failure_prevents_incomplete_combined_bag(root):
+def test_camera_start_failure_records_explicit_lidar_only_bag(root):
     from factory_mapping.service import Service
     async def go():
         enable(root);s=Service(root,True)
         async def failed():raise ValueError('Camera unavailable')
-        s.start_camera=failed
+        s._start_camera_candidate=failed
         try:
             m=s.sessions.create('missing camera','',s.config)
-            with pytest.raises(ValueError,match='Camera unavailable'):await s.start_recording(m['id'])
-            assert not (s.sessions.get(m['id'])/'raw_bag').exists()
-            assert not s.pm.active('recording')
+            await s.start_recording(m['id'])
+            acquired=json.loads((s.sessions.get(m['id'])/'active_config.json').read_text())
+            assert not acquired['system']['camera']['enabled']
+            assert acquired['camera_selection']['rgb_requested']
+            assert s.config['system']['camera']['enabled']
+            assert s.pm.active('recording')
         finally:await s.close()
     asyncio.run(go())

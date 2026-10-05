@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const source=readFileSync(new URL('../ui/frontend/camera-status.js',import.meta.url),'utf8');
+const {cameraLabel,captureMessages}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+const status={camera_selection:{active_profile:'dfk33ux287',fallback_used:true},health:{camera:{healthy:true,camera_info_seen:true,width:720,height:540,image_hz:14.9}},config:{system:{camera:{enabled:true}}}};
+assert.equal(cameraLabel(status).ready,true);
+assert.match(cameraLabel(status).text,/DFK 33UX287 · Ready/);
+const messages=captureMessages({state:'COMPLETE',error:'D405 unavailable'},null,'');
+assert.doesNotMatch(messages.current,/D405|unavailable/);
+assert.match(messages.previous,/D405 unavailable/);
+status.camera_selection={candidates:{d405:{detected:true}}};status.health.camera={};
+assert.match(cameraLabel(status).text,/USB detected/);assert.equal(cameraLabel(status).ready,false);
+status.camera_selection.fallback_reason='no image messages';
+assert.match(cameraLabel(status).text,/LiDAR-only scan available/);
+console.log('Camera status and previous-capture separation checks passed');

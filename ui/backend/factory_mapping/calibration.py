@@ -96,7 +96,10 @@ class Calibrations:
     def create(self,name):
         c=self.s.config
         if not c['system']['camera']['enabled']:raise ValueError('Enable camera acquisition before creating a calibration dataset')
-        intr=require_intrinsics(self.root,c['camera']);cid='cal_'+uuid.uuid4().hex[:16];p=self.base/cid;p.mkdir()
+        intr=require_intrinsics(self.root,c['camera'])
+        if not self.s.camera_selection.active_profile or not self.s.camera_selection.usable(self.s.camera_health()): raise ValueError('Calibration requires a usable resolved camera')
+        c=self.s.camera_selection.acquisition(True,True)
+        cid='cal_'+uuid.uuid4().hex[:16];p=self.base/cid;p.mkdir()
         for d in ('captures','jobs','result','validation'):(p/d).mkdir()
         shutil.copytree(self.root/'config',p/'config_snapshot');atomic_json(p/'active_config.json',c)
         m=dict(id=cid,name=name,state='CREATED',mock=self.s.mock,created_at=now(),intrinsics=intr,config=c,validated=False)
@@ -115,6 +118,9 @@ class Calibrations:
     async def capture_start(self,cid):
         self.idle();p=self.get(cid);m=read_json(p/'metadata.json');c=m['config']
         if m['state'] not in ('CREATED','CAPTURED'):raise ValueError('Dataset is sealed for processing; create another dataset for additional captures')
+        profile=c['system']['camera'].get('profile')
+        if profile not in ('d405','dfk33ux287'): profile='d405' if c['camera']['source']=='realsense' else 'dfk33ux287'
+        await self.s.prepare_camera(profile=profile)
         if c['camera']!=self.s.config.get('camera') or c['sensor']!=self.s.config['sensor']:raise ValueError('Acquisition configuration changed; create a new calibration dataset')
         if require_intrinsics(self.root,c['camera'])['sha256']!=m['intrinsics']['sha256']:raise ValueError('Intrinsics changed; create a new calibration dataset')
         camera=self.s.camera_health()

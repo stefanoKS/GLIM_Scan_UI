@@ -1,4 +1,4 @@
-import asyncio, copy, json, os, shutil, sys, time, uuid
+import asyncio, json, os, shutil, sys, time, uuid
 from datetime import datetime
 from pathlib import Path
 from . import commands, glim_tools
@@ -7,7 +7,6 @@ from .storage import Sessions, atomic_json, read_json, now, size
 from .processes import ProcessManager
 from .health import network, system_status
 from .calibration_data import camera_metadata, intrinsics_status
-from .camera import check_camera_dependencies, detect_camera
 
 class Service:
     def __init__(self, root=ROOT, mock=False):
@@ -26,6 +25,9 @@ class Service:
                 if job.get('state')=='running': job.update(state='interrupted'); atomic_json(f,job)
         from .capture import CaptureController
         self.capture=CaptureController(self)
+        from .camera_selection import CameraSelection
+        self.camera_selection=CameraSelection(self)
+        self.errors.extend(self.config.get('warnings', []))
     def event(self,kind,**fields):
         entry=dict(time=now(),event=kind,**fields)
         path=self.root/'.state/application.jsonl'
@@ -42,9 +44,10 @@ class Service:
         return obj
     def status(self):
         processes=self.pm.view(); h=self.health(); h['camera']=self.camera_health()
-        detection={'camera':detect_camera(self.config.get('camera',{})), 'mid360':dict(detected=self.net.get('state')=='reachable',basis='Configured IP responds to ICMP; stream health is separate')}
+        selection=self.camera_selection.view()
+        detection={'camera':dict(detected=any(c['detected'] for c in selection['candidates'].values())), 'mid360':dict(detected=self.net.get('state')=='reachable',basis='Configured IP responds to ICMP; stream health is separate')}
         if self.mock: detection={k:dict(detected=False,basis='MOCK: physical detection is not performed') for k in detection}
-        return dict(capture=self.capture.view(),detection=detection,mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,camera_calibration=self.camera_calibration(),network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
+        return dict(camera_selection=selection,capture=self.capture.view(),detection=detection,mock=self.mock,glim_available=self.glim_available(),live_preset=self.live_preset,system=system_status(self.root),config=self.config,camera_calibration=self.camera_calibration(),network=self.net,health=h,processes=processes,active_session=self.active.name if self.active else None,recording_elapsed=time.time()-self.record_started if self.record_started else 0,bag_size_bytes=size(self.active/'raw_bag') if self.active else 0,loop_detection='UNAVAILABLE' if self.config['system']['loop_closure']['enabled'] else 'OFF',errors=self.errors[-15:])
     async def start_process(self,key,args,log,out=None,done=None):
         if self.mock:
             args=[sys.executable,'-m','factory_mapping.mock_worker',key,str(out or self.root/'.state/mock')]
@@ -72,10 +75,10 @@ class Service:
     async def stop_driver(self):
         if any(self.pm.active(k) for k in ('recording','glim','calibration_record')): raise ValueError('Stop recording and GLIM before stopping the sensor')
         for k in ('preview','monitor','driver'): await self.pm.stop(k,20)
-    def require_health(self):
+    def require_health(self, acquisition=False):
         if not self.pm.active('driver'): raise ValueError('Start Mid-360 first')
         if not self.mock and not all(self.health().get(k,{}).get('state')=='healthy' for k in ('lidar','imu')): raise ValueError('LiDAR and IMU must both have healthy message rates; run diagnostics')
-        if self.config['system']['camera']['enabled'] and self.config['camera']['required_for_mapping'] and not self.camera_health()['healthy']: raise ValueError('Required camera frames are not healthy; start camera and check rates/geometry')
+        if not acquisition and self.config['system']['camera']['enabled'] and self.config['camera']['required_for_mapping'] and not self.camera_health()['healthy']: raise ValueError('Required camera frames are not healthy; start camera and check rates/geometry')
         if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
     async def start_preview_sensors(self):
         if self.mock: return
@@ -86,33 +89,24 @@ class Service:
             if self.config.get('camera') and not self.pm.active('camera'):
                 try: await self.start_camera(force=True)
                 except Exception as error: self.errors.append('Camera preview unavailable at startup: '+str(error))
-    async def prepare_camera(self):
-        if 'camera' not in self.config: raise ValueError('Camera is not configured')
-        if not self.pm.active('camera'): await self.start_camera(force=True)
-        for attempt in range(16):
-            h=self.camera_health()
-            if h['healthy'] and h['camera_info_seen']: return
-            if attempt==15: raise ValueError('Camera frames or CameraInfo are unavailable; check camera diagnostics')
-            await asyncio.sleep(1)
+    async def prepare_camera(self, profile=None):
+        return await self.camera_selection.resolve(required=True, profile=profile)
 
-    async def prepare_recording(self):
-        # Enabling RGB means Record must acquire both sensors. Disabling it keeps
-        # the independent LiDAR-only / record-only path available.
-        if self.config['system']['camera']['enabled'] and not self.pm.active('camera'):
-            await self.start_camera()
+    async def prepare_recording(self, require_camera=False, camera_profile=None):
+        rgb=False
+        if require_camera or self.config['system']['camera']['enabled']:
+            rgb=await self.camera_selection.resolve(required=require_camera, profile=camera_profile)
         if not self.pm.active('driver'): await self.start_driver()
         for attempt in range(16):
             try:
-                self.require_health()
-                if self.config['system']['camera']['enabled']:
-                    h=self.camera_health()
-                    if not h['healthy'] or not h['camera_info_seen']:
-                        camera=self.config['camera']
-                        raise ValueError(f"Camera-enabled recording requires {camera['width']}×{camera['height']} {camera['model']} images and CameraInfo; check camera diagnostics or disable RGB for LiDAR-only recording")
-                return
+                self.require_health(acquisition=True)
+                break
             except ValueError:
                 if attempt==15: raise
                 await asyncio.sleep(1)
+        if rgb and not self.camera_selection.usable(self.camera_health()):
+            rgb=await self.camera_selection.resolve(required=require_camera,profile=camera_profile)
+        return rgb
 
     async def start_recording(self,sid,camera_only=False):
         if self.pm.active('recording'): raise ValueError('Recording is already active; stop the current session before starting another')
@@ -120,12 +114,21 @@ class Service:
         p=self.sessions.get(sid)
         if self.active and self.active!=p: raise ValueError('Another session is active')
         if (p/'raw_bag').exists(): raise ValueError('This session already contains a raw bag; create another session')
-        if camera_only:
-            if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
-            await self.prepare_camera()
-        else: await self.prepare_recording()
-        acquisition=copy.deepcopy(self.config)
-        if camera_only: acquisition['system']['camera']['enabled']=True
+        requested=camera_only or self.config['system']['camera']['enabled']
+        rgb=False
+        try:
+            if camera_only:
+                if shutil.disk_usage(self.root).free<self.config['system']['storage']['minimum_free_gb']*1e9: raise ValueError('Insufficient free disk space')
+                rgb=await self.prepare_camera()
+            else: rgb=await self.prepare_recording()
+        finally:
+            acquisition=self.camera_selection.acquisition(requested,rgb)
+            atomic_json(p/'active_config.json',acquisition)
+            self.sessions.update(p,camera_selection=acquisition['camera_selection'])
+        if requested and not rgb:
+            warning='RGB unavailable; recording LiDAR + IMU only. '+(self.camera_selection.fallback_reason or '')
+            self.errors.append(warning)
+            if self.capture.data.get('session')==sid: self.capture.warn(warning)
         # Re-snapshot at acquisition time, not merely when a name is reserved.
         shutil.copytree(self.root/'config',p/'config_snapshot',dirs_exist_ok=True); atomic_json(p/'active_config.json',acquisition)
         self.active=p; self.rate_baseline={k:self.health().get(k,{}).get('count',0) for k in ('lidar','imu')}
@@ -182,6 +185,11 @@ class Service:
         if meta.get('camera',{}).get('enabled'):
             camera_stats.setdefault('image_count',0);camera_stats.setdefault('measured_image_hz',None)
             self.sessions.update(p,camera={**meta['camera'],**camera_stats})
+        selection=meta.get('camera_selection',{})
+        if selection:
+            selection.update(rgb_recorded=bool(acquired['system']['camera']['enabled'] and (self.mock or camera_stats.get('image_count',0)>0)),
+                             measured_image_hz=camera_stats.get('measured_image_hz'))
+            self.sessions.update(p,camera_selection=selection)
         self.record_started=None
         if not ok: self.errors.append('Recording did not finalize cleanly; preserve raw_bag and inspect recording.log')
     def require_processing(self):
@@ -375,27 +383,36 @@ class Service:
         if not enabled or not running:return base
         if self.mock:
             c=self.config['camera'];valid=intrinsics_status(self.root,c)['status']=='VALID'
-            return dict(base,state='mock',healthy=True,hz=c['expected_hz'],image_hz=c['expected_hz'],image_age=0.01,last_image_timestamp=time.time()-.01,width=c['width'],height=c['height'],frame_id=c['frame_id'],camera_info_seen=True,camera_info_valid=valid,timestamp_age_sec=.01,timestamp_jitter_sec=0,mock=True)
+            return dict(base,state='mock',healthy=True,hz=c['expected_hz'],image_hz=c['expected_hz'],image_age=0.01,last_image_timestamp=time.time()-.01,width=c['width'],height=c['height'],frame_id=c['frame_id'],camera_info_seen=True,camera_info_age=.01,camera_info_valid=valid,timestamp_age_sec=.01,timestamp_jitter_sec=0,mock=True)
         data=read_json(self.root/'.state/camera_health.json',{})
         if not self.pm.active('camera_monitor') or time.time()-data.get('updated_at',0)>3:return dict(base,state='monitor_stale')
+        if data.get('camera_generation') != getattr(self,'camera_generation',None): return dict(base,state='monitor_stale')
         return {**base,**data,'camera_running':running}
 
     async def start_camera(self,force=False):
         if not force and not self.config['system']['camera']['enabled']:raise ValueError('Camera is disabled in config/system.yaml')
-        if self.pm.active('camera'):raise ValueError('Camera is already running')
-        if not self.mock:
-            args=commands.camera(self.root,self.config)
-            await check_camera_dependencies(self.config['camera'],self.root)
-        else:args=[]
-        for name in ('camera_health.json','camera_preview.jpg','camera_calibration_frame.jpg'):(self.root/'.state'/name).unlink(missing_ok=True)
+        await self.prepare_camera()
+        return self.pm.view().get('camera',{})
+
+    async def _start_camera_candidate(self):
+        args=[] if self.mock else commands.camera(self.root,self.config)
+        self.camera_generation=uuid.uuid4().hex
+        atomic_json(self.root/'.state/camera_active.json',dict(camera=self.config['camera'],generation=self.camera_generation))
         result=await self.start_process('camera',args,self.root/'.state/camera.log')
         if not self.mock:
-            for role in ('camera_monitor','camera_preview'):
-                try:await self.start_process(role,[sys.executable,'-c',f'from factory_mapping.ros_nodes import {role}; {role}()'],self.root/f'.state/{role}.log')
-                except Exception as e:self.errors.append(f'{role} unavailable: {e}; camera publishing continues')
+            # Monitor is required for readiness. Preview is optional.
+            await self.start_process('camera_monitor',[sys.executable,'-c','from factory_mapping.ros_nodes import camera_monitor; camera_monitor()'],self.root/'.state/camera_monitor.log')
+            try: await self.start_process('camera_preview',[sys.executable,'-c','from factory_mapping.ros_nodes import camera_preview; camera_preview()'],self.root/'.state/camera_preview.log')
+            except Exception as e: self.errors.append(f'Camera preview unavailable: {e}')
         return result
 
+    async def _stop_camera_candidate(self):
+        for role in ('camera_preview','camera_monitor','camera'): await self.pm.stop(role,2)
+        for name in ('camera_health.json','camera_preview.jpg','camera_calibration_frame.jpg','camera_active.json'):
+            (self.root/'.state'/name).unlink(missing_ok=True)
+
     async def stop_camera(self):
-        if self.pm.active('calibration_record'):raise ValueError('Stop calibration capture before stopping camera')
-        for role in ('camera_preview','camera_monitor','camera'):await self.pm.stop(role,20)
-        self.event('camera_stopped',recording_continues=self.pm.active('recording'))
+        if self.pm.active('calibration_record') or self.pm.active('recording'): raise ValueError('Stop acquisition before stopping camera')
+        await self._stop_camera_candidate()
+        self.camera_selection.active_profile=None
+        self.event('camera_stopped',recording_continues=False)

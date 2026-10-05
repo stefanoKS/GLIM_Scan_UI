@@ -13,5 +13,5 @@ shutdown:
   recording_timeout: 60
   glim_timeout: 180
 camera:
-  profile: d405
+  profile: auto
   enabled: true

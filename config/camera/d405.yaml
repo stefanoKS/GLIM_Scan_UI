@@ -10,8 +10,8 @@ image_topic: /camera/image_raw
 camera_info_topic: /camera/camera_info
 width: 1280
 height: 720
-fps: 15.0
-expected_hz: 15.0
+fps: 30.0
+expected_hz: 30.0
 # SDK color only, rectified with factory intrinsics; no depth or IR publication.
 use_gst_timestamps: false
 intrinsics_file: config/calibration/d405_intrinsics.yaml

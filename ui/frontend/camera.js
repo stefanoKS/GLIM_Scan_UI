@@ -26,15 +26,16 @@ export function setupCamera(context){
  },1000);
 }
 export async function refreshCamera(s){
- cameraEnabled=!!s.config.system.camera.enabled;$('camera-enabled').checked=cameraEnabled;$('camera-profile').value=s.config.system.camera.profile||'d405';$('camera-profile').disabled=!!s.capture?.busy||!s.capture?.can_start;const c=s.health.camera||{};cameraRunning=!!c.camera_running;
- $('camera-status').textContent=`${s.detection?.camera?.detected?'✓':'○'} ${s.config.camera?.model||'Camera'} ${s.detection?.camera?.detected?'detected (USB)':'not detected'}\n${cameraEnabled?'ENABLED':'DISABLED'} · ${c.state||'unknown'}\nProcess ${cameraRunning?'running':'stopped'}\nImage FPS ${(c.hz||0).toFixed(2)} · ${c.width||'—'} × ${c.height||'—'}\nLast frame age ${c.image_age==null?'—':c.image_age.toFixed(3)+' s'}\nSource timestamp ${c.last_image_timestamp??'—'}\nCameraInfo ${c.camera_info_valid?'VALID':c.camera_info_seen?'INVALID':'MISSING'}\nFrame ${c.frame_id||'—'}\nTimestamp jitter ${c.timestamp_jitter_sec??'—'} s`;
+ cameraEnabled=!!s.config.system.camera.enabled;$('camera-enabled').checked=cameraEnabled;$('camera-profile').value=s.config.system.camera.profile||'auto';$('camera-profile').disabled=!!s.capture?.busy||!s.capture?.can_start;const c=s.health.camera||{};cameraRunning=!!c.camera_running;
+ $('camera-status').textContent=`Active camera: ${s.camera_selection?.active_profile||'none'}\n${cameraEnabled?'ENABLED':'DISABLED'} · ${c.state||'unknown'}\nProcess ${cameraRunning?'running':'stopped'}\nImage FPS ${(c.hz||0).toFixed(2)} · ${c.width||'—'} × ${c.height||'—'}\nLast frame age ${c.image_age==null?'—':c.image_age.toFixed(3)+' s'}\nSource timestamp ${c.last_image_timestamp??'—'}\nCameraInfo ${c.camera_info_valid?'VALID':c.camera_info_seen?'INVALID':'MISSING'}\nFrame ${c.frame_id||'—'}\nTimestamp jitter ${c.timestamp_jitter_sec??'—'} s`;
+ $('camera-status').textContent+='\nSelection / fallback: '+JSON.stringify(s.camera_selection,null,2);
  const factory=s.config.camera?.source==='realsense';
  document.querySelectorAll('a[href="/intrinsics.html"]').forEach(link=>link.hidden=factory);
  $('wizard-import').hidden=factory;
  $('intrinsics-help').textContent=factory?'D405 factory lens calibration is loaded automatically. No printed board is needed. Camera–LiDAR mounting alignment is still required.':'Use the camera wizard to capture a printed board, or import a measured calibration below.';
  const intr=s.camera_calibration?.intrinsics||{},ext=s.camera_calibration?.extrinsics||{};
  $('calibration-summary').textContent=`Camera lens: ${intr.status==='VALID'?'calibrated':'calibration needed'} · Camera–LiDAR alignment: ${ext.validated?'validated':ext.calibrated?'needs independent review':'not calibrated'}`;
- $('calibration-create').disabled=intr.status!=='VALID'||!cameraEnabled||!!s.capture?.busy;
+ $('calibration-create').disabled=!cameraEnabled||!!s.capture?.busy;
  if(!cameraEnabled)$('calibration-summary').textContent+=' · Enable RGB in Settings for LiDAR alignment.';
  $('camera-intrinsics').textContent=`Camera Intrinsics: ${intr.status||'MISSING'}\nModel: ${intr.model||'—'}\nResolution: ${intr.width||'—'} × ${intr.height||'—'}\nfx/fy/cx/cy: ${intr.intrinsics?.slice(0,4).join(', ')||'—'}\n${intr.error||''}`;
  $('camera-extrinsics').textContent=`LiDAR–camera extrinsics: ${ext.calibrated?'AVAILABLE':'NOT AVAILABLE'} · ${ext.validated?'VALIDATED':'NOT VALIDATED'}\nT_lidar_camera: ${ext.T_lidar_camera?.join(', ')||'—'}\nTime offset: ${s.config.camera?.time_offset_sec??0} s (configured, not estimated)`;
