@@ -9,8 +9,8 @@ camera_info_topic: /camera/camera_info
 # DFK 33UX287 sensor resolution; validate format and rate on the attached device.
 width: 720
 height: 540
-fps: 15.0
-expected_hz: 15.0
+fps: 5.0
+expected_hz: 5.0
 use_gst_timestamps: true
 intrinsics_file: config/calibration/camera_intrinsics.yaml
 extrinsics_file: config/calibration/lidar_camera.yaml
@@ -19,5 +19,5 @@ preview_hz: 2.0
 preview_max_width: 640
 time_offset_sec: 0.0
 # Local trusted configuration only. Never set through the HTTP API.
-gstreamer_pipeline: 'tcambin serial="05420543" tcam-properties="tcam,ExposureAuto=Continuous,ExposureAutoUpperLimit=33333.0" ! video/x-raw,format=BGRx,width=720,height=540,framerate=15/1 ! videoconvert'
+gstreamer_pipeline: 'tcambin serial="05420543" tcam-properties="tcam,ExposureAuto=Continuous,ExposureAutoUpperLimit=33333.0" ! video/x-raw,format=BGRx,width=720,height=540,framerate=5/1 ! videoconvert'
 pipeline_validated: true
