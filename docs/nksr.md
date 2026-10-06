@@ -97,9 +97,10 @@ The Advanced settings keep these two concepts separate:
 - **Preparation voxel: 1 cm = 0.01 m.** This selects actual world-space observations
   while keeping point, sensor origin, intensity and timestamp paired. Changing it
   or the trajectory marks the selected input stale and requires preparation again.
-- **NKSR detail level: 0.5.** Full inference uses this, with internal
-  `voxel_size=None`. Sampling size is never passed as NKSR's internal voxel size.
-  Changing inference settings does not invalidate the prepared points.
+- **NKSR target voxel: 2 cm = 0.02 m.** Fixed in the backend independently of
+  preparation sampling. The existing detail-level setting is retained as requested
+  metadata but does not apply with this explicit target. Changing inference
+  settings does not invalidate the prepared points; existing NPZ files work unchanged.
 
 Manual preparation, from a fresh shell (replace paths with your scan and choose
 a new output directory):
@@ -140,11 +141,25 @@ This is a conservative heuristic, not a guarantee of memory sufficiency. A CUDA
 OOM in AUTO releases tensors/cache and makes at most one chunked retry, capped at
 5 meters. FULL and CHUNKED do not silently retry or switch inference to CPU.
 
-Full inference passes `detail_level`, `voxel_size=None`, `approx_kernel_grad=True`,
+Full inference passes `detail_level=None`, `voxel_size=0.02`, `approx_kernel_grad=True`,
 `solver_tol=1e-4`, `fused_mode=True`, real sensor origins, and the normal preprocessor.
-Chunked inference uses metric `chunk_size`, overlap 0.05, and `detail_level=None`.
-Upstream does not forward solver tolerance or internal voxel size through its
-chunk dispatcher: chunk subproblems use the upstream `1e-5` solver tolerance.
+The pinned API applies explicit voxel size in preference to detail level and
+handles full-mode scaling internally; the worker passes full-mode coordinates in meters.
+
+Chunked inference uses overlap 0.05 and `detail_level=None`. Its native `ks` voxel
+is 0.1 input units: previously this meant 0.1 m (10 cm). The worker now scales
+points, sensor origins, and the selected physical chunk size by
+`scale = 0.1 / 0.02 = 5.0` before calling NKSR. A 5 m chunk is passed as 25 model
+units. Extracted vertices are divided by 5 before validation, bounds, PLY output,
+and metadata; faces are unchanged. All output geometry remains in meters.
+Chunk selection still operates on the original metric points. No preparation,
+normal-estimation, overlap, or extraction settings change.
+
+Upstream does not forward solver tolerance or voxel size through its chunk
+dispatcher: no `voxel_size` is passed for chunks, and chunk subproblems retain
+the upstream `1e-5` solver tolerance. Reconstruction log events report
+`target_voxel_m`, `coordinate_scale`, physical `chunk_size` in meters,
+`nksr_chunk_size` in model units, and the full-mode `voxel_size` override.
 The worker records requested and actual settings rather than claiming full-mode
 settings applied to chunks. Completed chunks are temporarily stored on CPU;
 chunked dual-mesh extraction explicitly uses CPU to reduce peak GPU memory.
@@ -182,6 +197,9 @@ for use and distribution; this repository does not relicense or bundle the sourc
 or checkpoint.
 
 ## Verified workstation run — 2026-10-05
+
+This historical run predates the 2 cm metric-scale fix above and used the native
+10 cm chunked voxel. Its counts and timings are not validation of the new resolution.
 
 Official NKSR 1.0.3, commit `e40336845e67761343a756788e5a98b827d4a143`,
 compiled without source modifications. Python 3.10.21, torch 2.7.0+cu128,

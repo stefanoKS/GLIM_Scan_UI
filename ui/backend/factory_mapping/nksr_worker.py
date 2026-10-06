@@ -11,6 +11,10 @@ import traceback
 import numpy as np
 from .nksr_mesh import write_mesh
 
+DEFAULT_NKSR_TARGET_VOXEL_M = 0.02
+# Native ks voxel at pinned NKSR e403368; independent of preparation sampling.
+NKSR_NATIVE_VOXEL_SIZE = 0.1
+
 
 class WorkerError(RuntimeError):
     def __init__(self, code, message, details=None):
@@ -57,13 +61,13 @@ def select_chunk(points):
 
 
 def reconstruction_kwargs(settings, mode, chunk_size, preprocess):
-    result = dict(sensor=None, detail_level=settings.detail_level if mode == 'full' else None,
+    result = dict(sensor=None, detail_level=None,
                   approx_kernel_grad=True, fused_mode=True, preprocess_fn=preprocess)
     if mode == 'chunked':
         # Upstream does NOT forward solver_tol/voxel_size through this path.
         result.update(chunk_size=chunk_size, overlap_ratio=settings.overlap_ratio)
     else:
-        result.update(voxel_size=None, solver_tol=1e-4)
+        result.update(voxel_size=DEFAULT_NKSR_TARGET_VOXEL_M, solver_tol=1e-4)
     return result
 
 
@@ -148,10 +152,17 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         xyz = torch.from_numpy(points).float().to(device)
         sensor = torch.from_numpy(sensors).float().to(device)
         kwargs = reconstruction_kwargs(settings, current_mode, chunk_size, preprocess)
+        scale = NKSR_NATIVE_VOXEL_SIZE / DEFAULT_NKSR_TARGET_VOXEL_M if current_mode == 'chunked' else 1.0
+        if current_mode == 'chunked':
+            xyz = xyz * scale
+            sensor = sensor * scale
+            kwargs['chunk_size'] = chunk_size * scale
         kwargs['sensor'] = sensor
         event('RECONSTRUCTING', requested_mode=settings.mode, actual_mode=current_mode,
               chunk_size=chunk_size if current_mode == 'chunked' else None,
-              detail_level=kwargs['detail_level'])
+              detail_level=kwargs['detail_level'], target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M,
+              coordinate_scale=scale, nksr_chunk_size=kwargs.get('chunk_size'),
+              voxel_size=kwargs.get('voxel_size'))
         started = time.monotonic()
         with torch.inference_mode():
             field = reconstructor.reconstruct(xyz, **kwargs)
@@ -167,7 +178,9 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
             started = time.monotonic()
             mesh = field.extract_dual_mesh(mise_iter=settings.mise_iter)
             def array(value): return value.detach().cpu().numpy() if hasattr(value,'detach') else np.asarray(value)
-            return array(mesh.v), array(mesh.f), reconstruct_seconds, time.monotonic()-started
+            vertices = array(mesh.v)
+            if current_mode == 'chunked': vertices = vertices / scale
+            return vertices, array(mesh.f), reconstruct_seconds, time.monotonic()-started
 
     for retry in range(2):
         try:
@@ -184,8 +197,11 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         reconstructor.network.to(device)
     return vertices, faces, dict(requested_mode=settings.mode, actual_mode=mode,
         chunk_size=chunk_size if mode == 'chunked' else None, overlap_ratio=settings.overlap_ratio,
-        requested_detail_level=settings.detail_level, detail_level=settings.detail_level if mode == 'full' else None,
-        nksr_internal_voxel_size=None, normal_knn=settings.normal_knn,
+        requested_detail_level=settings.detail_level, detail_level=None,
+        nksr_internal_voxel_size=DEFAULT_NKSR_TARGET_VOXEL_M if mode == 'full' else None,
+        target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M,
+        coordinate_scale=NKSR_NATIVE_VOXEL_SIZE / DEFAULT_NKSR_TARGET_VOXEL_M if mode == 'chunked' else 1.0,
+        normal_knn=settings.normal_knn,
         normal_drop_angle_deg=settings.normal_drop_angle_deg, mise_iter=settings.mise_iter,
         normal_backend='nksr_cuda' if device.type=='cuda' else 'scipy_cpu_pca',
         approx_kernel_grad=True, fused_mode=True, solver_tol=1e-4 if mode == 'full' else 1e-5,

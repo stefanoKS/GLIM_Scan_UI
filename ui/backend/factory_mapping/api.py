@@ -333,6 +333,8 @@ def make_app(root=ROOT,mock=None):
     @app.post('/api/action')
     async def action(body:Action):
         s=app.state.service
+        if body.action in ('processes_stop','processes_restart'):
+            async with s.lock: return await s.recover_processes(restart=body.action=='processes_restart')
         if s.capture.busy:
             if body.action in ('session_stop','record_stop'):
                 return await (s.capture.stop_scan() if s.capture.data['mode']=='scan' else s.capture.stop_camera_recording())

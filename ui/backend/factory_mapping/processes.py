@@ -37,6 +37,46 @@ class ProcessManager:
             else: file.unlink(missing_ok=True)
     def active(self,key): return key in self.items and self.items[key]['state'] in ('running','stopping','orphaned')
     def view(self): return {k:{a:b for a,b in v.items() if a not in ('process','watcher')} for k,v in self.items.items()}
+    async def recover(self,key,timeout=20,terminate_timeout=10):
+        """Explicitly stop a saved process group; never signal a reused PID."""
+        item=self.items.get(key)
+        if not item or item['state']!='orphaned': return await self.stop(key,timeout,cancel=True)
+        pgid=item['pid']
+        identities={pgid:item['created']}
+        def verify():
+            if pgid<=1 or pgid==os.getpgrp(): raise ValueError('Unsafe recovery process group')
+            members=[]
+            for proc in psutil.process_iter(['pid','create_time','status','uids']):
+                try:
+                    if os.getpgid(proc.pid)==pgid and proc.info['status']!=psutil.STATUS_ZOMBIE:
+                        members.append(proc)
+                except (ProcessLookupError,psutil.NoSuchProcess): pass
+            if not members: return False
+            try:
+                leader=psutil.Process(pgid)
+                leader_matches=abs(leader.create_time()-item['created'])<.01 and os.getpgid(pgid)==pgid
+            except (ProcessLookupError,psutil.NoSuchProcess): leader_matches=False
+            if (any(p.info['uids'].real!=os.getuid() for p in members) or
+                not (leader_matches or any(p.pid in identities and abs(p.info['create_time']-identities[p.pid])<.01 for p in members))):
+                raise ValueError(f'Cannot verify ownership of {key} (group {pgid}); no signal sent. Inspect Diagnostics.')
+            # Retain verified descendants if the launcher exits during shutdown.
+            identities.update({p.pid:p.info['create_time'] for p in members})
+            return True
+        for sig,delay in ((signal.SIGINT,timeout),(signal.SIGTERM,terminate_timeout),(signal.SIGKILL,5)):
+            if not verify(): break
+            if sig!=signal.SIGINT: item['forced']=True
+            try: os.killpg(pgid,sig)
+            except ProcessLookupError: break
+            try:
+                await asyncio.wait_for(wait_group(pgid),delay)
+                break
+            except asyncio.TimeoutError: pass
+        else:
+            raise ValueError(f'{key} is still running after recovery; inspect Diagnostics')
+        item.update(state='cancelled',ended_at=now(),returncode=None,cancel=True)
+        (self.state/f'process_{key}.json').unlink(missing_ok=True)
+        return item
+
     async def start(self,key,argv,log,env=None,done=None):
         async with self.lock:
             if self.active(key): raise ValueError(f'{key} is already active')
@@ -73,7 +113,7 @@ class ProcessManager:
     async def stop(self,key,timeout=60,cancel=False):
         item=self.items.get(key)
         if not item or not self.active(key): return item
-        if item['state']=='orphaned': raise ValueError(f"Orphaned PID {item['pid']}: inspect it and send SIGINT manually; automatic PID adoption is disabled")
+        if item['state']=='orphaned': raise ValueError(f"Orphaned PID {item['pid']}: use Process recovery in Settings → Advanced / Diagnostics")
         p=item['process']; item['state']='stopping'; item['cancel']=cancel
         try: os.killpg(p.pid,signal.SIGINT)
         except ProcessLookupError: pass

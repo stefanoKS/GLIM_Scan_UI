@@ -13,6 +13,7 @@ class Service:
         self.root=root; self.mock=mock; self.config=load(root); self.sessions=Sessions(root,mock)
         self.pm=ProcessManager(root/'.state'); self.active=None; self.lock=asyncio.Lock(); self.errors=list(self.pm.recovery); self.net={}; self.closed=False
         self.intrinsic_samples=[]
+        self.recovering=False
         self.record_started=None; self.rate_baseline={}; self.live_preset=None
         from .calibration import Calibrations
         self.calibrations=Calibrations(self)
@@ -89,6 +90,44 @@ class Service:
             if self.config.get('camera') and not self.pm.active('camera'):
                 try: await self.start_camera(force=True)
                 except Exception as error: self.errors.append('Camera preview unavailable at startup: '+str(error))
+    async def recover_processes(self,restart=False):
+        """Called under the service lock by the explicit recovery controls."""
+        if self.capture.data['state'] in ('PREFLIGHT','FINALIZING'):
+            raise ValueError('Wait for capture startup or saving to finish, then retry recovery')
+        self.recovering=True
+        failures=[]
+        try:
+            if self.capture.data['state']=='SCANNING': await self.capture._finish(process=False)
+            elif self.active: await self.stop_session()
+            if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
+            # Recorders and consumers first, sensor publishers last.
+            order=('recording','calibration_record','glim','nksr','nksr_check','reconstruction',
+                   'calibration_tool','offline','export','tool','validator',
+                   'camera_preview','camera_monitor','camera','preview','monitor','driver')
+            for key in dict.fromkeys((*order,*self.pm.items)):
+                if not self.pm.active(key): continue
+                try:
+                    timeout=self.config['system']['shutdown']['recording_timeout'] if key in ('recording','calibration_record') else 20
+                    await self.pm.recover(key,timeout)
+                except Exception as error: failures.append(f'{key}: {error}')
+            await self.capture.reconcile()
+            if failures:
+                self.errors.extend(failures)
+                raise ValueError('Some processes could not be stopped. Sensors were not restarted. '+'; '.join(failures))
+            self.errors=[error for error in self.errors if error not in self.pm.recovery]
+            self.pm.recovery.clear()
+            if restart:
+                for name,start in (('LiDAR',self.start_driver),('Camera',lambda:self.start_camera(force=True))):
+                    if name=='Camera' and not self.config.get('camera'): continue
+                    try: await start()
+                    except Exception as error: failures.append(f'{name}: {error}')
+                if failures:
+                    self.errors.extend(failures)
+                    raise ValueError('Processes stopped, but sensor restart was incomplete. '+'; '.join(failures))
+            self.event('process_recovery',restart_sensors=restart)
+            return {'ok':True,'message':'App processes stopped; sensor previews restarted.' if restart else 'All app processes stopped. Start Scan will start sensors when needed.'}
+        finally: self.recovering=False
+
     async def prepare_camera(self, profile=None):
         return await self.camera_selection.resolve(required=True, profile=profile)
 

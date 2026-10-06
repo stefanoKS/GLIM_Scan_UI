@@ -11,6 +11,12 @@ export function setupCapture(context){
   if(actionPending)return;actionPending=true;updateButtons();$('error').hidden=true;
   try{const result=await ctx.json('capture/action',{action:button.dataset.capture});if(result.session)ctx.selectSession(result.session);await ctx.refresh()}catch(e){ctx.error(e)}finally{actionPending=false;updateButtons()}
  });
+ document.querySelectorAll('[data-recovery]').forEach(button=>button.onclick=async()=>{
+  if(actionPending)return;actionPending=true;updateButtons();$('error').hidden=true;
+  const status=text=>{for(const id of ['capture-recovery-status','process-recovery-status'])$(id).textContent=text};
+  status('Stopping app processes… Please wait for recordings to finish.');
+  try{const result=await ctx.json('action',{action:button.dataset.recovery});status(result.message)}catch(e){status(e.message);ctx.error(e)}finally{actionPending=false;await ctx.refresh();updateButtons()}
+ });
  $('capture-settings').onsubmit=async e=>{e.preventDefault();try{await ctx.json('capture/settings',{live_glim:$('live-glim-setting').checked,auto_process:$('auto-process-setting').checked,mapping_preset:$('mapping-preset-setting').value},'PUT');settingsLoaded=false;$('preset').value=$('mapping-preset-setting').value==='auto'?latest.capture.capabilities.gpu?'jetson_gpu':'jetson_cpu':$('mapping-preset-setting').value;await ctx.refresh()}catch(e){ctx.error(e)}};
 }
 export function showPage(name,hash=true){
@@ -25,6 +31,8 @@ function updateButtons(){
  $('record-camera').hidden=scanning&&isCamera;$('stop-camera-recording').hidden=!scanning||!isCamera;
  $('start-scan').disabled=actionPending||!c.can_start;$('record-camera').disabled=actionPending||!c.can_start||!c.capabilities.camera;
  $('stop-scan').disabled=$('stop-camera-recording').disabled=actionPending||c.state==='FINALIZING';
+ $('recover-sensors').hidden=!Object.values(latest.processes).some(p=>p.state==='orphaned');
+ document.querySelectorAll('[data-recovery]').forEach(button=>button.disabled=actionPending||c.recovering||['PREFLIGHT','FINALIZING'].includes(c.state));
 }
 export function refreshCapture(s){
  latest=s;const c=s.capture;if(!c)return;const capabilities=c.capabilities,h=s.health;
@@ -37,7 +45,8 @@ export function refreshCapture(s){
  const titles={READY:'Ready to scan',PREFLIGHT:'Checking sensors…',SCANNING:c.mode==='camera'?'Recording camera':'Scanning',FINALIZING:'Saving recording…',PROCESSING:'Processing scan…',COMPLETE:'Ready for next scan'};
  $('capture-state').textContent=titles[c.state]||c.state;
  const hints={READY:'Press Start Scan to begin.',PREFLIGHT:'Starting the required sensors and checking their data.',SCANNING:'Raw data is being saved.',FINALIZING:'Keep the application open while recording finishes.',PROCESSING:'The raw scan is safe. Building the map.',COMPLETE:capabilities.record_only?'Scan saved. Export it from Library to process on a workstation.':'Open Library to view, rename or export the recording.'};
- const blocked=!c.busy&&!c.can_start?(Object.values(s.processes).some(p=>p.state==='orphaned')?'A previous sensor process is still running. Review recovery in Settings → Advanced / Diagnostics.':'Finish the active session or job before starting another capture.'):null;
+ const blocked=c.recovering?'Stopping app processes for recovery…':!c.busy&&!c.can_start?(Object.values(s.processes).some(p=>p.state==='orphaned')?'A previous sensor process is still running. Use Recover & restart sensors below.':'Finish the active session or job before starting another capture.'):null;
+ if(blocked&&!c.busy)$('capture-state').textContent=c.recovering?'Recovering processes…':'Capture unavailable';
  const messages=captureMessages(c,blocked,hints[c.state]);
  $('capture-message').textContent=messages.current;
  $('previous-capture').textContent=messages.previous;

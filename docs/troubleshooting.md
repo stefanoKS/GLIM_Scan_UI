@@ -6,11 +6,26 @@ Use **Settings → Advanced / Diagnostics**, `scripts/diagnose.sh` and the relev
 
 This Capture message means ProcessManager found a surviving process group from an earlier backend instance. It verifies saved PID/creation-time information and refuses automatic adoption or duplicate publishers. An ordinary preview process owned by the current backend is not an orphan.
 
-- **Ready for next scan** is the high-level capture-state label. A recovery condition can still disable Start.
+- **Capture unavailable** replaces the ready label while a leftover process blocks Start.
 - **A previous sensor process is still running** means current process ownership needs recovery.
 - **Previous scan: recorded** describes the earlier finalized recording. The orphan warning alone does not invalidate it; inspect that session's metadata/logs if its result is uncertain.
 
 Recovery:
+
+Use **Recover & restart sensors** beside the Capture warning, or open
+**Settings → Advanced / Diagnostics → Process recovery**. **Stop all app processes**
+stops managed recorders, GLIM, processing/reconstruction jobs, tools, and sensor
+previews, including verified leftovers from a previous backend. **Stop all & restart
+sensors** then starts LiDAR and camera previews; it never resumes a recording or job.
+Current recordings are finalized first and saved scans are retained. Shutdown tries
+SIGINT, then SIGTERM and SIGKILL for stuck processes; forced recorder shutdown may
+leave an incomplete bag. Wait for startup/saving to finish before using recovery.
+The backend stays running. Process identity is checked before signalling a leftover
+group; unrelated processes are not killed by name. If ownership cannot be verified
+(for example, a legacy record whose launcher has already disappeared), recovery
+reports the affected role without signalling it or restarting sensors.
+
+If automatic recovery reports an ownership error, use this manual fallback:
 
 1. Open Advanced / Diagnostics and identify the role marked `orphaned`, its PID and command. Saved records are `.state/process_*.json`. Do not delete those files or `.state` to hide a live process.
 2. If an older dashboard/terminal still owns the process, use that instance to stop capture and exit gracefully. Avoid launching another recorder.

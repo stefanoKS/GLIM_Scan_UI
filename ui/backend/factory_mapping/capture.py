@@ -42,7 +42,8 @@ class CaptureController:
 
     def view(self):
         return {**self.data, 'busy': self.busy, 'capabilities': self.capabilities(),
-                'can_start': not self.busy and not self.s.active and not any(item['state']=='orphaned' for item in self.s.pm.items.values()) and not any(self.s.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool'))}
+                'recovering': self.s.recovering,
+                'can_start': not self.s.recovering and not self.busy and not self.s.active and not any(item['state']=='orphaned' for item in self.s.pm.items.values()) and not any(self.s.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool'))}
 
     def transition(self, state, **fields):
         self.data.update(state=state, updated_at=now(), **fields)

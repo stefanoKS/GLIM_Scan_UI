@@ -37,7 +37,7 @@ def test_defaults_and_upstream_arguments(mode):
     assert args['preprocess_fn'] is fn
     assert args['approx_kernel_grad'] and args['fused_mode']
     if mode=='full':
-        assert args['detail_level']==.7 and args['voxel_size'] is None
+        assert args['detail_level'] is None and args['voxel_size']==.02
         assert args['solver_tol']==1e-4
     else:
         assert args['detail_level'] is None and args['chunk_size']==5
@@ -128,20 +128,22 @@ def test_import_only_is_not_ready(prepared):
     assert jobs.health(service)['status']=='UNVERIFIED'
 
 
-def fake_runtime(failures):
+def fake_runtime(failures, mesh=None):
     """Tiny tensor facade tests orchestration only; never used in production."""
     class Tensor:
         def __init__(self,value): self.value=value
         def float(self): return self
         def to(self,device): return self
-    cuda=SimpleNamespace(mem_get_info=lambda device:(8*1024**3,8*1024**3),empty_cache=lambda:None,max_memory_allocated=lambda device:0)
+        def __mul__(self,scale): return Tensor(self.value*scale)
+    cuda=SimpleNamespace(mem_get_info=lambda device:(8*1024**3,8*1024**3),empty_cache=lambda:None,
+                         max_memory_allocated=lambda device:0,reset_peak_memory_stats=lambda device:None)
     torch=SimpleNamespace(device=lambda name:SimpleNamespace(type=name.split(':')[0]),from_numpy=Tensor,
                           cuda=cuda,inference_mode=contextlib.nullcontext)
     calls=[];normal_calls=[]
-    mesh=SimpleNamespace(v=np.zeros((3,3)),f=np.array([[0,1,2]]))
+    if mesh is None: mesh=SimpleNamespace(v=np.zeros((3,3)),f=np.array([[0,1,2]]))
     field=SimpleNamespace(extract_dual_mesh=lambda **kw:mesh,to_=lambda device:None)
     def reconstruct(xyz,**kwargs):
-        calls.append(kwargs)
+        calls.append(dict(kwargs,xyz=xyz))
         assert kwargs['sensor'].value.shape==xyz.value.shape
         if len(calls)<=failures:raise RuntimeError('CUDA out of memory')
         return field
@@ -164,6 +166,66 @@ def test_bounded_oom_retry_and_sensor_pairing(mode,failures,expected_calls):
         with pytest.raises(RuntimeError,match='out of memory'):execute(*args)
     assert len(calls)==expected_calls and normal_calls==[(64,85.)]
     assert calls[0]['preprocess_fn']=='normal_fn'
+
+
+@pytest.mark.parametrize('mode,failures', [('chunked',0), ('full',0), ('auto',1)])
+def test_metric_resolution_through_worker_output(tmp_path,monkeypatch,capsys,mode,failures):
+    from factory_mapping import nksr_worker as worker, nksr_mesh
+    from plyfile import PlyData
+    chunked=mode!='full'
+    scale=5.0 if chunked else 1.0
+    points=np.array([[10,20,30],[11,20,30],[10,21,30]],dtype=np.float32)
+    sensors=points+np.array([2,-3,4],dtype=np.float32)
+    faces=np.array([[0,1,2]],dtype=np.int32)
+    mesh=SimpleNamespace(v=points*scale,f=faces.copy())
+    torch,nksr,reconstructor,calls,_=fake_runtime(failures,mesh)
+    source=tmp_path/'existing.npz';output=tmp_path/'mesh.ply'
+    np.savez(source,points=points,sensor_origins=sensors)
+    original=source.read_bytes()
+    monkeypatch.setattr(worker.sys,'argv',['nksr_worker','--input',str(source),'--output',str(output),
+                                         '--mode',mode,'--chunk-size','5'])
+    monkeypatch.setattr(worker.signal,'signal',lambda *args:None)
+    monkeypatch.setattr(worker,'runtime',lambda device:(torch,nksr,torch.device('cuda'),{}))
+    monkeypatch.setattr(worker,'load_model',lambda *args:reconstructor)
+    validated=[]
+    validate=nksr_mesh.validate_mesh
+    def capture_validation(vertices,triangles):
+        validated.append(vertices.copy())
+        return validate(vertices,triangles)
+    monkeypatch.setattr(nksr_mesh,'validate_mesh',capture_validation)
+    assert worker.main()==0
+    assert worker.NKSR_NATIVE_VOXEL_SIZE/worker.DEFAULT_NKSR_TARGET_VOXEL_M==5.0
+    call=calls[-1]
+    np.testing.assert_array_equal(call['xyz'].value,points*scale)
+    np.testing.assert_array_equal(call['sensor'].value,sensors*scale)
+    assert call['detail_level'] is None
+    if chunked:
+        assert call['chunk_size']==25.0
+        assert 'voxel_size' not in call
+    else:
+        assert call['voxel_size']==.02 and 'chunk_size' not in call
+    if failures:
+        np.testing.assert_array_equal(calls[0]['xyz'].value,points)
+        np.testing.assert_array_equal(calls[0]['sensor'].value,sensors)
+        assert calls[0]['voxel_size']==.02
+    np.testing.assert_array_equal(validated[0],points)
+    ply=PlyData.read(output)
+    np.testing.assert_array_equal(np.column_stack([ply['vertex'][axis] for axis in 'xyz']),points)
+    np.testing.assert_array_equal(ply['face']['vertex_indices'].tolist(),faces)
+    metadata=read_json(tmp_path/'nksr_metadata.json')
+    assert metadata['mesh_bbox']==[points.min(axis=0).tolist(),points.max(axis=0).tolist()]
+    assert metadata['bounding_box_min']==points.min(axis=0).tolist()
+    assert metadata['bounding_box_max']==points.max(axis=0).tolist()
+    assert metadata['validation_status']=='PASS' and metadata['bbox_difference']==[0.,0.,0.]
+    assert metadata['coordinate_scale']==scale and metadata['target_voxel_m']==.02
+    assert metadata['detail_level'] is None
+    events=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    diagnostic=[event for event in events if 'coordinate_scale' in event][-1]
+    assert diagnostic['coordinate_scale']==scale and diagnostic['target_voxel_m']==.02
+    assert diagnostic['chunk_size']==(5.0 if chunked else None)
+    assert diagnostic['nksr_chunk_size']==(25.0 if chunked else None)
+    assert diagnostic['voxel_size']==(None if chunked else .02)
+    assert source.read_bytes()==original
 
 
 def test_failure_classification():
