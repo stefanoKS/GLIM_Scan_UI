@@ -180,3 +180,52 @@ All mutations use the existing serialized service lock, process groups and fixed
 - [ROS camera calibration](https://docs.ros.org/en/ros2_packages/humble/api/camera_calibration/)
 
 Pinned source inspections confirmed `gscam_main`, relative image_raw/camera_info names, use_gst_timestamps, camera_info_url; explicit preprocess topic options; results.init_T_lidar_camera and results.T_lidar_camera; graphical manual/NID workflows. Source inspection and mock tests are not physical camera or numerical calibration validation.
+
+## Offline D405 projection validation
+
+From the repository root, use a completed scan with prepared reconstruction input:
+
+```bash
+source scripts/env.sh
+SESSION="$ROOT/data/sessions/20261006_090533_Scan_2026-10-06_09_05_33"
+python -m factory_mapping.colorization --session "$SESSION" --frames 8 --allow-unvalidated-calibration
+```
+
+The example session currently has an **uncalibrated** extrinsic snapshot and will
+correctly refuse projection. Choose a session with an actual calibrated extrinsic;
+the override permits `validated: false`, never `calibrated: false`. This tool does
+not repair or replace historical snapshots with current global calibration.
+
+The tool selects the latest completed reconstruction preparation (or `--run
+run_<id>`) and uses the exact trajectory referenced by its `job.json`. Both
+calibration files come exclusively from the session's `config_snapshot`, using
+paths recorded in `active_config.json`. Missing files, mismatched intrinsic hashes,
+nonzero published distortion, and conflicting time offsets are rejected.
+
+It streams recorded images twice, selecting at most eight by default, evenly
+spaced by frame index within trajectory coverage. Recorded `Image.header.stamp`
+plus the calibration offset determines one camera pose per image. The rosbag
+arrival timestamp is retained separately in metadata. Prepared world points are
+filtered to 20 m by default (`--max-range`), projected with rectified pinhole
+intrinsics, and displayed as radius-one dots colored by depth (JET: near blue,
+far red). A pixel z-buffer keeps the nearest point; this is not full occlusion
+handling. No camera RGB is sampled into points or meshes.
+
+Each invocation prints a fresh output directory under
+`reconstruction/run_<id>/colorization/projection_validation/run_<id>/`, containing
+PNGs and `metadata.json` with calibration paths/hashes, geometry, timestamps,
+source trajectory, point counts, and the effective offset. Previous runs and all
+inputs are preserved. Requires the existing ROS bag Python libraries and OpenCV.
+
+To compare eleven manual offsets without changing calibration:
+
+```bash
+for offset in -0.100 -0.080 -0.060 -0.040 -0.020 0.000 0.020 0.040 0.060 0.080 0.100; do
+  python -m factory_mapping.colorization --session "$SESSION" --frames 8 \
+    --allow-unvalidated-calibration --time-offset "$offset"
+done
+```
+
+The eligible frame interval may change at trajectory boundaries with each offset;
+use the recorded camera timestamps in metadata when comparing runs. There is no
+automatic offset optimization or assertion that an overlay validates calibration.

@@ -1,4 +1,34 @@
 version: 1
-calibrated: false
+camera_name: factory_rgb_d405
+camera_frame_id: camera_optical_frame
+lidar_frame_id: livox_frame
+intrinsics_file: config/calibration/d405_intrinsics.yaml
+intrinsics_sha256: 9f37ee03d4927a84980429c510ac360a02078a4a4e776f1128bf4bcb4cdf9e76
+camera_model: plumb_bob
+intrinsics:
+- 653.3778076171875
+- 651.61376953125
+- 648.0505981445312
+- 359.6151123046875
+distortion:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+width: 1280
+height: 720
+T_lidar_camera:
+- 0.6072133174054478
+- -0.3827576380131541
+- -0.5228479047387896
+- -0.2733324081313753
+- 0.26592927552112866
+- -0.5891005276363028
+- 0.7124125093122248
+transform_convention: p_lidar = T_lidar_camera * p_camera
+time_offset_sec: 0.0
+source_calibration_id: cal_572e708c72724d04
+source_result: data/calibrations/cal_572e708c72724d04/result/calib.json
+calibrated: true
 validated: false
-reason: Intrinsics changed; previous result retained in history and source dataset
