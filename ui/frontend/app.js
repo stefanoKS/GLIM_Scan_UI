@@ -89,6 +89,7 @@ $('open-viewer').onclick=()=>openTool('offline_viewer');$('open-editor').onclick
 let reconstructionPending=false,reconstructionData=null,reconstructionSession=null;
 function nksrSettings(){
  return {preparation_voxel_size_m:Number($('voxel-size-cm').value)/100.0,mode:$('nksr-mode').value,device:$('nksr-device').value,
+  mesh_output_mode:$('nksr-output-mode').value,
   detail_level:Number($('nksr-detail').value),chunk_size:$('nksr-mode').value!=='low_ram'&&$('nksr-chunk').value?Number($('nksr-chunk').value):null,
   tile_size:$('nksr-mode').value==='low_ram'?Number($('nksr-tile').value):5,
   normal_knn:Number($('nksr-knn').value),normal_drop_angle_deg:Number($('nksr-angle').value),mise_iter:Number($('nksr-mise').value)};
@@ -134,9 +135,15 @@ function renderReconstruction(){
  if(mesh?.state==='COMPLETED'){
   const m=mesh.metadata;
   const modeLabel=m.actual_mode==='low_ram'?`Low RAM · ${m.completed_tiles}/${m.tile_count} tiles · ${m.tile_size_m} m`:m.actual_mode;
-  $('nksr-mesh-results').append(el('p',`NKSR mesh · ${m.vertex_count.toLocaleString()} vertices · ${m.face_count.toLocaleString()} triangles · ${modeLabel}${m.chunk_size?' · '+m.chunk_size+' m chunks':''} · Bounds: ${m.validation_status}`));
+  const chunkLabel=m.chunk_count!=null?` · ${m.chunk_count} chunks`:m.chunk_size?' · '+m.chunk_size+' m chunks':'';
+  $('nksr-mesh-results').append(el('p',`NKSR mesh · ${m.vertex_count.toLocaleString()} vertices · ${m.face_count.toLocaleString()} triangles · ${modeLabel}${chunkLabel} · Bounds: ${m.validation_status}`));
   if(m.validation_note)$('nksr-mesh-results').append(el('p',m.validation_note));
-  const button=el('button','Download Mesh');button.onclick=()=>download(`reconstruction/${job.id}/output/mesh.ply`);$('nksr-mesh-results').append(button);
+  if(m.mesh_output_mode!=='chunks'){
+   const button=el('button','Download Mesh');button.onclick=()=>download(`reconstruction/${job.id}/output/mesh.ply`);$('nksr-mesh-results').append(button);
+  }
+  if(m.mesh_output_mode==='chunks'||m.mesh_output_mode==='both'){
+   const manifest=el('button','Download chunks manifest');manifest.onclick=()=>download(`reconstruction/${job.id}/output/mesh_chunks/chunks.json`);$('nksr-mesh-results').append(manifest);
+  }
  }
  if(job){const button=el('button','Preparation / reconstruction log');button.onclick=()=>download(`reconstruction/${job.id}/job.log`);$('reconstruction-results').append(button)}
 }
@@ -167,7 +174,7 @@ $('reconstruction-form').onsubmit=async event=>{
  reconstructionPending=true;$('prepare-reconstruction').disabled=true;
  try{await json(`sessions/${selected}/reconstruction`,{trajectory:$('reconstruction-trajectory').value,voxel_size_m:cm/100.0,filter_edited_geometry:filtering,...(filtering?{edit_id:$('edited-source').value,filter_tolerance_m:tolerance}:{})});reconstructionSession=null;await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };
-for(const id of ['voxel-size-cm','reconstruction-trajectory','filter-edited-geometry','edited-source','edited-tolerance','nksr-input-run','nksr-mode','nksr-device','nksr-detail','nksr-chunk','nksr-tile','nksr-knn','nksr-angle','nksr-mise'])$(id).addEventListener('input',renderReconstruction);
+for(const id of ['voxel-size-cm','reconstruction-trajectory','filter-edited-geometry','edited-source','edited-tolerance','nksr-input-run','nksr-mode','nksr-device','nksr-output-mode','nksr-detail','nksr-chunk','nksr-tile','nksr-knn','nksr-angle','nksr-mise'])$(id).addEventListener('input',renderReconstruction);
 $('nksr-check').onclick=async()=>{try{await json('nksr/check',{device:$('nksr-device').value});await refresh()}catch(e){error(e)}};
 $('reconstruct-mesh').onclick=async()=>{
  if(reconstructionPending)return;reconstructionPending=true;renderReconstruction();

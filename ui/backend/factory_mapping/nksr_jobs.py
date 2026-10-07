@@ -74,10 +74,31 @@ def mesh_state(run):
 
 def validate_completed(output, returncode):
     if returncode != 0: raise ValueError('Worker exited unsuccessfully')
-    stats=inspect_mesh(output/'mesh.ply')
     metadata=read_json(output/'nksr_metadata.json',{})
+    if metadata.get('mesh_output_mode')=='chunks':
+        return validate_chunks_completed(output, metadata)
+    stats=inspect_mesh(output/'mesh.ply')
     if stats['vertex_count'] != metadata.get('vertex_count') or stats['face_count'] != metadata.get('face_count'):
         raise ValueError('Mesh counts do not match worker metadata')
+    return metadata
+
+
+def validate_chunks_completed(output, metadata):
+    from .nksr_mesh import inspect_mesh
+    manifest=read_json(output/'mesh_chunks/chunks.json',None)
+    if not manifest: raise ValueError('Chunk manifest is missing')
+    chunks=[chunk for chunk in manifest.get('chunks',[]) if chunk.get('file')]
+    if manifest.get('total_chunks') != len(manifest.get('chunks',[])):
+        raise ValueError('Chunk manifest chunk count is inconsistent')
+    total_vertices=total_faces=0
+    for chunk in chunks:
+        stats=inspect_mesh(output/'mesh_chunks'/chunk['file'])
+        if stats['vertex_count'] != chunk.get('vertices') or stats['face_count'] != chunk.get('faces'):
+            raise ValueError(f"Chunk {chunk['file']} counts do not match the manifest")
+        total_vertices+=stats['vertex_count']; total_faces+=stats['face_count']
+    if total_vertices != metadata.get('vertex_count') or total_faces != metadata.get('face_count'):
+        raise ValueError('Chunk totals do not match worker metadata')
+    if not chunks: raise ValueError('All chunk meshes were empty')
     return metadata
 
 
@@ -115,7 +136,7 @@ async def reconstruct(service,sid,rid,settings):
     atomic_json(run/'mesh_job.json',data)
     args=[str(python),str(worker_path()),'--input',str(input_path),'--output',str(output/'mesh.ply'),
           '--metadata',str(output/'nksr_metadata.json'),'--progress',str(run/'nksr_progress.json')]
-    for key in ('device','mode','detail_level','chunk_size','normal_knn','normal_drop_angle_deg','mise_iter','overlap_ratio'):
+    for key in ('device','mode','detail_level','chunk_size','normal_knn','normal_drop_angle_deg','mise_iter','overlap_ratio','mesh_output_mode'):
         if settings.get(key) is not None: args.extend(['--'+key.replace('_','-'),str(settings[key])])
     if settings.get('mode')=='low_ram': args.extend(['--tile-size',str(settings.get('tile_size',5.))])
     async def done(item):

@@ -30,6 +30,7 @@ class MeshRequest(BaseModel):
     preparation_voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0)
     device: Literal['auto','cuda','cpu']='auto'
     mode: Literal['auto','full','chunked','low_ram']='auto'
+    mesh_output_mode: Literal['merged','chunks','both']='merged'
     detail_level: float=Field(default=.5, ge=0, le=1)
     chunk_size: float | None=Field(default=None, gt=0)
     tile_size: float=Field(default=5., gt=0)

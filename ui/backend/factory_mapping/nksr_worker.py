@@ -14,6 +14,8 @@ from .nksr_mesh import write_mesh
 DEFAULT_NKSR_TARGET_VOXEL_M = 0.02
 # Native ks voxel at pinned NKSR e403368; independent of preparation sampling.
 NKSR_NATIVE_VOXEL_SIZE = 0.1
+MESH_OUTPUT_MODES = ('merged', 'chunks', 'both')
+CHUNKS_DIR_NAME = 'mesh_chunks'
 
 
 class WorkerError(RuntimeError):
@@ -49,6 +51,81 @@ def load_input(path):
         return points, sensors
     except Exception as error:
         raise WorkerError('INPUT_INVALID', str(error)) from error
+
+
+def to_numpy(value):
+    return value.detach().cpu().numpy() if hasattr(value, 'detach') else np.asarray(value)
+
+
+def finite_or_none(values):
+    """JSON-safe coordinates: unbounded (-inf/+inf) become null."""
+    return [None if not np.isfinite(value) else float(value) for value in np.asarray(values).ravel()]
+
+
+def chunk_grid_from_centers(centers):
+    """Per-axis chunk stride and grid indices derived from the actual chunk centers.
+
+    NKSR lays chunk centers on a regular axis-aligned grid. Empty chunks are
+    never reconstructed by NKSR, so the returned grid index is the 0-based rank
+    of each center along its axis rather than the absolute NKSR cell index.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3 or not len(centers):
+        raise WorkerError('EMPTY_TILE', 'NKSR produced no chunk fields')
+    strides = np.full(3, np.inf)
+    grid_index = np.zeros((len(centers), 3), dtype=np.int64)
+    for axis in range(3):
+        values, inverse = np.unique(centers[:, axis], return_inverse=True)
+        if len(values) > 1:
+            strides[axis] = float(np.min(np.diff(values)))
+        grid_index[:, axis] = inverse
+    return strides, grid_index
+
+
+def chunk_core_bounds(centers):
+    """Half-open [min, max) core ownership bounds per chunk, in scaled coordinates.
+
+    Adjacent chunks split each axis at the midpoint between their centers, so
+    every region belongs to exactly one chunk and no triangle is exported by two
+    neighboring chunks. The outermost chunk along each axis keeps its outer
+    boundary by extending to +/-inf.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    bounds = []
+    for center in centers:
+        lo = np.full(3, -np.inf)
+        hi = np.full(3, np.inf)
+        for axis in range(3):
+            values = np.unique(centers[:, axis])
+            pos = int(np.searchsorted(values, center[axis]))
+            if pos > 0:
+                lo[axis] = 0.5 * (values[pos - 1] + center[axis])
+            if pos + 1 < len(values):
+                hi[axis] = 0.5 * (center[axis] + values[pos + 1])
+        bounds.append((lo, hi))
+    return bounds
+
+
+def crop_mesh_to_core(vertices, faces, core_min, core_max):
+    """Remove triangles whose centroid lies outside the half-open core region.
+
+    Triangle ownership by centroid is deterministic: each centroid falls in
+    exactly one chunk core, so overlap regions are never exported twice.
+    """
+    vertices = np.asarray(vertices)
+    faces = np.asarray(faces)
+    if faces.size == 0:
+        return vertices[:0].copy(), faces[:0].copy()
+    centroids = vertices[faces].mean(axis=1)
+    keep = np.all(centroids >= core_min, axis=1) & np.all(centroids < core_max, axis=1)
+    faces = faces[keep]
+    if faces.size == 0:
+        return vertices[:0].copy(), faces[:0].copy()
+    used = np.zeros(len(vertices), dtype=bool)
+    used[faces.reshape(-1)] = True
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(int(used.sum()))
+    return vertices[used].copy(), remap[faces]
 
 
 def select_chunk(points):
@@ -138,8 +215,104 @@ def cpu_normal_preprocess(knn, drop_angle):
     return preprocess
 
 
+def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunks_dir, event, torch, device):
+    """Extract, crop, transform and save each NKSR chunk field independently.
+
+    Chunk meshes are processed one at a time and never held simultaneously. Each
+    field is moved to CPU before extraction (the existing small-memory recipe),
+    transformed into scaled global coordinates, cropped to its half-open core
+    ownership region, compacted, and written in world meters.
+    """
+    strides, grid_index = chunk_grid_from_centers(centers)
+    bounds = chunk_core_bounds(centers)
+    chunks_dir = Path(chunks_dir)
+    if chunks_dir.exists():
+        raise WorkerError('MESH_INVALID', 'Chunk output exists; choose a new output directory')
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    total_vertices = total_faces = 0
+    union_min = np.full(3, np.inf)
+    union_max = np.full(3, -np.inf)
+    total = len(fields)
+    for index, (field, center, rotation) in enumerate(zip(fields, centers, rotations)):
+        event('EXTRACTING_CHUNK_MESH', chunk=index + 1, total_chunks=total)
+        field.to_('cpu:0')
+        mesh = field.extract_dual_mesh(mise_iter=settings.mise_iter)
+        local_vertices = to_numpy(mesh.v)
+        faces = to_numpy(mesh.f)
+        del mesh
+        if rotation is None:
+            global_vertices = local_vertices + center
+        else:
+            global_vertices = local_vertices @ np.asarray(rotation).T + center
+        core_min, core_max = bounds[index]
+        core_vertices, core_faces = crop_mesh_to_core(global_vertices, faces, core_min, core_max)
+        del local_vertices, global_vertices, faces
+        entry = dict(index=index, grid_index=grid_index[index].tolist(),
+                     field_origin_scaled=center.tolist(),
+                     core_bbox_min=finite_or_none(core_min), core_bbox_max=finite_or_none(core_max))
+        if core_faces.size == 0:
+            entry.update(file=None, vertices=0, faces=0, world_bbox_min=None, world_bbox_max=None,
+                         note='No triangles inside the chunk core region')
+        else:
+            world_vertices = core_vertices / scale
+            filename = f'chunk_{index:04d}.ply'
+            stats = write_mesh(chunks_dir / filename, world_vertices, core_faces)
+            entry.update(file=filename, vertices=int(stats['vertex_count']), faces=int(stats['face_count']),
+                         world_bbox_min=stats['bounding_box_min'], world_bbox_max=stats['bounding_box_max'])
+            total_vertices += stats['vertex_count']
+            total_faces += stats['face_count']
+            union_min = np.minimum(union_min, world_vertices.min(axis=0))
+            union_max = np.maximum(union_max, world_vertices.max(axis=0))
+            del world_vertices
+        entries.append(entry)
+        del core_vertices, core_faces, field
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        event('SAVING_CHUNK_MESH', chunk=index + 1, total_chunks=total,
+              vertices=entry['vertices'], faces=entry['faces'])
+    manifest = dict(version=1, coordinate_system='GLIM_world', units='meters',
+                    output_mode=settings.mesh_output_mode,
+                    target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M, coordinate_scale=scale,
+                    nksr_chunk_size_scaled=settings.chunk_size * scale if settings.chunk_size else None,
+                    overlap_ratio=settings.overlap_ratio,
+                    total_chunks=total, total_vertices=total_vertices, total_faces=total_faces,
+                    chunk_stride_scaled=[None if not np.isfinite(s) else float(s) for s in strides],
+                    ownership_rule='Half-open midpoint between adjacent chunk centers; '
+                                   'outer chunks keep their outer boundary; triangle-centroid ownership.',
+                    chunks=entries)
+    atomic_json(chunks_dir / 'chunks.json', manifest)
+    union = None if not np.isfinite(union_min).all() else (union_min.tolist(), union_max.tolist())
+    return manifest, dict(total_vertices=total_vertices, total_faces=total_faces,
+                          union_bounds=union)
+
+
+def write_full_single_chunk(settings, vertices, faces, chunks_dir):
+    """Export a full (non-chunked) reconstruction as one chunk plus its manifest."""
+    chunks_dir = Path(chunks_dir)
+    if chunks_dir.exists():
+        raise WorkerError('MESH_INVALID', 'Chunk output exists; choose a new output directory')
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    stats = write_mesh(chunks_dir / 'chunk_0000.ply', vertices, faces)
+    entry = dict(index=0, grid_index=[0, 0, 0], field_origin_scaled=[0.0, 0.0, 0.0],
+                 core_bbox_min=None, core_bbox_max=None, file='chunk_0000.ply',
+                 vertices=int(stats['vertex_count']), faces=int(stats['face_count']),
+                 world_bbox_min=stats['bounding_box_min'], world_bbox_max=stats['bounding_box_max'],
+                 note='Full (non-chunked) reconstruction exported as a single chunk')
+    manifest = dict(version=1, coordinate_system='GLIM_world', units='meters',
+                    output_mode=settings.mesh_output_mode,
+                    target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M, coordinate_scale=1.0,
+                    nksr_chunk_size_scaled=None, overlap_ratio=None,
+                    total_chunks=1, total_vertices=int(stats['vertex_count']),
+                    total_faces=int(stats['face_count']), chunks=[entry])
+    atomic_json(chunks_dir / 'chunks.json', manifest)
+    return manifest, dict(total_vertices=int(stats['vertex_count']), total_faces=int(stats['face_count']),
+                          union_bounds=(stats['bounding_box_min'], stats['bounding_box_max']))
+
+
 def execute(points, sensors, settings, event, torch, nksr, device, reconstructor):
     free = torch.cuda.mem_get_info(device)[0] if device.type == 'cuda' else None
+    output_mode = getattr(settings, 'mesh_output_mode', 'merged')
     mode = settings.mode
     if mode == 'auto': mode = 'full' if len(points) <= 250_000 and (free is None or free >= 3*1024**3) else 'chunked'
     chunk_size = settings.chunk_size or (select_chunk(points) if mode == 'chunked' or settings.mode == 'auto' else None)
@@ -147,8 +320,12 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
     reconstructor.chunk_tmp_device = torch.device('cpu:0')
     preprocess = nksr.get_estimate_normal_preprocess_fn(settings.normal_knn, settings.normal_drop_angle_deg)
     if device.type=='cpu': preprocess=cpu_normal_preprocess(settings.normal_knn,settings.normal_drop_angle_deg)
+    manifest = None
+    chunk_totals = None
+    chunk_seconds = None
 
     def attempt(current_mode):
+        nonlocal manifest, chunk_totals, chunk_seconds
         xyz = torch.from_numpy(points).float().to(device)
         sensor = torch.from_numpy(sensors).float().to(device)
         kwargs = reconstruction_kwargs(settings, current_mode, chunk_size, preprocess)
@@ -159,6 +336,7 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
             kwargs['chunk_size'] = chunk_size * scale
         kwargs['sensor'] = sensor
         event('RECONSTRUCTING', requested_mode=settings.mode, actual_mode=current_mode,
+              mesh_output_mode=output_mode,
               chunk_size=chunk_size if current_mode == 'chunked' else None,
               detail_level=kwargs['detail_level'], target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M,
               coordinate_scale=scale, nksr_chunk_size=kwargs.get('chunk_size'),
@@ -171,6 +349,32 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
                                   'NKSR returned no field after normal filtering')
             reconstruct_seconds = time.monotonic()-started
             del xyz, sensor, kwargs
+            # Per-chunk export: reuse the individual chunk fields NKSR already built.
+            if current_mode == 'chunked' and output_mode in ('chunks', 'both'):
+                if not (hasattr(field, 'fields') and hasattr(field, 'transforms')):
+                    raise WorkerError('NKSR_CHUNK_FIELDS_UNAVAILABLE',
+                                      'NKSR did not expose individual chunk fields; per-chunk export is unavailable')
+                fields = field.fields
+                transforms = field.transforms
+                if not fields:
+                    raise WorkerError('EMPTY_TILE', 'NKSR produced no chunk fields')
+                centers = np.stack([np.asarray(t.t, dtype=np.float64) for t in transforms])
+                rotations = [np.asarray(t.q.rotation_matrix, dtype=np.float64) for t in transforms]
+                event('EXTRACTING_CHUNK_MESHES', extraction_device='cpu', total_chunks=len(fields),
+                      message='Per-chunk extraction on CPU')
+                reconstructor.network.to('cpu:0')
+                if device.type == 'cuda': torch.cuda.empty_cache()
+                chunks_dir = settings.output.parent / CHUNKS_DIR_NAME
+                chunk_started = time.monotonic()
+                manifest, chunk_totals = extract_and_save_chunks(
+                    fields, centers, rotations, settings, scale, chunks_dir, event, torch, device)
+                chunk_seconds = time.monotonic() - chunk_started
+                if output_mode == 'chunks':
+                    del field, fields, transforms, centers, rotations
+                    gc.collect()
+                    if device.type == 'cuda': torch.cuda.empty_cache()
+                    return None, None, reconstruct_seconds, 0.0, manifest, chunk_totals, chunk_seconds
+                # 'both': fall through to the fused extraction below; chunk fields are on CPU.
             # Official small-memory recipe: CPU extraction, no silent CPU inference fallback.
             if current_mode == 'chunked' or settings.tile_worker:
                 message='Independent tile extraction on CPU' if settings.tile_worker else 'Chunked mesh extraction uses CPU and may be slow'
@@ -184,14 +388,13 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
             mesh = field.extract_dual_mesh(**extraction)
             if settings.tile_worker and (not len(mesh.v) or not len(mesh.f)):
                 raise WorkerError('EMPTY_TILE','Tile produced no triangles')
-            def array(value): return value.detach().cpu().numpy() if hasattr(value,'detach') else np.asarray(value)
-            vertices = array(mesh.v)
+            vertices = to_numpy(mesh.v)
             if current_mode == 'chunked': vertices = vertices / scale
-            return vertices, array(mesh.f), reconstruct_seconds, time.monotonic()-started
+            return vertices, to_numpy(mesh.f), reconstruct_seconds, time.monotonic()-started, manifest, chunk_totals, chunk_seconds
 
     for retry in range(2):
         try:
-            vertices, faces, recons_seconds, extraction_seconds = attempt(mode)
+            vertices, faces, recons_seconds, extraction_seconds, manifest, chunk_totals, chunk_seconds = attempt(mode)
             break
         except Exception as error:
             if classify(error, 'RECONSTRUCTING') != 'CUDA_OOM' or settings.mode != 'auto' or retry:
@@ -202,7 +405,8 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         gc.collect(); torch.cuda.empty_cache()
         mode = 'chunked'; chunk_size = min(chunk_size or 5., 5.)
         reconstructor.network.to(device)
-    return vertices, faces, dict(requested_mode=settings.mode, actual_mode=mode,
+    result = dict(requested_mode=settings.mode, actual_mode=mode, mesh_output_mode=output_mode,
+        chunk_count=None,
         chunk_size=chunk_size if mode == 'chunked' else None, overlap_ratio=settings.overlap_ratio,
         requested_detail_level=settings.detail_level, detail_level=None,
         nksr_internal_voxel_size=DEFAULT_NKSR_TARGET_VOXEL_M if mode == 'full' else None,
@@ -217,6 +421,13 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         gpu_free_before=free, gpu_free_after=torch.cuda.mem_get_info(device)[0] if device.type=='cuda' else None,
         gpu_total_memory=torch.cuda.mem_get_info(device)[1] if device.type=='cuda' else None,
         gpu_peak_allocated=torch.cuda.max_memory_allocated(device) if device.type=='cuda' else None)
+    if manifest is not None:
+        result.update(chunk_manifest=manifest, chunk_count=manifest['total_chunks'],
+                      chunk_vertices_total=chunk_totals['total_vertices'],
+                      chunk_faces_total=chunk_totals['total_faces'],
+                      chunk_union_bounds=chunk_totals['union_bounds'],
+                      chunk_extraction_seconds=chunk_seconds)
+    return vertices, faces, result
 
 
 def parser():
@@ -227,6 +438,8 @@ def parser():
     p.add_argument('--health-output', type=Path)
     p.add_argument('--device', choices=['auto','cuda','cpu'], default='auto')
     p.add_argument('--mode', choices=['auto','full','chunked','low_ram'], default='auto')
+    p.add_argument('--mesh-output-mode', choices=list(MESH_OUTPUT_MODES), default='merged',
+                   help='merged: fused mesh only; chunks: per-chunk meshes only; both: chunks plus fused mesh')
     p.add_argument('--tile-size', type=float, default=5., help='Independent low-RAM tile edge length in meters')
     p.add_argument('--tile-worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--detail-level', type=float, default=.5)
@@ -277,10 +490,40 @@ def main():
         reconstructor=load_model(torch,nksr,device,event)
         vertices,faces,result=execute(points,sensors,settings,event,torch,nksr,device,reconstructor)
         metadata.update(result)
-        event('SAVING_MESH')
-        metadata.update(write_mesh(settings.output,vertices,faces))
+        output_mode = settings.mesh_output_mode
+        chunks_dir = settings.output.parent / CHUNKS_DIR_NAME
+        write_merged = output_mode != 'chunks'
+        chunk_totals = None
+        if result.get('chunk_manifest') is not None:
+            chunk_totals = dict(total_vertices=result['chunk_vertices_total'],
+                                total_faces=result['chunk_faces_total'],
+                                union_bounds=result['chunk_union_bounds'])
+        # A full (non-chunked) reconstruction has no individual fields; export it as
+        # one chunk so "chunks" and "both" remain meaningful without extra work.
+        if result['actual_mode'] != 'chunked' and output_mode in ('chunks', 'both'):
+            manifest, chunk_totals = write_full_single_chunk(settings, vertices, faces, chunks_dir)
+            metadata.update(chunk_manifest_path=str(chunks_dir/'chunks.json'),
+                            chunk_count=manifest['total_chunks'],
+                            chunk_vertices_total=chunk_totals['total_vertices'],
+                            chunk_faces_total=chunk_totals['total_faces'])
+            metadata['chunk_manifest'] = manifest
+        elif result.get('chunk_manifest') is not None:
+            metadata['chunk_manifest_path'] = str(chunks_dir/'chunks.json')
+        if write_merged:
+            event('SAVING_MESH')
+            metadata.update(write_mesh(settings.output,vertices,faces))
+            mesh_lo,mesh_hi=vertices.min(axis=0),vertices.max(axis=0)
+            mesh_vertices,mesh_faces=len(vertices),len(faces)
+        else:
+            # chunks only: the fused mesh was intentionally not extracted or saved.
+            union=chunk_totals.get('union_bounds') if chunk_totals else None
+            if not union:
+                raise WorkerError('MESH_INVALID','All chunk meshes were empty after core cropping')
+            mesh_lo,mesh_hi=np.asarray(union[0]),np.asarray(union[1])
+            mesh_vertices,mesh_faces=chunk_totals['total_vertices'],chunk_totals['total_faces']
+            metadata.update(vertex_count=mesh_vertices,face_count=mesh_faces,
+                            mesh_bbox=[mesh_lo.tolist(),mesh_hi.tolist()])
         lo,hi=points.min(axis=0),points.max(axis=0)
-        mesh_lo,mesh_hi=vertices.min(axis=0),vertices.max(axis=0)
         difference=np.maximum(abs(mesh_lo-lo),abs(mesh_hi-hi))
         tolerance=max(1.,float(np.linalg.norm(hi-lo))*.25)
         metadata.update(input_path=str(settings.input) if settings.input else None,input_points=len(points), input_bbox=[lo.tolist(),hi.tolist()],
@@ -289,7 +532,8 @@ def main():
                         elapsed_seconds=time.monotonic()-started, checkpoint_loaded=True, sensor_origins_used=True)
         path=settings.metadata or settings.output.parent/'nksr_metadata.json'
         atomic_json(path,metadata)
-        event('COMPLETED',vertices=len(vertices),faces=len(faces))
+        event('COMPLETED',vertices=mesh_vertices,faces=mesh_faces,
+              mesh_output_mode=output_mode,chunk_count=metadata.get('chunk_count'))
         if settings.health_output:
             atomic_json(settings.health_output,dict(metadata, status='READY' if device.type=='cuda' else ('CPU_READY' if metadata['cuda_available'] else 'CUDA_UNAVAILABLE'),
                         cpu_ready=device.type=='cpu', smoke_passed=True, checked_at=time.time()))

@@ -199,6 +199,43 @@ reconstruction/run_ID/output/mesh.ply
 **PREPARED** means only that point input exists. **COMPLETED** means the independent
 NKSR worker exited successfully and the triangle mesh passed validation.
 
+### Mesh output mode
+
+**Mesh output** selects how the result is saved:
+
+| Mode | Behavior |
+| --- | --- |
+| **Merged** (default) | Existing behavior: a single fused `output/mesh.ply`. |
+| **Per-chunk** | Saves only the individual NKSR chunk meshes under `output/mesh_chunks/` (no fused mesh). Chunked reconstruction reuses the per-chunk fields NKSR already built; no extra reconstruction pass runs. |
+| **Both** | Saves the per-chunk meshes and then the fused `output/mesh.ply`. |
+
+Chunk output lives in:
+
+```text
+reconstruction/run_ID/output/mesh_chunks/
+  chunk_0000.ply
+  chunk_0001.ply
+  ...
+  chunks.json
+```
+
+Each `chunk_NNNN.ply` contains world-space vertices in meters in the original
+GLIM/world coordinate system, so loading all chunks together (for example in
+Houdini, with no transform) aligns them with the point cloud, each other, and
+the fused mesh. `chunks.json` records the coordinate system, units, scale,
+per-chunk grid index and world bounding boxes.
+
+Chunks reconstructed by NKSR overlap slightly to give each field reconstruction
+context. To avoid exporting duplicate surfaces, each chunk keeps only its core
+region: adjacent chunks split the overlap at the midpoint between their centers
+(half-open bounds), and outermost chunks keep their outer boundary. Triangle
+ownership is decided by triangle centroid, so no triangle is exported by two
+neighboring chunks. Neighboring chunk meshes are **not** welded together.
+
+In full (non-chunked) mode, **Per-chunk** saves a single chunk representing the
+whole field, and **Both** saves that chunk plus the normal fused mesh; no extra
+reconstruction pass is performed.
+
 ## Common failures
 
 | Status or message | Meaning | Action |
