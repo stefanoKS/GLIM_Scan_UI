@@ -154,6 +154,75 @@ def test_low_ram_tile_failure_stops_before_merge(tmp_path,monkeypatch):
     assert read_json(settings.output.parent/'tiles.json')['tiles'][0]['state']=='FAILED'
 
 
+def low_ram_tile_run(tmp_path,monkeypatch,output_mode,chunk_size='10'):
+    """Run one Low RAM job with a stubbed per-tile worker and record what happened."""
+    from factory_mapping import nksr_tiled as tiled
+    points=np.array([[0,0,0],[1,0,0],[0,1,0],[10,0,0],[11,0,0],[10,1,0]],dtype=np.float32)
+    source=tmp_path/'input.npz';np.savez(source,points=points,sensor_origins=points+3)
+    calls=[];merges=[];events=[]
+    def run(args):
+        with np.load(args[args.index('--input')+1]) as data: vertices=data['points']
+        output=Path(args[args.index('--output')+1])
+        if calls: assert calls[-1].is_file()  # one isolated subprocess finishes before the next starts
+        write_mesh(output,vertices,np.array([[0,1,2]],dtype=np.int32))
+        atomic_json(Path(args[args.index('--metadata')+1]),{})
+        calls.append(output);return 0
+    original=tiled.merge_meshes
+    def merge(output,sources):
+        merges.append(list(sources))
+        return original(output,sources)
+    monkeypatch.setattr(tiled,'run_tile',run)
+    monkeypatch.setattr(tiled,'merge_meshes',merge)
+    settings=parser().parse_args(['--input',str(source),'--output',str(tmp_path/'output/mesh.ply'),
+                                  '--mode','low_ram','--mesh-output-mode',output_mode,'--normal-knn','3']
+                                 +([] if chunk_size is None else ['--chunk-size',chunk_size]))
+    assert tiled.run_tiled(settings,lambda stage,**kw:events.append((stage,kw)))==0
+    return settings,calls,merges,events
+
+
+@pytest.mark.parametrize('output_mode,merged',[('merged',True),('chunks',False),('both',True)])
+def test_low_ram_output_mode_controls_merging(output_mode,merged,tmp_path,monkeypatch):
+    settings,calls,merges,events=low_ram_tile_run(tmp_path,monkeypatch,output_mode)
+    metadata=read_json(settings.output.parent/'nksr_metadata.json')
+    assert len(calls)==2 and metadata['completed_tiles']==2 and metadata['skipped_tiles']==0
+    assert metadata['mesh_output_mode']==output_mode
+    assert metadata['effective_chunk_size_m']==10.0 and metadata['tile_size_m']==10.0
+    assert metadata['actual_mode']=='low_ram' and metadata['boundary_stitching'] is False
+    # The independent tile meshes always exist in their existing directory.
+    assert (settings.output.parent/'tiles/tile_000001/mesh.ply').is_file()
+    assert (settings.output.parent/'tiles/tile_000002/mesh.ply').is_file()
+    if merged:
+        assert len(merges)==1 and settings.output.is_file()
+        assert metadata['face_count']==2 and metadata['mesh_file_size']>0
+    else:
+        assert merges==[] and not settings.output.exists()
+        assert metadata['face_count']==2 and metadata['mesh_file_size'] is None
+        # Separate output must never be duplicated into the Full/Chunked chunk directory.
+        assert not (settings.output.parent/'mesh_chunks').exists()
+    assert metadata['total_faces']==2 and metadata['output_bytes']>0
+    state=read_json(settings.output.parent/'tiles.json')
+    assert state['mesh_output_mode']==output_mode and state['total_faces']==2
+    assert state['effective_chunk_size_m']==10.0 and state['chunk_size_source']=='user'
+    assert ('MERGING_MESHES' in [stage for stage,_ in events]) is merged
+    assert events[-1][0]=='COMPLETED' and not list(settings.output.parent.glob('nksr-tiles-*'))
+
+
+def test_low_ram_default_tile_edge_stays_five_metres(tmp_path,monkeypatch):
+    settings,_,_,_=low_ram_tile_run(tmp_path,monkeypatch,'merged',chunk_size=None)
+    metadata=read_json(settings.output.parent/'nksr_metadata.json')
+    assert metadata['effective_chunk_size_m']==5.0 and metadata['chunk_size_source']=='default'
+    assert metadata['requested_chunk_size_m'] is None
+    assert len(read_json(settings.output.parent/'tiles.json')['tiles'])==2
+
+
+def test_low_ram_chunks_skips_merging_but_keeps_every_tile(tmp_path,monkeypatch):
+    settings,calls,merges,events=low_ram_tile_run(tmp_path,monkeypatch,'chunks')
+    assert merges==[] and not settings.output.exists()
+    assert [path.parent.name for path in calls]==['tile_000001','tile_000002']
+    assert not list(settings.output.parent.glob('nksr-tiles-*'))
+    assert read_json(settings.output.parent/'tiles.json')['tiles'][0]['state']=='COMPLETED'
+
+
 def test_tile_worker_bounds_extraction_without_changing_original_modes():
     torch,nksr,reconstructor,_,_=fake_runtime(0)
     captured=[]
@@ -264,11 +333,15 @@ def test_low_ram_settings_reach_worker(prepared,monkeypatch):
     calls=[]
     async def start(key,args,*rest): calls.append(args)
     monkeypatch.setattr(service.pm,'start',start)
+    # A legacy client sends tile_size; it must reach the worker as the shared chunk size.
     settings=MeshRequest(mode='low_ram',tile_size=2.5).model_dump()
     asyncio.run(jobs.reconstruct(service,sid,run.name,settings))
     assert calls[0][calls[0].index('--mode')+1]=='low_ram'
-    assert calls[0][calls[0].index('--tile-size')+1]=='2.5'
-    assert read_json(run/'mesh_job.json')['settings']['tile_size']==2.5
+    assert calls[0][calls[0].index('--chunk-size')+1]=='2.5'
+    assert calls[0][calls[0].index('--chunk-size-source')+1]=='legacy_tile_size'
+    recorded=read_json(run/'mesh_job.json')['settings']
+    assert recorded['chunk_size']==2.5 and recorded['chunk_size_source']=='legacy_tile_size'
+    assert 'tile_size' not in recorded
 
 
 def test_import_only_is_not_ready(prepared):
@@ -445,3 +518,103 @@ def test_api_reconstruction_validation_and_routes(root,monkeypatch):
         for obj in ({'mode':'poisson'},{'chunk_size':-1},{'normal_knn':0},{'normal_drop_angle_deg':91},
                     {'mode':'low_ram','tile_size':0},{'tile_size':-1},{'tile_size':'NaN'}):
             assert client.post(url,json=obj).status_code==422
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end worker output for Full and Chunked
+# --------------------------------------------------------------------------- #
+
+def world_surface():
+    """Two unit cubes 25 m apart, in GLIM world metres."""
+    local=np.array([[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]],dtype=np.float32)
+    triangles=np.array([[0,1,2],[0,2,3],[4,6,5],[4,7,6],[0,4,5],[0,5,1],
+                        [1,5,6],[1,6,2],[2,6,7],[2,7,3],[3,7,4],[3,4,0]],dtype=np.int32)
+    vertices,faces=[],[]
+    for origin in ([0.,0.,0.],[25.,0.,0.]):
+        base=len(vertices);vertices.extend((np.asarray(origin,dtype=np.float32)+local).tolist())
+        faces.extend((triangles+base).tolist())
+    return np.asarray(vertices,dtype=np.float32),np.asarray(faces,dtype=np.int32)
+
+
+def tile_triangle_multiset(directory,manifest):
+    from plyfile import PlyData
+    triangles=[]
+    for chunk in manifest['chunks']:
+        mesh=PlyData.read(str(Path(directory)/chunk['file']),known_list_len={'face':{'vertex_indices':3}})
+        local=np.round(np.column_stack([mesh['vertex'][axis] for axis in 'xyz']).astype(np.float64),6)
+        indexed=np.asarray(mesh['face']['vertex_indices'])
+        if indexed.dtype.kind=='O': indexed=np.stack(indexed)
+        triangles.extend(sorted(tuple(local[index].tolist()) for index in face) for face in indexed)
+    return sorted(triangles)
+
+
+def run_worker(tmp_path,monkeypatch,mode,output_mode,mesh,chunk_size='10'):
+    """Run the real worker main() against a stubbed runtime; returns (output, reconstruct calls)."""
+    from factory_mapping import nksr_worker as worker
+    source=tmp_path/'input.npz';np.savez(source,points=np.ones((70,3)),sensor_origins=np.ones((70,3))*5)
+    output=tmp_path/'output/mesh.ply'
+    torch,nksr,reconstructor,reconstruct_calls,_=fake_runtime(0,mesh=mesh)
+    monkeypatch.setattr(worker.sys,'argv',['worker','--input',str(source),'--output',str(output),
+        '--metadata',str(output.parent/'nksr_metadata.json'),'--mode',mode,
+        '--mesh-output-mode',output_mode,'--chunk-size',chunk_size])
+    monkeypatch.setattr(worker.signal,'signal',lambda *args:None)
+    monkeypatch.setattr(worker,'runtime',lambda device:(torch,nksr,torch.device('cuda'),{}))
+    monkeypatch.setattr(worker,'load_model',lambda *args:reconstructor)
+    assert worker.main()==0
+    return output,reconstruct_calls
+
+
+@pytest.mark.parametrize('mode,scale',[('full',1.0),('chunked',5.0)])
+def test_chunks_export_partitions_the_final_worker_mesh(mode,scale,tmp_path,monkeypatch):
+    vertices,faces=world_surface()
+    output,calls=run_worker(tmp_path,monkeypatch,mode,'chunks',
+                            SimpleNamespace(v=np.asarray(vertices*scale,dtype=np.float32),f=faces))
+    assert len(calls)==1  # the final surface is reconstructed and extracted once
+    metadata=jobs.validate_completed(output.parent,0)
+    assert metadata['actual_mode']==mode and metadata['mesh_output_mode']=='chunks'
+    assert metadata['effective_chunk_size_m']==10.0 and metadata['chunk_size_source']=='user'
+    assert metadata['chunk_count']==2 and metadata['chunk_faces_total']==len(faces)
+    assert not output.exists() and metadata['export_strategy']=='spatial_split_of_final_mesh'
+    manifest=read_json(output.parent/'mesh_chunks/chunks.json')
+    assert manifest['total_faces']==len(faces) and manifest['source_faces']==len(faces)
+    # Concatenated tiles reproduce the original triangles exactly, in world metres.
+    assert tile_triangle_multiset(output.parent/'mesh_chunks',manifest)== \
+        tile_triangle_multiset_for(vertices,faces)
+
+
+def tile_triangle_multiset_for(vertices,faces):
+    rounded=np.round(np.asarray(vertices,dtype=np.float64),6)
+    return sorted(sorted(tuple(rounded[index].tolist()) for index in face) for face in faces)
+
+
+@pytest.mark.parametrize('mode,scale',[('full',1.0),('chunked',5.0)])
+def test_both_export_writes_merged_mesh_and_tiles(mode,scale,tmp_path,monkeypatch):
+    vertices,faces=world_surface()
+    output,calls=run_worker(tmp_path,monkeypatch,mode,'both',
+                            SimpleNamespace(v=np.asarray(vertices*scale,dtype=np.float32),f=faces))
+    assert len(calls)==1  # Both never reconstructs twice
+    metadata=jobs.validate_completed(output.parent,0)
+    assert metadata['mesh_output_mode']=='both' and metadata['vertex_count']==len(vertices)
+    assert metadata['face_count']==len(faces) and metadata['chunk_count']==2
+    assert output.is_file() and metadata['output_bytes']>metadata['mesh_file_size']
+    merged=inspect_mesh(output)
+    manifest=read_json(output.parent/'mesh_chunks/chunks.json')
+    assert merged['face_count']==manifest['total_faces']==len(faces)
+
+
+def test_chunked_both_uses_the_fused_field_once_not_native_fields(tmp_path,monkeypatch):
+    """Chunked separate output must not fall back to independent native chunk fields."""
+    from factory_mapping import nksr_worker as worker
+    vertices,faces=world_surface()
+    fields_seen=[]
+    original=worker.partition_mesh
+    def counted(vertices_in,faces_in,size,directory,**kwargs):
+        fields_seen.append(kwargs['reconstruction_mode'])
+        return original(vertices_in,faces_in,size,directory,**kwargs)
+    monkeypatch.setattr(worker,'partition_mesh',counted)
+    output,calls=run_worker(tmp_path,monkeypatch,'chunked','both',
+                            SimpleNamespace(v=np.asarray(vertices*5,dtype=np.float32),f=faces))
+    assert len(calls)==1 and fields_seen==['chunked']
+    manifest=read_json(output.parent/'mesh_chunks/chunks.json')
+    assert manifest['total_faces']==len(faces) and manifest['export_strategy']=='spatial_split_of_final_mesh'
+    assert jobs.validate_completed(output.parent,0)['chunk_count']==2

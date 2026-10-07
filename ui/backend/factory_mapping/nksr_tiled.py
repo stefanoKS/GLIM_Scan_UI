@@ -9,7 +9,7 @@ import time
 import zipfile
 import numpy as np
 from .nksr_mesh import inspect_mesh, merge_meshes
-from .nksr_worker import WorkerError, atomic_json, DEFAULT_NKSR_TARGET_VOXEL_M
+from .nksr_worker import WorkerError, atomic_json, resolve_chunk_size, DEFAULT_NKSR_TARGET_VOXEL_M
 
 
 def partition_input(source, scratch, tile_size, event):
@@ -69,6 +69,11 @@ def run_tile(args):
 def run_tiled(settings, event):
     started=time.monotonic()
     output=settings.output
+    # Shared chunk size: Low RAM uses it as the independent tile edge, resolved here so a
+    # direct caller sees the same defaults as the web orchestrator.
+    requested=getattr(settings,'requested_chunk_size_m',getattr(settings,'chunk_size',None))
+    chunk_size,chunk_size_source=resolve_chunk_size(getattr(settings,'chunk_size',None),
+                                                   getattr(settings,'chunk_size_source',None),'low_ram',None)
     if output.exists(): raise WorkerError('MESH_INVALID','Output exists; choose a new output path')
     output.parent.mkdir(parents=True,exist_ok=True)
     tile_root=output.parent/'tiles'
@@ -79,9 +84,11 @@ def run_tiled(settings, event):
     with tempfile.TemporaryDirectory(prefix='nksr-tiles-',dir=output.parent) as directory:
         scratch=Path(directory)
         event('PARTITIONING',message='Partitioning independent spatial tiles on disk')
-        tiles,input_stats=partition_input(settings.input,scratch,settings.tile_size,event)
+        tiles,input_stats=partition_input(settings.input,scratch,chunk_size,event)
         meshes=[]
-        state=dict(tile_size_m=settings.tile_size,overlap_ratio=0,tiles=tiles,**input_stats)
+        state=dict(tile_size_m=chunk_size,effective_chunk_size_m=chunk_size,
+                   requested_chunk_size_m=requested,chunk_size_source=chunk_size_source,
+                   mesh_output_mode=settings.mesh_output_mode,overlap_ratio=0,tiles=tiles,**input_stats)
         atomic_json(manifest,state)
         for index,tile in enumerate(tiles,1):
             tile_dir=tile_root/tile['id'];tile_dir.mkdir()
@@ -130,18 +137,44 @@ def run_tiled(settings, event):
             event('RECONSTRUCTING_TILES',tile_index=index,tile_count=len(tiles),
                   message=f'Tile {index}/{len(tiles)} {tile["state"].lower()}')
         if not meshes: raise WorkerError('MESH_INVALID','No tile produced triangles; increase tile size or check input')
-        event('MERGING_MESHES',tile_count=len(tiles),message=f'Assembling {len(meshes)} independent tile meshes')
-        stats=merge_meshes(output,meshes)
-        metadata=dict(stats,**input_stats,python=sys.executable,requested_mode='low_ram',actual_mode='low_ram',
-                      tile_size_m=settings.tile_size,tile_count=len(tiles),completed_tiles=len(meshes),
-                      skipped_tiles=len(tiles)-len(meshes),overlap_ratio=0,extraction_max_points=100000,
+        completed=[tile for tile in tiles if tile.get('state')=='COMPLETED']
+        total_vertices=sum(tile['vertex_count'] for tile in completed)
+        total_faces=sum(tile['face_count'] for tile in completed)
+        output_bytes=sum((tile_root/tile['id']/'mesh.ply').stat().st_size for tile in completed)
+        lower=np.min([tile['bounding_box_min'] for tile in completed],axis=0)
+        upper=np.max([tile['bounding_box_max'] for tile in completed],axis=0)
+        output_mode=settings.mesh_output_mode
+        metadata=dict(requested_mode='low_ram',actual_mode='low_ram',mesh_output_mode=output_mode,
+                      requested_chunk_size_m=requested,
+                      effective_chunk_size_m=chunk_size,chunk_size_source=chunk_size_source,
+                      tile_size_m=chunk_size,tile_count=len(tiles),completed_tiles=len(completed),
+                      skipped_tiles=sum(tile.get('state')=='SKIPPED' for tile in tiles),
+                      failed_tiles=sum(tile.get('state')=='FAILED' for tile in tiles),
+                      chunk_count=len(completed),total_vertices=total_vertices,total_faces=total_faces,
+                      **input_stats,python=sys.executable,
+                      overlap_ratio=0,extraction_max_points=100000,
                       extraction_device='cpu',target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M,
                       normal_knn=settings.normal_knn,normal_drop_angle_deg=settings.normal_drop_angle_deg,
                       mise_iter=settings.mise_iter,detail_level=None,requested_detail_level=settings.detail_level,
-                      input_path=str(settings.input),mesh_bbox=[stats['bounding_box_min'],stats['bounding_box_max']],
+                      input_path=str(settings.input),mesh_bbox=[lower.tolist(),upper.tolist()],
                       validation_status='WARNING',boundary_stitching=False,
                       validation_note='Independent tiles: boundaries are not stitched; gaps or overlaps may remain.',
-                      checkpoint_loaded=True,sensor_origins_used=True,elapsed_seconds=time.monotonic()-started)
+                      checkpoint_loaded=True,sensor_origins_used=True)
+        if output_mode != 'chunks':
+            event('MERGING_MESHES',tile_count=len(tiles),message=f'Assembling {len(meshes)} independent tile meshes')
+            stats=merge_meshes(output,meshes)
+            metadata.update(stats,mesh_bbox=[stats['bounding_box_min'],stats['bounding_box_max']])
+            output_bytes+=stats['mesh_file_size']
+        else:
+            # Separate meshes: the independent tile PLYs are the output, so merging is skipped entirely.
+            metadata.update(vertex_count=total_vertices,face_count=total_faces,mesh_file_size=None)
+        metadata['output_bytes']=output_bytes
+        state.update(mesh_output_mode=output_mode,chunk_count=len(completed),total_vertices=total_vertices,
+                     total_faces=total_faces,elapsed_seconds=time.monotonic()-started)
+        atomic_json(manifest,state)
+        metadata['elapsed_seconds']=time.monotonic()-started
         atomic_json(settings.metadata or output.parent/'nksr_metadata.json',metadata)
-        event('COMPLETED',vertices=stats['vertex_count'],faces=stats['face_count'],tile_count=len(tiles))
+        event('COMPLETED',vertices=metadata['vertex_count'],faces=metadata['face_count'],
+              tile_count=len(tiles),mesh_output_mode=output_mode,
+              message=f'{len(completed)} independent tile meshes; merged mesh {"written" if output_mode != "chunks" else "skipped"}')
     return 0

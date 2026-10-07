@@ -33,7 +33,8 @@ class MeshRequest(BaseModel):
     mesh_output_mode: Literal['merged','chunks','both']='merged'
     detail_level: float=Field(default=.5, ge=0, le=1)
     chunk_size: float | None=Field(default=None, gt=0)
-    tile_size: float=Field(default=5., gt=0)
+    # Legacy Low RAM tile edge; prefer chunk_size. Used only when chunk_size is absent.
+    tile_size: float | None=Field(default=None, gt=0)
     overlap_ratio: float=Field(default=.05, ge=0, lt=1)
     normal_knn: int=Field(default=64, ge=1, le=1024)
     normal_drop_angle_deg: float=Field(default=85, gt=0, le=90)

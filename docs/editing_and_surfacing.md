@@ -15,7 +15,7 @@ Completed GLIM processing run
   -> Prepare Reconstruction
   -> Check NKSR
   -> Reconstruct Mesh
-  -> inspect or download output/mesh.ply
+  -> inspect or download output/mesh.ply or the separate mesh cells
 ```
 
 Each stage creates derived data. The raw bag and original
@@ -193,21 +193,32 @@ extracts a triangle mesh, and validates that the output contains finite vertices
 and valid faces. Successful output is stored at:
 
 ```text
-reconstruction/run_ID/output/mesh.ply
+reconstruction/run_ID/output/mesh.ply           # Single mesh / Both
+reconstruction/run_ID/output/mesh_chunks/        # Separate meshes / Both
+reconstruction/run_ID/output/tiles/               # Low RAM independent tiles
 ```
 
 **PREPARED** means only that point input exists. **COMPLETED** means the independent
-NKSR worker exited successfully and the triangle mesh passed validation.
+NKSR worker exited successfully and every saved mesh passed validation. A worker exit
+code of 0 alone is never enough.
 
 ### Mesh output mode
 
-**Mesh output** selects how the result is saved:
+**Mesh output** selects how the finished geometry is saved. It is independent of the
+reconstruction mode:
 
 | Mode | Behavior |
 | --- | --- |
-| **Merged** (default) | Existing behavior: a single fused `output/mesh.ply`. |
-| **Per-chunk** | Saves only the individual NKSR chunk meshes under `output/mesh_chunks/` (no fused mesh). Chunked reconstruction reuses the per-chunk fields NKSR already built; no extra reconstruction pass runs. |
-| **Both** | Saves the per-chunk meshes and then the fused `output/mesh.ply`. |
+| **Single mesh** (default, internal `merged`) | Existing behavior: a single fused `output/mesh.ply`. |
+| **Separate meshes** (internal `chunks`) | Saves only the per-cell PLYs under `output/mesh_chunks/`, with no fused mesh. Full and Chunked reconstruct once and split the one final fused surface spatially. |
+| **Both** | Saves the separate cells and the fused `output/mesh.ply`. The reconstruction still runs once. |
+
+**One chunk size (meters)** is shared: `Auto` or a positive number. In Chunked mode
+it is also passed to NKSR as the reconstruction chunk size, and it is always the edge
+of the export cell. Auto resolves the reconstruction mode first and then the size
+(Chunked: the existing 20/10/5 m density heuristic; Full and Low RAM: 5 m). After
+processing the UI shows the effective size and where it came from
+(`user`, `default`, `auto_density`, `oom_retry`, or `legacy_tile_size`).
 
 Chunk output lives in:
 
@@ -220,37 +231,38 @@ reconstruction/run_ID/output/mesh_chunks/
 ```
 
 Each `chunk_NNNN.ply` contains world-space vertices in meters in the original
-GLIM/world coordinate system, so loading all chunks together (for example in
-Houdini, with no transform) aligns them with the point cloud, each other, and
-the fused mesh. `chunks.json` records the coordinate system, units, the physical
-and scaled chunk size, the scaled stride, and per-chunk grid indices and world
-bounding boxes. `core_bbox_min`/`core_bbox_max` are in world meters;
-`core_bbox_min_scaled`/`core_bbox_max_scaled`, `field_origin_scaled` and
-`chunk_stride_scaled` stay in scaled NKSR coordinates, which is stated in the
-field names.
+GLIM/world coordinate system, so loading all cells together (for example in Houdini,
+with no transform) aligns them with the point cloud, each other, and the fused mesh.
 
-NKSR reconstructs each chunk with overlap to give the field context, and it
-skips candidate cells that contain no points, so the reconstructed fields do not
-form a complete Cartesian grid. Ownership therefore works as follows:
+Ownership works on the final mesh alone: every triangle belongs to the cell that
+contains its float64 centroid on a world-aligned grid of `effective_chunk_size_m`
+cubes anchored at `[0, 0, 0]` (`floor(centroid / size)`, so negative coordinates are
+correct). Triangles are never cut, so a triangle that crosses a cell boundary stays
+whole in one file, neighbouring cells meet with a hairline seam, and shared boundary
+vertices are duplicated with identical coordinates. Cells are written z-major, then
+y, then x. Cells that own no triangle produce no file. `SUM(cell faces)` therefore
+equals the source face count, while `SUM(cell vertices)` is normally larger than the
+source because of that duplication.
 
-- every triangle belongs to the active chunk whose nominal cube contains its
-  centroid, choosing the nearest chunk center and the lowest field index on a tie
-  (this also resolves diagonal overlaps);
-- geometry whose centroid lies inside no active cube stays with the chunk that
-  emitted it, so a chunk in an unrelated grid cell can never crop it;
-- because ownership is decided from the centroid and the full active set, no
-  triangle is exported by two neighboring chunks.
+`chunks.json` records the export strategy, the actual reconstruction mode, the
+coordinate system and units, the grid origin and cell ordering, the requested and
+effective chunk size with its source, the source face count, the exported totals, and
+per-cell grid indices, nominal cell bounds, world bounding boxes, counts, and file
+sizes. Filenames are bare relative names, and validation rejects path traversal,
+symlink escapes, duplicate names, missing files, invalid indices, and nonpositive
+sizes. Older manifests from the former native per-field exporter are still read.
 
-Ownership by triangle centroid means a triangle is never split, so neighboring
-chunk meshes meet with a hairline seam (under half a triangle wide) instead of
-being welded. Neighboring chunks are intentionally **not** welded together.
+Full and Chunked separate output still require enough memory to reconstruct and
+extract the complete surface; tiling reduces file sizes and downstream loading
+pressure, not peak reconstruction RAM. The native per-field exporter remains in the
+worker for compatibility and future advanced use, but the standard output selection
+never uses it.
 
-In full (non-chunked) mode, **Per-chunk** saves a single chunk representing the
-whole field, and **Both** saves that chunk plus the normal fused mesh; no extra
-reconstruction pass is performed.
-
-Low RAM mode keeps its existing independent tile meshes plus the merged output;
-**Mesh output** does not apply there and is disabled in the UI.
+Low RAM mode also accepts all three output selections and keeps its existing
+independent tile layout under `output/tiles/`. **Separate meshes** skips the final
+merge entirely and writes no `output/mesh.ply`; **Single mesh** or **Both** assemble
+the merged mesh after all tiles finish. Independent tiles are never stitched, so
+their boundaries may show seams.
 
 ## Common failures
 

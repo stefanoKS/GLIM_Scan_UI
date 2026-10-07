@@ -7,9 +7,10 @@ import tempfile
 import numpy as np
 import pytest
 from factory_mapping import nksr_jobs as jobs
-from factory_mapping.nksr_worker import (parser, execute, extract_and_save_chunks,
-    write_full_single_chunk, chunk_core_bounds, chunk_grid_layout, crop_mesh_to_owned,
+from factory_mapping.nksr_worker import (parser, execute, extract_and_save_chunks, write_outputs,
+    resolve_chunk_size, chunk_core_bounds, chunk_grid_layout, crop_mesh_to_owned,
     owned_triangle_mask, WorkerError)
+from factory_mapping.mesh_partition import partition_mesh
 from factory_mapping.nksr_mesh import write_mesh, inspect_mesh
 from factory_mapping.api import MeshRequest
 from factory_mapping.storage import read_json, atomic_json
@@ -319,23 +320,260 @@ def test_manifest_reports_nominal_chunk_size_and_stride(tmp_path):
     assert manifest['overlap_ratio'] == .05
 
 
-def test_write_full_single_chunk(tmp_path):
-    settings = SimpleNamespace(mesh_output_mode='both')
+def test_full_mode_chunks_partition_the_final_mesh_spatially(tmp_path):
+    """A Full reconstruction splits its final mesh into world-aligned cells, never one giant chunk."""
+    settings = SimpleNamespace(mesh_output_mode='chunks', output=tmp_path / 'output' / 'mesh.ply')
+    mesh = grid_cubes([0.0, 0.0, 0.0], [25.0, 0.0, 0.0], [0.0, 25.0, 0.0])
+    result = dict(actual_mode='full', effective_chunk_size_m=10.0, requested_chunk_size_m=None,
+                  chunk_size_source='default')
+    fields, _, _, mesh_vertices, mesh_faces = write_outputs(settings, *mesh, result, lambda *a, **k: None)
+    manifest = read_json(tmp_path / 'output' / 'mesh_chunks' / 'chunks.json')
+    assert manifest['export_strategy'] == 'spatial_split_of_final_mesh'
+    assert manifest['reconstruction_mode'] == 'full'
+    assert manifest['effective_chunk_size_m'] == 10.0 and manifest['chunk_size_source'] == 'default'
+    assert manifest['total_chunks'] == 3 and fields['chunk_count'] == 3
+    assert fields['chunk_faces_total'] == manifest['source_faces'] == len(mesh[1])
+    assert mesh_faces == fields['chunk_faces_total'] and mesh_vertices == fields['chunk_vertices_total']
+    assert not (tmp_path / 'output' / 'mesh.ply').exists()
+    assert sorted(p.name for p in (tmp_path / 'output' / 'mesh_chunks').glob('chunk_*.ply')) == \
+        ['chunk_0000.ply', 'chunk_0001.ply', 'chunk_0002.ply']
+
+
+def test_partition_mesh_manifest_schema(tmp_path):
     vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
     faces = np.array([[0, 1, 2]], dtype=np.int64)
-    manifest, totals = write_full_single_chunk(settings, vertices, faces, tmp_path / 'mesh_chunks')
+    manifest, totals = partition_mesh(vertices, faces, 4.0, tmp_path / 'mesh_chunks',
+                                      reconstruction_mode='chunked', requested_chunk_size_m=4.0,
+                                      chunk_size_source='user')
+    assert manifest['version'] == 2 and manifest['units'] == 'meters'
+    assert manifest['coordinate_system'] == 'GLIM_world' and manifest['tile_shape'] == 'xyz_cube'
+    assert manifest['grid_origin_m'] == [0.0, 0.0, 0.0] and manifest['tile_shape'] == 'xyz_cube'
     assert manifest['total_chunks'] == 1 and totals['total_faces'] == 1
-    assert inspect_mesh(tmp_path / 'mesh_chunks/chunk_0000.ply')['face_count'] == 1
-    assert manifest['chunks'][0]['note'].startswith('Full')
-    assert manifest['coordinate_scale'] == 1.0 and manifest['overlap_ratio'] is None
-    assert manifest['chunk_size_m'] is None and manifest['chunk_stride_scaled'] is None
-    # A full reconstruction owns the whole field, so its core box is the mesh box.
-    assert manifest['chunks'][0]['core_bbox_min'] == manifest['chunks'][0]['world_bbox_min']
+    chunk = manifest['chunks'][0]
+    assert chunk['file'] == 'chunk_0000.ply' and chunk['grid_index'] == [0, 0, 0]
+    assert chunk['nominal_bbox_min_m'] == [0.0, 0.0, 0.0]
+    assert chunk['nominal_bbox_max_m'] == [4.0, 4.0, 4.0]
+    assert chunk['file_size_bytes'] > 0 and chunk['vertices'] == 3 and chunk['faces'] == 1
+    assert inspect_mesh(tmp_path / 'mesh_chunks' / 'chunk_0000.ply')['bounding_box_max'] == [1.0, 1.0, 0.0]
 
 
 # --------------------------------------------------------------------------- #
-# execute() modes
+# execute() modes and output writing
 # --------------------------------------------------------------------------- #
+
+def grid_cubes(*origins, size=1.0):
+    """Closed cubes of ``size`` at the given origins, merged into one mesh in world metres."""
+    local = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+                      [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], dtype=np.float32) * size
+    triangles = np.array([[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
+                          [1, 5, 6], [1, 6, 2], [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0]], dtype=np.int64)
+    vertices, faces = [], []
+    for origin in origins:
+        base = len(vertices)
+        vertices.extend((np.asarray(origin, dtype=np.float32) + local).tolist())
+        faces.extend((triangles + base).tolist())
+    return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.int64)
+
+
+def fused_field(origins, scale=None, chunk_fields=1):
+    """FusedField whose dual-mesh extraction is a controlled synthetic surface.
+
+    ``scale`` emulates the scaled global coordinates NKSR returns in Chunked mode.
+    """
+    field = FusedField([chunk_field([0.0, 0, 0], [0.0, 0, 0])] * chunk_fields, [[0.0, 0, 0]])
+    vertices, faces = grid_cubes(*origins)
+    if scale is not None:
+        vertices = vertices * scale
+    def extract_dual_mesh(**kwargs):
+        field.fused_calls.append(kwargs)
+        return SimpleNamespace(v=vertices, f=faces)
+    field.extract_dual_mesh = extract_dual_mesh
+    return field
+
+
+def test_full_mode_chunks_partition_the_final_mesh_spatially(tmp_path):
+    """A Full reconstruction splits its final mesh into world-aligned cells, never one giant chunk."""
+    settings = SimpleNamespace(mesh_output_mode='chunks', output=tmp_path / 'output' / 'mesh.ply')
+    vertices, faces = grid_cubes([0.0, 0.0, 0.0], [25.0, 0.0, 0.0], [0.0, 25.0, 0.0])
+    result = dict(actual_mode='full', effective_chunk_size_m=10.0, requested_chunk_size_m=None,
+                  chunk_size_source='default')
+    fields, _, _, mesh_vertices, mesh_faces = write_outputs(settings, vertices, faces, result,
+                                                            lambda *a, **k: None)
+    manifest = read_json(tmp_path / 'output' / 'mesh_chunks' / 'chunks.json')
+    assert manifest['export_strategy'] == 'spatial_split_of_final_mesh'
+    assert manifest['reconstruction_mode'] == 'full'
+    assert manifest['effective_chunk_size_m'] == 10.0 and manifest['chunk_size_source'] == 'default'
+    assert manifest['total_chunks'] == 3 and fields['chunk_count'] == 3
+    assert fields['chunk_faces_total'] == manifest['source_faces'] == len(faces)
+    assert mesh_faces == fields['chunk_faces_total'] and mesh_vertices == fields['chunk_vertices_total']
+    assert fields['output_bytes'] > 0 and not (tmp_path / 'output' / 'mesh.ply').exists()
+    assert sorted(p.name for p in (tmp_path / 'output' / 'mesh_chunks').glob('chunk_*.ply')) == \
+        ['chunk_0000.ply', 'chunk_0001.ply', 'chunk_0002.ply']
+
+
+def test_partition_mesh_manifest_schema(tmp_path):
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    manifest, totals = partition_mesh(vertices, faces, 4.0, tmp_path / 'mesh_chunks',
+                                      reconstruction_mode='chunked', requested_chunk_size_m=4.0,
+                                      chunk_size_source='user')
+    assert manifest['version'] == 2 and manifest['units'] == 'meters'
+    assert manifest['coordinate_system'] == 'GLIM_world' and manifest['tile_shape'] == 'xyz_cube'
+    assert manifest['grid_origin_m'] == [0.0, 0.0, 0.0] and manifest['cell_order']
+    assert manifest['total_chunks'] == 1 and totals['total_faces'] == 1
+    chunk = manifest['chunks'][0]
+    assert chunk['file'] == 'chunk_0000.ply' and chunk['grid_index'] == [0, 0, 0]
+    assert chunk['nominal_bbox_min_m'] == [0.0, 0.0, 0.0]
+    assert chunk['nominal_bbox_max_m'] == [4.0, 4.0, 4.0]
+    assert chunk['file_size_bytes'] > 0 and chunk['vertices'] == 3 and chunk['faces'] == 1
+    assert inspect_mesh(tmp_path / 'mesh_chunks' / 'chunk_0000.ply')['bounding_box_max'] == [1.0, 1.0, 0.0]
+
+
+def test_chunks_mode_extracts_the_fused_mesh_once(tmp_path):
+    """chunks no longer crops individual NKSR fields: it partitions the final fused mesh."""
+    field = fused_field([[0.0, 0.0, 0.0], [25.0, 0.0, 0.0]], scale=SCALE, chunk_fields=2)
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, output_mode='chunks')
+    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
+                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert len(field.fused_calls) == 1  # exactly one fused extraction, no per-field extraction
+    assert result['mesh_output_mode'] == 'chunks'
+    assert result['effective_chunk_size_m'] == 4.0 and result['chunk_size_source'] == 'user'
+    assert vertices is not None and len(faces) == 24
+    fields, _, _, _, _ = write_outputs(settings, vertices, faces, result, lambda *a, **k: None)
+    manifest = read_json(tmp_path / 'output' / 'mesh_chunks' / 'chunks.json')
+    assert fields['chunk_count'] == 2 and fields['chunk_faces_total'] == 24
+    assert [chunk['grid_index'] for chunk in manifest['chunks']] == [[0, 0, 0], [6, 0, 0]]
+
+
+def test_both_mode_produces_cells_and_fused(tmp_path):
+    field = fused_field([[0.0, 0.0, 0.0], [25.0, 0.0, 0.0]], scale=SCALE)
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, output_mode='both')
+    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
+                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert len(field.fused_calls) == 1
+    fields, _, _, _, _ = write_outputs(settings, vertices, faces, result, lambda *a, **k: None)
+    assert (tmp_path / 'output' / 'mesh.ply').is_file()
+    assert read_json(tmp_path / 'output' / 'mesh_chunks' / 'chunks.json')['total_chunks'] == 2
+    assert fields['mesh_file_size'] > 0 and fields['output_bytes'] > fields['mesh_file_size']
+
+
+def test_merged_mode_preserves_existing_single_extraction(tmp_path):
+    field = fused_field([[0.0, 0.0, 0.0]])
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, output_mode='merged')
+    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
+                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert len(field.fused_calls) == 1
+    assert vertices is not None and result.get('chunk_count') is None
+    write_outputs(settings, vertices, faces, result, lambda *a, **k: None)
+    assert not (tmp_path / 'output' / 'mesh_chunks').exists()
+
+
+def test_chunked_chunks_restores_world_metres_before_partitioning(tmp_path):
+    """Chunked extraction emits scaled coordinates; the worker restores metres before partitioning."""
+    world_vertices, faces = grid_cubes([0.0, 0.0, 0.0], [25.0, 0.0, 0.0])
+    field = fused_field([[0.0, 0.0, 0.0], [25.0, 0.0, 0.0]], scale=SCALE)
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, mode='chunked', output_mode='chunks')
+    vertices, restored, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
+                                         lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert result['coordinate_scale'] == SCALE and result['actual_mode'] == 'chunked'
+    # Divided by scale exactly once: 4 m export cells, not 20 m ones.
+    assert vertices.max() == pytest.approx(float(world_vertices.max()))
+    manifest, _ = partition_mesh(vertices, restored, result['effective_chunk_size_m'],
+                                 tmp_path / 'mesh_chunks', reconstruction_mode='chunked')
+    assert manifest['total_chunks'] == 2 and manifest['chunks'][1]['grid_index'] == [6, 0, 0]
+
+
+def test_auto_chunk_size_resolution_records_resolved_values(tmp_path):
+    """Auto resolves the chunk size; the manifest still reports the effective physical value."""
+    field = fused_field([[0.0, 0.0, 0.0], [25.0, 0.0, 0.0]], scale=SCALE)
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, output_mode='chunks', chunk_size=None)
+    assert settings.chunk_size is None
+    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
+                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert result['effective_chunk_size_m'] == 20.0  # select_chunk picked 20 m for this small input
+    assert result['chunk_size_source'] == 'auto_density'
+    assert result['nksr_chunk_size_scaled'] == pytest.approx(100.0)  # 20 m * scale 5
+    write_outputs(settings, vertices, faces, result, lambda *a, **k: None)
+    manifest = read_json(tmp_path / 'output' / 'mesh_chunks' / 'chunks.json')
+    assert manifest['effective_chunk_size_m'] == 20.0
+    assert manifest['chunk_size_source'] == 'auto_density'
+    assert manifest['requested_chunk_size_m'] is None
+    assert manifest['total_chunks'] == 2  # the 0-20 m and 20-40 m cells
+
+
+def test_auto_resolves_full_and_uses_the_default_export_cell(tmp_path):
+    field = fused_field([[0.0, 0.0, 0.0]])
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, mode='auto', output_mode='chunks', chunk_size=None)
+    points = np.ones((70, 3))
+    _, _, result = execute(points, points * 5, settings, lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert result['actual_mode'] == 'full'
+    assert result['effective_chunk_size_m'] == 5.0 and result['chunk_size_source'] == 'default'
+
+
+def test_resolve_chunk_size_rules():
+    points = np.ones((10, 3))
+    assert resolve_chunk_size(None, None, 'full', points) == (5.0, 'default')
+    assert resolve_chunk_size(None, None, 'low_ram', points) == (5.0, 'default')
+    assert resolve_chunk_size(None, 'legacy_tile_size', 'low_ram', points) == (5.0, 'default')
+    assert resolve_chunk_size(30.0, 'user', 'chunked', points) == (30.0, 'user')
+    assert resolve_chunk_size(30.0, 'legacy_tile_size', 'low_ram', points) == (30.0, 'legacy_tile_size')
+
+
+def test_chunks_mode_requires_no_native_chunk_fields(tmp_path):
+    """chunks works for a plain fused field: individual NKSR fields are no longer required."""
+    class Plain:
+        def __init__(self):
+            self.fused_calls = []
+
+        def to_(self, device):
+            pass
+
+        def extract_dual_mesh(self, **kwargs):
+            self.fused_calls.append(kwargs)
+            vertices, faces = grid_cubes([0.0, 0.0, 0.0], [25.0, 0.0, 0.0])
+            return SimpleNamespace(v=vertices, f=faces)
+
+    field = Plain()
+    torch, nksr, reconstructor, device = execute_runtime(field)
+    settings = execute_settings(tmp_path, output_mode='chunks')
+    _, _, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
+                           lambda *a, **k: None, torch, nksr, device, reconstructor)
+    assert result['mesh_output_mode'] == 'chunks' and len(field.fused_calls) == 1
+
+
+@pytest.mark.parametrize('output_mode', ['merged', 'chunks', 'both'])
+def test_low_ram_worker_accepts_every_mesh_output(output_mode, monkeypatch, capsys):
+    """Low RAM no longer rejects Separate/Both; only the missing input stops the worker."""
+    from factory_mapping import nksr_worker as worker
+    monkeypatch.setattr(worker.signal, 'signal', lambda *args: None)
+    monkeypatch.setattr(worker.sys, 'argv',
+                        ['worker', '--mode', 'low_ram', '--mesh-output-mode', output_mode])
+    assert worker.main() == 1
+    assert '--input and --output are required' in capsys.readouterr().out
+    assert parser().parse_args([]).mesh_output_mode == 'merged'
+
+
+def test_chunk_size_request_from_the_legacy_tile_size_reaches_the_worker(prepared, monkeypatch):
+    service, sid, run, _ = prepared
+    calls = []
+    async def start(key, args, *rest): calls.append(args)
+    monkeypatch.setattr(service.pm, 'start', start)
+    settings = MeshRequest(mode='low_ram', mesh_output_mode='chunks', tile_size=2.5).model_dump()
+    asyncio.run(jobs.reconstruct(service, sid, run.name, settings))
+    assert calls[0][calls[0].index('--chunk-size') + 1] == '2.5'
+    assert calls[0][calls[0].index('--chunk-size-source') + 1] == 'legacy_tile_size'
+    assert calls[0][calls[0].index('--mesh-output-mode') + 1] == 'chunks'
+    recorded = read_json(run / 'mesh_job.json')['settings']
+    assert recorded['chunk_size'] == 2.5 and recorded['chunk_size_source'] == 'legacy_tile_size'
+    assert 'tile_size' not in recorded
+
+
 
 class FakeTensor:
     def __init__(self, value):
@@ -389,99 +627,6 @@ class FusedField:
 
 def chunk_field(centroid, center):
     return FakeField(local_triangle(centroid, center), [[0, 1, 2]])
-
-
-def test_chunks_mode_does_not_call_fused_extraction(tmp_path):
-    field = FusedField([chunk_field([0.0, 0, 0], [0.0, 0, 0])], [[0.0, 0, 0]])
-    torch, nksr, reconstructor, device = execute_runtime(field)
-    settings = execute_settings(tmp_path, output_mode='chunks')
-    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
-                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
-    assert vertices is None and faces is None
-    assert field.fused_calls == []
-    assert result['mesh_output_mode'] == 'chunks' and result['chunk_count'] == 1
-    assert (tmp_path / 'output' / 'mesh_chunks' / 'chunk_0000.ply').is_file()
-    assert not (tmp_path / 'output' / 'mesh.ply').exists()
-
-
-def test_both_mode_produces_chunks_and_fused(tmp_path):
-    field = FusedField([chunk_field([0.0, 0, 0], [0.0, 0, 0])], [[0.0, 0, 0]])
-    torch, nksr, reconstructor, device = execute_runtime(field)
-    settings = execute_settings(tmp_path, output_mode='both')
-    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
-                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
-    assert len(field.fused_calls) == 1
-    assert vertices is not None and faces is not None
-    assert result['chunk_count'] == 1
-    assert (tmp_path / 'output' / 'mesh_chunks' / 'chunk_0000.ply').is_file()
-
-
-def test_merged_mode_preserves_existing_single_extraction(tmp_path):
-    field = FusedField([chunk_field([0.0, 0, 0], [0.0, 0, 0])], [[0.0, 0, 0]])
-    torch, nksr, reconstructor, device = execute_runtime(field)
-    settings = execute_settings(tmp_path, output_mode='merged')
-    vertices, faces, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
-                                      lambda *a, **k: None, torch, nksr, device, reconstructor)
-    assert len(field.fused_calls) == 1
-    assert vertices is not None and result.get('chunk_count') is None
-    assert not (tmp_path / 'output' / 'mesh_chunks').exists()
-
-
-def test_auto_chunk_size_manifest_records_resolved_values(tmp_path):
-    """Auto resolves the chunk size; the manifest still reports physical and scaled values."""
-    field = FusedField([chunk_field([0.0, 0, 0], [0.0, 0, 0])], [[0.0, 0, 0]])
-    torch, nksr, reconstructor, device = execute_runtime(field)
-    settings = execute_settings(tmp_path, output_mode='chunks', chunk_size=None)
-    assert settings.chunk_size is None
-    _, _, result = execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
-                           lambda *a, **k: None, torch, nksr, device, reconstructor)
-    manifest = read_json(tmp_path / 'output' / 'mesh_chunks' / 'chunks.json')
-    assert manifest['chunk_size_m'] == 20.0  # select_chunk picked 20 m for this small input
-    assert manifest['nksr_chunk_size_scaled'] == pytest.approx(100.0)
-    assert manifest['chunk_stride_scaled'] == pytest.approx(95.0)  # 100 * (1 - .05)
-    assert manifest['overlap_ratio'] == .05
-    assert result['chunk_size_m'] == 20.0
-    assert result['nksr_chunk_size_scaled'] == pytest.approx(100.0)
-    assert result['chunk_stride_scaled'] == pytest.approx(95.0)
-    # The resolved size is what the manifest's grid indices are derived from.
-    assert manifest['chunk_stride_source'] == 'nksr_chunk_size'
-    assert manifest['chunks'][0]['grid_index'] == [0, 0, 0]
-
-
-def test_chunks_mode_requires_chunk_fields(tmp_path):
-    class Plain:
-        def __init__(self):
-            self.fused_calls = []
-
-        def to_(self, device):
-            pass
-
-        def extract_dual_mesh(self, **kwargs):
-            return SimpleNamespace(v=np.zeros((3, 3)), f=np.array([[0, 1, 2]]))
-
-    torch, nksr, reconstructor, device = execute_runtime(Plain())
-    settings = execute_settings(tmp_path, output_mode='chunks')
-    with pytest.raises(WorkerError, match='chunk fields'):
-        execute(np.ones((70, 3)), np.ones((70, 3)) * 5, settings,
-                lambda *a, **k: None, torch, nksr, device, reconstructor)
-
-
-def test_low_ram_rejects_non_merged_mesh_output(monkeypatch):
-    from factory_mapping import nksr_worker as worker
-    monkeypatch.setattr(worker.signal, 'signal', lambda *args: None)
-    for output_mode in ('chunks', 'both'):
-        monkeypatch.setattr(worker.sys, 'argv',
-                            ['worker', '--mode', 'low_ram', '--mesh-output-mode', output_mode])
-        with pytest.raises(SystemExit):
-            worker.main()
-    assert parser().parse_args(['--mode', 'low_ram']).mesh_output_mode == 'merged'
-
-
-def test_low_ram_orchestration_rejects_non_merged_output(prepared):
-    service, sid, run, _ = prepared
-    settings = MeshRequest(mode='low_ram', mesh_output_mode='chunks').model_dump()
-    with pytest.raises(ValueError, match='Low RAM'):
-        asyncio.run(jobs.reconstruct(service, sid, run.name, settings))
 
 
 # --------------------------------------------------------------------------- #
@@ -638,3 +783,177 @@ def test_api_rejects_invalid_mesh_output_mode(root, monkeypatch):
         assert client.post(url, json={'mesh_output_mode': 'chunks'}).status_code == 202
         assert calls[-1]['mesh_output_mode'] == 'chunks'
         assert client.post(url, json={'mesh_output_mode': 'poisson'}).status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Spatial output completion validation
+# --------------------------------------------------------------------------- #
+
+def build_spatial_output(tmp_path, mode='chunks', size=10.0):
+    """Worker output directory for the standard spatial exporter, one cube per cell."""
+    settings = SimpleNamespace(mesh_output_mode=mode, output=tmp_path / 'output' / 'mesh.ply')
+    vertices, faces = grid_cubes([0.0, 0.0, 0.0], [25.0, 0.0, 0.0])
+    result = dict(actual_mode='full', effective_chunk_size_m=size, requested_chunk_size_m=None,
+                  chunk_size_source='default')
+    fields, _, _, _, _ = write_outputs(settings, vertices, faces, result, lambda *a, **k: None)
+    atomic_json(tmp_path / 'output' / 'nksr_metadata.json',
+                dict(actual_mode='full', **fields))
+    return tmp_path / 'output'
+
+
+@pytest.mark.parametrize('mode', ['chunks', 'both'])
+def test_validate_completed_accepts_spatial_output(mode, tmp_path):
+    output = build_spatial_output(tmp_path, mode=mode)
+    metadata = jobs.validate_completed(output, 0)
+    assert metadata['mesh_output_mode'] == mode and metadata['chunk_count'] == 2
+    assert (output / 'mesh.ply').exists() == (mode == 'both')
+    assert (output / 'mesh_chunks' / 'chunks.json').is_file()
+
+
+def test_validate_completed_rejects_duplicate_spatial_filenames(tmp_path):
+    output = build_spatial_output(tmp_path, mode='chunks')
+    manifest = read_json(output / 'mesh_chunks/chunks.json')
+    manifest['chunks'][1]['file'] = manifest['chunks'][0]['file']
+    atomic_json(output / 'mesh_chunks/chunks.json', manifest)
+    with pytest.raises(ValueError, match='repeats a file name'):
+        jobs.validate_completed(output, 0)
+
+
+@pytest.mark.parametrize('size', [0.0, -1.0, None, 'ten'])
+def test_validate_completed_rejects_invalid_effective_chunk_size(size, tmp_path):
+    output = build_spatial_output(tmp_path, mode='chunks')
+    manifest = read_json(output / 'mesh_chunks/chunks.json')
+    manifest['effective_chunk_size_m'] = size
+    atomic_json(output / 'mesh_chunks/chunks.json', manifest)
+    with pytest.raises(ValueError, match='invalid effective chunk size'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_a_spatial_cell_without_a_file(tmp_path):
+    output = build_spatial_output(tmp_path, mode='chunks')
+    manifest = read_json(output / 'mesh_chunks/chunks.json')
+    manifest['chunks'][0]['file'] = None
+    atomic_json(output / 'mesh_chunks/chunks.json', manifest)
+    with pytest.raises(ValueError, match='no mesh file'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_spatial_face_conservation_errors(tmp_path):
+    output = build_spatial_output(tmp_path, mode='chunks')
+    manifest = read_json(output / 'mesh_chunks/chunks.json')
+    manifest['source_faces'] += 1
+    atomic_json(output / 'mesh_chunks/chunks.json', manifest)
+    with pytest.raises(ValueError, match='do not match the source mesh'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_corrupt_chunk_ply(tmp_path):
+    output = build_spatial_output(tmp_path, mode='chunks')
+    (output / 'mesh_chunks' / 'chunk_0000.ply').write_bytes(b'not a ply file')
+    with pytest.raises(ValueError):
+        jobs.validate_completed(output, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Low RAM tile completion validation
+# --------------------------------------------------------------------------- #
+
+def build_tiled_output(tmp_path, mode='merged', states=('COMPLETED', 'SKIPPED'), failed=False):
+    """Worker output directory for Low RAM independent tiles."""
+    output = tmp_path / 'output'
+    (output / 'tiles').mkdir(parents=True)
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    face = np.array([[0, 1, 2]], dtype=np.int64)
+    tiles, total_vertices, total_faces = [], 0, 0
+    for index, state in enumerate(states, 1):
+        tile_id = f'tile_{index:06d}'
+        tile = dict(id=tile_id, cell=[index - 1, 0, 0], points=4, state=state)
+        if state == 'COMPLETED':
+            tile_dir = output / 'tiles' / tile_id
+            tile_dir.mkdir()
+            stats = write_mesh(tile_dir / 'mesh.ply', vertices + index * 10, face)
+            tile.update(stats)
+            total_vertices += stats['vertex_count']
+            total_faces += stats['face_count']
+        tiles.append(tile)
+    atomic_json(output / 'tiles.json',
+                dict(tile_size_m=5.0, effective_chunk_size_m=5.0, chunk_size_source='default',
+                     mesh_output_mode=mode, tiles=tiles))
+    metadata = dict(requested_mode='low_ram', actual_mode='low_ram', mesh_output_mode=mode,
+                    effective_chunk_size_m=5.0, tile_size_m=5.0, tile_count=len(tiles),
+                    completed_tiles=sum(state == 'COMPLETED' for state in states),
+                    skipped_tiles=sum(state == 'SKIPPED' for state in states),
+                    failed_tiles=sum(state == 'FAILED' for state in states),
+                    chunk_count=sum(state == 'COMPLETED' for state in states),
+                    total_vertices=total_vertices, total_faces=total_faces)
+    if failed:
+        metadata['failed_tiles'] = 1
+    if mode != 'chunks':
+        stats = write_mesh(output / 'mesh.ply', vertices, face)
+        metadata.update(vertex_count=stats['vertex_count'], face_count=stats['face_count'])
+    else:
+        metadata.update(vertex_count=total_vertices, face_count=total_faces)
+    atomic_json(output / 'nksr_metadata.json', metadata)
+    return output
+
+
+@pytest.mark.parametrize('mode', ['merged', 'chunks', 'both'])
+def test_validate_completed_accepts_low_ram_tiles(mode, tmp_path):
+    output = build_tiled_output(tmp_path, mode=mode)
+    metadata = jobs.validate_completed(output, 0)
+    assert metadata['mesh_output_mode'] == mode and metadata['completed_tiles'] == 1
+    assert (output / 'mesh.ply').exists() == (mode != 'chunks')
+
+
+def test_validate_completed_rejects_missing_low_ram_tile_mesh(tmp_path):
+    output = build_tiled_output(tmp_path)
+    (output / 'tiles/tile_000001/mesh.ply').unlink()
+    with pytest.raises(ValueError, match='missing'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_failed_low_ram_tile(tmp_path):
+    output = build_tiled_output(tmp_path, states=('COMPLETED', 'FAILED'))
+    with pytest.raises(ValueError, match='unfinished tiles'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_low_ram_without_a_completed_tile(tmp_path):
+    output = build_tiled_output(tmp_path, states=('SKIPPED',), mode='chunks')
+    with pytest.raises(ValueError, match='No independent tile'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_low_ram_tile_count_mismatch(tmp_path):
+    output = build_tiled_output(tmp_path)
+    metadata = read_json(output / 'nksr_metadata.json')
+    metadata['completed_tiles'] = 99
+    atomic_json(output / 'nksr_metadata.json', metadata)
+    with pytest.raises(ValueError, match='Tile counts'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_low_ram_totals_mismatch(tmp_path):
+    output = build_tiled_output(tmp_path)
+    metadata = read_json(output / 'nksr_metadata.json')
+    metadata['total_faces'] += 1
+    atomic_json(output / 'nksr_metadata.json', metadata)
+    with pytest.raises(ValueError, match='totals do not match'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_symlinked_low_ram_tile(tmp_path):
+    output = build_tiled_output(tmp_path)
+    outside = tmp_path / 'outside.ply'
+    write_mesh(outside, np.zeros((3, 3)), np.array([[0, 1, 2]]))
+    link = output / 'tiles/tile_000001/mesh.ply'
+    link.unlink()
+    link.symlink_to(outside)
+    with pytest.raises(ValueError, match='regular file'):
+        jobs.validate_completed(output, 0)
+
+
+def test_validate_completed_rejects_unsuccessful_low_ram_worker(tmp_path):
+    output = build_tiled_output(tmp_path)
+    with pytest.raises(ValueError, match='unsuccessfully'):
+        jobs.validate_completed(output, -9)

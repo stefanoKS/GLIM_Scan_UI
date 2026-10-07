@@ -13,16 +13,15 @@
 <details><summary>Advanced</summary>
 <label>Preparation voxel: <input id="voxel-size-cm" type="number" value="1.0" min="0.2" max="20" step="0.1" required/> cm</label>
 <label>Mode<select id="nksr-mode"><option value="auto">Auto</option><option value="full">Full</option><option value="chunked">Chunked</option><option value="low_ram">Low RAM · independent tiles</option></select></label>
-<label>Mesh output<select id="nksr-output-mode"><option value="merged">Merged</option><option value="chunks">Per-chunk</option><option value="both">Both</option></select></label>
-<p id="nksr-output-note" hidden>Low RAM keeps its existing independent tile meshes and merged output; Mesh output does not apply.</p>
+<label>Mesh output<select id="nksr-output-mode"><option value="merged">Single mesh</option><option value="chunks">Separate meshes</option><option value="both">Both</option></select></label>
+<p id="nksr-output-note">Full / Chunked: separate meshes are spatial sections of the final surface. Low RAM: each section is reconstructed independently, so boundaries may have seams.</p>
 <label>Detail level<input id="nksr-detail" type="number" value="0.5" min="0" max="1" step="0.1"/></label>
 <label id="nksr-chunk-label">Chunk size (meters)<input id="nksr-chunk" type="number" min="0.1" step="0.1" placeholder="Auto"/></label>
-<label id="nksr-tile-label" hidden>Tile edge length (meters)<input id="nksr-tile" type="number" value="5" min="0.1" step="0.1" required disabled/></label>
 <label>Normal KNN<input id="nksr-knn" type="number" value="64" min="1" max="1024"/></label>
 <label>Normal angle threshold (degrees)<input id="nksr-angle" type="number" value="85" min="0.1" max="90" step="0.1"/></label>
 <label>MISE iterations<input id="nksr-mise" type="number" value="1" min="0" max="4"/></label>
 <label>Device<select id="nksr-device"><option value="auto">Auto</option><option value="cuda">CUDA</option><option value="cpu">CPU</option></select></label>
-<p id="nksr-mode-note">Auto selects full or chunked inference from point count and available GPU memory. Detail level applies only to full mode. Chunked extraction uses CPU. CPU inference can be very slow.</p>
+<p id="nksr-mode-note">Auto selects full or chunked inference from point count and available GPU memory. Detail level applies only to full mode. Chunked extraction uses CPU. CPU inference can be very slow. Chunk size is one physical setting in meters, used for reconstruction chunking and for mesh export cells.</p>
 <p>Preparation sampling is separate from NKSR's internal reconstruction scale.</p>
 </details>
 <h3>Point preparation</h3><button id="prepare-reconstruction" type="submit">Prepare Reconstruction</button></form>

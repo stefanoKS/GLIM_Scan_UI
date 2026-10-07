@@ -1,5 +1,6 @@
 """Subprocess-only NKSR orchestration. The web/ROS process never imports torch."""
 import asyncio
+import math
 import os
 from pathlib import Path, PurePath
 import re
@@ -90,6 +91,24 @@ def chunk_mesh_path(output, name):
     return path
 
 
+def tile_mesh_path(output, tile_id):
+    """Resolve a Low RAM tile mesh strictly inside output/tiles/<tile_id>."""
+    if not isinstance(tile_id, str) or not re.fullmatch(r'tile_\d{6}', tile_id):
+        raise ValueError(f'Tile manifest has an invalid tile id {tile_id!r}')
+    base = output/'tiles'
+    if base.is_symlink():
+        raise ValueError('Tile output directory cannot be a symlink')
+    directory = base/tile_id
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError(f'Tile directory {tile_id!r} is missing or is not a directory')
+    path = directory/'mesh.ply'
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f'Tile mesh {tile_id!r} is missing or is not a regular file')
+    if path.resolve().parent != directory.resolve():
+        raise ValueError(f'Tile mesh {tile_id!r} resolves outside its tile directory')
+    return path
+
+
 def validate_chunks_completed(output, metadata):
     """Validate chunks.json and every chunk PLY against the worker metadata."""
     manifest=read_json(output/'mesh_chunks/chunks.json',None)
@@ -98,18 +117,32 @@ def validate_chunks_completed(output, metadata):
     if not isinstance(chunks, list) or not chunks: raise ValueError('Chunk manifest has no chunks')
     if manifest.get('total_chunks') != len(chunks):
         raise ValueError('Chunk manifest chunk count is inconsistent')
+    # Spatial export manifests describe cells of the one final fused mesh; older native
+    # per-field manifests have no export_strategy and may carry empty chunks.
+    spatial=manifest.get('export_strategy')=='spatial_split_of_final_mesh'
+    if spatial:
+        size=manifest.get('effective_chunk_size_m')
+        if isinstance(size,bool) or not isinstance(size,(int,float)) or not math.isfinite(size) or size<=0:
+            raise ValueError('Chunk manifest has an invalid effective chunk size')
+    names=[]
     total_vertices=total_faces=0
     saved=0
     for chunk in chunks:
         name=chunk.get('file')
-        if name is None: continue
+        if name is None:
+            if spatial: raise ValueError('A spatial export cell has no mesh file')
+            continue
+        names.append(name)
         stats=inspect_mesh(chunk_mesh_path(output,name))
         if stats['vertex_count'] != chunk.get('vertices') or stats['face_count'] != chunk.get('faces'):
             raise ValueError(f'Chunk {name!r} counts do not match the manifest')
         total_vertices+=stats['vertex_count']; total_faces+=stats['face_count']; saved+=1
+    if len(set(names)) != len(names): raise ValueError('Chunk manifest repeats a file name')
     if not saved: raise ValueError('All chunk meshes were empty')
     if total_vertices != manifest.get('total_vertices') or total_faces != manifest.get('total_faces'):
         raise ValueError('Parsed chunk totals do not match the manifest totals')
+    if spatial and manifest.get('source_faces') != total_faces:
+        raise ValueError('Exported chunk faces do not match the source mesh')
     if metadata.get('chunk_count') != manifest.get('total_chunks'):
         raise ValueError('Chunk count does not match worker metadata')
     if (metadata.get('chunk_vertices_total') != total_vertices or
@@ -118,11 +151,49 @@ def validate_chunks_completed(output, metadata):
     return metadata
 
 
+def validate_tiled_completed(output, metadata, mode):
+    """Validate tiles.json and every completed independent tile mesh one at a time."""
+    state=read_json(output/'tiles.json',None)
+    if not isinstance(state, dict): raise ValueError('Tile manifest is missing')
+    tiles=state.get('tiles')
+    if not isinstance(tiles, list) or not tiles: raise ValueError('Tile manifest has no tiles')
+    outcomes={'COMPLETED':0,'SKIPPED':0,'FAILED':0,'INTERRUPTED':0}
+    total_vertices=total_faces=0
+    for tile in tiles:
+        tile_id=tile.get('id')
+        if not isinstance(tile_id, str) or not re.fullmatch(r'tile_\d{6}', tile_id):
+            raise ValueError(f'Tile manifest has an invalid tile id {tile_id!r}')
+        tile_state=tile.get('state')
+        if tile_state not in outcomes: raise ValueError(f'Tile {tile_id!r} has an invalid state')
+        outcomes[tile_state]+=1
+        if tile_state != 'COMPLETED': continue
+        stats=inspect_mesh(tile_mesh_path(output, tile_id))
+        if stats['vertex_count'] != tile.get('vertex_count') or stats['face_count'] != tile.get('face_count'):
+            raise ValueError(f'Tile {tile_id!r} counts do not match the manifest')
+        total_vertices+=stats['vertex_count']; total_faces+=stats['face_count']
+    if outcomes['FAILED'] or outcomes['INTERRUPTED']:
+        raise ValueError('Tile manifest records unfinished tiles')
+    if not outcomes['COMPLETED']: raise ValueError('No independent tile produced a valid mesh')
+    if metadata.get('tile_count') != len(tiles) or metadata.get('completed_tiles') != outcomes['COMPLETED']:
+        raise ValueError('Tile counts do not match worker metadata')
+    if (metadata.get('skipped_tiles') != outcomes['SKIPPED'] or
+            metadata.get('failed_tiles') != outcomes['FAILED']):
+        raise ValueError('Tile outcomes do not match worker metadata')
+    if metadata.get('total_vertices') != total_vertices or metadata.get('total_faces') != total_faces:
+        raise ValueError('Parsed tile totals do not match worker metadata')
+    if mode != 'chunks':
+        stats=inspect_mesh(output/'mesh.ply')
+        if stats['vertex_count'] != metadata.get('vertex_count') or stats['face_count'] != metadata.get('face_count'):
+            raise ValueError('Mesh counts do not match worker metadata')
+    return metadata
+
+
 def validate_completed(output, returncode):
     if returncode != 0: raise ValueError('Worker exited unsuccessfully')
     metadata=read_json(output/'nksr_metadata.json',{})
     mode=metadata.get('mesh_output_mode','merged')
     if mode not in ('merged','chunks','both'): raise ValueError('Unknown mesh output mode in worker metadata')
+    if metadata.get('actual_mode')=='low_ram': return validate_tiled_completed(output, metadata, mode)
     if mode != 'chunks':
         stats=inspect_mesh(output/'mesh.ply')
         if stats['vertex_count'] != metadata.get('vertex_count') or stats['face_count'] != metadata.get('face_count'):
@@ -132,9 +203,19 @@ def validate_completed(output, returncode):
     return metadata
 
 
+def normalize_settings(settings):
+    """One shared physical chunk size: prefer chunk_size, accept the legacy Low RAM tile_size."""
+    normalized=dict(settings)
+    legacy=normalized.pop('tile_size',None)
+    if normalized.get('chunk_size') is None and normalized.get('mode')=='low_ram' and legacy is not None:
+        normalized.update(chunk_size=legacy, chunk_size_source='legacy_tile_size')
+    return normalized
+
+
 async def reconstruct(service,sid,rid,settings):
     service.require_processing()
     from .reconstruction_jobs import preparation_state
+    settings=normalize_settings(settings)
     run=get_run(service,sid,rid)
     job=read_json(run/'job.json',{})
     if preparation_state(run,job)!='PREPARED': raise ValueError('Prepare point input first')
@@ -147,9 +228,6 @@ async def reconstruct(service,sid,rid,settings):
         if any(current.get(key)!=source.get(key) for key in ('saved_map_fingerprint','trajectory_fingerprint','export_path')):
             raise ValueError('Prepared input is stale because the saved cleanup source changed; prepare again')
     if service.mock: raise ValueError('Real NKSR requires real prepared input')
-    if settings.get('mode')=='low_ram' and settings.get('mesh_output_mode','merged')!='merged':
-        raise ValueError('Low RAM mode keeps its independent tile meshes plus the merged output; '
-                         'choose Mesh output "Merged" or select another reconstruction mode')
     if service.capture.busy or service.active or any(service.pm.active(k) for k in
             ('nksr','nksr_check','reconstruction','offline','export','tool','glim','recording')):
         raise ValueError('Finish capture and active processing first')
@@ -169,9 +247,9 @@ async def reconstruct(service,sid,rid,settings):
     atomic_json(run/'mesh_job.json',data)
     args=[str(python),str(worker_path()),'--input',str(input_path),'--output',str(output/'mesh.ply'),
           '--metadata',str(output/'nksr_metadata.json'),'--progress',str(run/'nksr_progress.json')]
-    for key in ('device','mode','detail_level','chunk_size','normal_knn','normal_drop_angle_deg','mise_iter','overlap_ratio','mesh_output_mode'):
+    for key in ('device','mode','detail_level','chunk_size','chunk_size_source','normal_knn',
+                'normal_drop_angle_deg','mise_iter','overlap_ratio','mesh_output_mode'):
         if settings.get(key) is not None: args.extend(['--'+key.replace('_','-'),str(settings[key])])
-    if settings.get('mode')=='low_ram': args.extend(['--tile-size',str(settings.get('tile_size',5.))])
     async def done(item):
         progress=read_json(run/'nksr_progress.json',{})
         data.update(ended_at=now(),returncode=item['returncode'])

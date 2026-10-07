@@ -9,12 +9,15 @@ import tempfile
 import time
 import traceback
 import numpy as np
+from .mesh_partition import partition_mesh
 from .nksr_mesh import write_mesh
 
 DEFAULT_NKSR_TARGET_VOXEL_M = 0.02
 # Native ks voxel at pinned NKSR e403368; independent of preparation sampling.
 NKSR_NATIVE_VOXEL_SIZE = 0.1
 MESH_OUTPUT_MODES = ('merged', 'chunks', 'both')
+# Shared physical default when no explicit chunk size is requested and the density heuristic does not apply.
+DEFAULT_CHUNK_SIZE_M = 5.0
 CHUNKS_DIR_NAME = 'mesh_chunks'
 
 
@@ -34,7 +37,7 @@ def classify(error, stage):
     if 'out of memory' in str(error).lower(): return 'CUDA_OOM'
     if stage == 'DOWNLOADING_MODEL': return 'CHECKPOINT_DOWNLOAD_FAILED'
     if stage == 'EXTRACTING_MESH': return 'MESH_EXTRACTION_FAILED'
-    if stage == 'SAVING_MESH': return 'MESH_INVALID'
+    if stage in ('SAVING_MESH', 'PARTITIONING_MESH', 'SAVING_MESH_CHUNKS'): return 'MESH_INVALID'
     if stage == 'LOADING_INPUT': return 'INPUT_INVALID'
     return 'NKSR_RECONSTRUCTION_FAILED'
 
@@ -199,6 +202,20 @@ def select_chunk(points):
     return 5.
 
 
+def resolve_chunk_size(requested_chunk_size_m, chunk_size_source, mode, points):
+    """One physical chunk size in metres, shared by reconstruction and mesh export.
+
+    An explicit request always wins. Otherwise Chunked keeps the existing NKSR density
+    heuristic, and Full and Low RAM export the historical 5 m default. ``mode`` must
+    already be resolved from ``auto`` so an unsuccessful retry reports the size it used.
+    """
+    if requested_chunk_size_m is not None:
+        return float(requested_chunk_size_m), (chunk_size_source or 'user')
+    if mode == 'chunked':
+        return select_chunk(points), 'auto_density'
+    return DEFAULT_CHUNK_SIZE_M, 'default'
+
+
 def reconstruction_kwargs(settings, mode, chunk_size, preprocess):
     result = dict(sensor=None, detail_level=None,
                   approx_kernel_grad=True, fused_mode=True, preprocess_fn=preprocess)
@@ -279,7 +296,12 @@ def cpu_normal_preprocess(knn, drop_angle):
 
 def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunk_size_m,
                             chunks_dir, event, torch, device):
-    """Extract, crop, transform and save each NKSR chunk field independently.
+    """Legacy native per-field exporter, retained for compatibility and advanced use only.
+
+    It extracts each NKSR chunk field independently and crops it to its owned region,
+    so neighbouring fields can differ at their boundaries. The standard ``chunks`` and
+    ``both`` output selections do NOT use this: they extract the one final fused mesh
+    and split it spatially with :mod:`.mesh_partition`, which preserves fused geometry.
 
     Chunk meshes are processed one at a time and never held simultaneously. Each
     field is moved to CPU before extraction (the existing small-memory recipe),
@@ -359,50 +381,20 @@ def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunk_s
                           union_bounds=union)
 
 
-def write_full_single_chunk(settings, vertices, faces, chunks_dir):
-    """Export a full (non-chunked) reconstruction as one chunk plus its manifest."""
-    chunks_dir = Path(chunks_dir)
-    if chunks_dir.exists():
-        raise WorkerError('MESH_INVALID', 'Chunk output exists; choose a new output directory')
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-    stats = write_mesh(chunks_dir / 'chunk_0000.ply', vertices, faces)
-    entry = dict(index=0, grid_index=[0, 0, 0], field_origin_scaled=[0.0, 0.0, 0.0],
-                 core_bbox_min=stats['bounding_box_min'], core_bbox_max=stats['bounding_box_max'],
-                 core_bbox_min_scaled=stats['bounding_box_min'], core_bbox_max_scaled=stats['bounding_box_max'],
-                 file='chunk_0000.ply',
-                 vertices=int(stats['vertex_count']), faces=int(stats['face_count']),
-                 world_bbox_min=stats['bounding_box_min'], world_bbox_max=stats['bounding_box_max'],
-                 note='Full (non-chunked) reconstruction exported as a single chunk that owns the whole field')
-    manifest = dict(version=1, coordinate_system='GLIM_world', units='meters',
-                    output_mode=settings.mesh_output_mode,
-                    target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M, coordinate_scale=1.0,
-                    chunk_size_m=None, nksr_chunk_size_scaled=None, chunk_stride_scaled=None,
-                    chunk_stride_source=None, overlap_ratio=None,
-                    total_chunks=1, total_vertices=int(stats['vertex_count']),
-                    total_faces=int(stats['face_count']),
-                    ownership_rule='Full reconstruction owns the whole field; no NKSR chunk grid exists.',
-                    chunks=[entry])
-    atomic_json(chunks_dir / 'chunks.json', manifest)
-    return manifest, dict(total_vertices=int(stats['vertex_count']), total_faces=int(stats['face_count']),
-                          union_bounds=(stats['bounding_box_min'], stats['bounding_box_max']))
-
-
 def execute(points, sensors, settings, event, torch, nksr, device, reconstructor):
     free = torch.cuda.mem_get_info(device)[0] if device.type == 'cuda' else None
     output_mode = getattr(settings, 'mesh_output_mode', 'merged')
     mode = settings.mode
     if mode == 'auto': mode = 'full' if len(points) <= 250_000 and (free is None or free >= 3*1024**3) else 'chunked'
-    chunk_size = settings.chunk_size or (select_chunk(points) if mode == 'chunked' or settings.mode == 'auto' else None)
+    requested_chunk_size_m = settings.chunk_size
+    chunk_size, chunk_size_source = resolve_chunk_size(
+        requested_chunk_size_m, getattr(settings, 'chunk_size_source', None), mode, points)
     attempts = []
     reconstructor.chunk_tmp_device = torch.device('cpu:0')
     preprocess = nksr.get_estimate_normal_preprocess_fn(settings.normal_knn, settings.normal_drop_angle_deg)
     if device.type=='cpu': preprocess=cpu_normal_preprocess(settings.normal_knn,settings.normal_drop_angle_deg)
-    manifest = None
-    chunk_totals = None
-    chunk_seconds = None
 
     def attempt(current_mode):
-        nonlocal manifest, chunk_totals, chunk_seconds
         xyz = torch.from_numpy(points).float().to(device)
         sensor = torch.from_numpy(sensors).float().to(device)
         kwargs = reconstruction_kwargs(settings, current_mode, chunk_size, preprocess)
@@ -415,6 +407,7 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         event('RECONSTRUCTING', requested_mode=settings.mode, actual_mode=current_mode,
               mesh_output_mode=output_mode,
               chunk_size=chunk_size if current_mode == 'chunked' else None,
+              effective_chunk_size_m=chunk_size, chunk_size_source=chunk_size_source,
               detail_level=kwargs['detail_level'], target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M,
               coordinate_scale=scale, nksr_chunk_size=kwargs.get('chunk_size'),
               voxel_size=kwargs.get('voxel_size'))
@@ -426,33 +419,6 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
                                   'NKSR returned no field after normal filtering')
             reconstruct_seconds = time.monotonic()-started
             del xyz, sensor, kwargs
-            # Per-chunk export: reuse the individual chunk fields NKSR already built.
-            if current_mode == 'chunked' and output_mode in ('chunks', 'both'):
-                if not (hasattr(field, 'fields') and hasattr(field, 'transforms')):
-                    raise WorkerError('NKSR_CHUNK_FIELDS_UNAVAILABLE',
-                                      'NKSR did not expose individual chunk fields; per-chunk export is unavailable')
-                fields = field.fields
-                transforms = field.transforms
-                if not fields:
-                    raise WorkerError('EMPTY_TILE', 'NKSR produced no chunk fields')
-                centers = np.stack([np.asarray(t.t, dtype=np.float64) for t in transforms])
-                rotations = [np.asarray(t.q.rotation_matrix, dtype=np.float64) for t in transforms]
-                event('EXTRACTING_CHUNK_MESHES', extraction_device='cpu', total_chunks=len(fields),
-                      message='Per-chunk extraction on CPU')
-                reconstructor.network.to('cpu:0')
-                if device.type == 'cuda': torch.cuda.empty_cache()
-                chunks_dir = settings.output.parent / CHUNKS_DIR_NAME
-                chunk_started = time.monotonic()
-                manifest, chunk_totals = extract_and_save_chunks(
-                    fields, centers, rotations, settings, scale, chunk_size,
-                    chunks_dir, event, torch, device)
-                chunk_seconds = time.monotonic() - chunk_started
-                if output_mode == 'chunks':
-                    del field, fields, transforms, centers, rotations
-                    gc.collect()
-                    if device.type == 'cuda': torch.cuda.empty_cache()
-                    return None, None, reconstruct_seconds, 0.0, manifest, chunk_totals, chunk_seconds
-                # 'both': fall through to the fused extraction below; chunk fields are on CPU.
             # Official small-memory recipe: CPU extraction, no silent CPU inference fallback.
             if current_mode == 'chunked' or settings.tile_worker:
                 message='Independent tile extraction on CPU' if settings.tile_worker else 'Chunked mesh extraction uses CPU and may be slow'
@@ -467,12 +433,16 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
             if settings.tile_worker and (not len(mesh.v) or not len(mesh.f)):
                 raise WorkerError('EMPTY_TILE','Tile produced no triangles')
             vertices = to_numpy(mesh.v)
+            # One final fused surface per attempt; every output mode partitions this mesh,
+            # so a triangle is never extracted from an individual NKSR chunk field.
+            # Chunked extraction produces scaled global coordinates: restore GLIM metres
+            # here, so partitioning and export always work in real metres.
             if current_mode == 'chunked': vertices = vertices / scale
-            return vertices, to_numpy(mesh.f), reconstruct_seconds, time.monotonic()-started, manifest, chunk_totals, chunk_seconds
+            return vertices, to_numpy(mesh.f), reconstruct_seconds, time.monotonic()-started
 
     for retry in range(2):
         try:
-            vertices, faces, recons_seconds, extraction_seconds, manifest, chunk_totals, chunk_seconds = attempt(mode)
+            vertices, faces, recons_seconds, extraction_seconds = attempt(mode)
             break
         except Exception as error:
             if classify(error, 'RECONSTRUCTING') != 'CUDA_OOM' or settings.mode != 'auto' or retry:
@@ -481,15 +451,21 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
             event('RECONSTRUCTING', message='CUDA OOM: releasing tensors; one chunked retry', actual_mode='chunked')
         # Outside except: traceback/tensors can now be collected.
         gc.collect(); torch.cuda.empty_cache()
-        mode = 'chunked'; chunk_size = min(chunk_size or 5., 5.)
+        mode = 'chunked'
+        if chunk_size > DEFAULT_CHUNK_SIZE_M:
+            # Report the size the successful retry actually used.
+            chunk_size, chunk_size_source = DEFAULT_CHUNK_SIZE_M, 'oom_retry'
         reconstructor.network.to(device)
+    scale = NKSR_NATIVE_VOXEL_SIZE / DEFAULT_NKSR_TARGET_VOXEL_M if mode == 'chunked' else 1.0
     result = dict(requested_mode=settings.mode, actual_mode=mode, mesh_output_mode=output_mode,
         chunk_count=None,
+        requested_chunk_size_m=requested_chunk_size_m, effective_chunk_size_m=chunk_size,
+        chunk_size_source=chunk_size_source,
         chunk_size=chunk_size if mode == 'chunked' else None, overlap_ratio=settings.overlap_ratio,
+        nksr_chunk_size_scaled=chunk_size * scale if mode == 'chunked' else None,
         requested_detail_level=settings.detail_level, detail_level=None,
         nksr_internal_voxel_size=DEFAULT_NKSR_TARGET_VOXEL_M if mode == 'full' else None,
-        target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M,
-        coordinate_scale=NKSR_NATIVE_VOXEL_SIZE / DEFAULT_NKSR_TARGET_VOXEL_M if mode == 'chunked' else 1.0,
+        target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M, coordinate_scale=scale,
         normal_knn=settings.normal_knn,
         normal_drop_angle_deg=settings.normal_drop_angle_deg, mise_iter=settings.mise_iter,
         normal_backend='nksr_cuda' if device.type=='cuda' else 'scipy_cpu_pca',
@@ -498,21 +474,68 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         attempts=attempts, reconstruction_seconds=recons_seconds, extraction_seconds=extraction_seconds,
         gpu_free_before=free, gpu_free_after=torch.cuda.mem_get_info(device)[0] if device.type=='cuda' else None,
         gpu_total_memory=torch.cuda.mem_get_info(device)[1] if device.type=='cuda' else None,
-        gpu_peak_allocated=torch.cuda.max_memory_allocated(device) if device.type=='cuda' else None)
-    if manifest is not None:
-        result.update(chunk_manifest=manifest, chunk_count=manifest['total_chunks'],
-                      chunk_vertices_total=chunk_totals['total_vertices'],
-                      chunk_faces_total=chunk_totals['total_faces'],
-                      chunk_union_bounds=chunk_totals['union_bounds'],
-                      chunk_size_m=manifest['chunk_size_m'],
-                      nksr_chunk_size_scaled=manifest['nksr_chunk_size_scaled'],
-                      chunk_stride_scaled=manifest['chunk_stride_scaled'],
-                      chunk_extraction_seconds=chunk_seconds)
+        gpu_peak_allocated=torch.cuda.max_memory_allocated(device) if device.type=='cuda' else None,
+        source_vertex_count=int(len(vertices)), source_face_count=int(len(faces)))
     return vertices, faces, result
 
 
+def write_outputs(settings, vertices, faces, result, event):
+    """Save the selected mesh output: the merged mesh, spatial export cells, or both.
+
+    Full and fused-Chunked reconstruction both reach this with the one final surface, so
+    ``chunks`` never extracts individual NKSR fields and ``both`` never reconstructs
+    twice. ``chunks`` alone writes no merged mesh. Returns
+    ``(fields, mesh_lo, mesh_hi, mesh_vertices, mesh_faces)``.
+    """
+    output_mode = settings.mesh_output_mode
+    chunks_dir = settings.output.parent / CHUNKS_DIR_NAME
+    fields = dict(mesh_output_mode=output_mode, output_bytes=0)
+    chunk_totals = None
+    if output_mode in ('chunks', 'both'):
+        partition_started = time.monotonic()
+        manifest, chunk_totals = partition_mesh(
+            vertices, faces, result['effective_chunk_size_m'], chunks_dir,
+            reconstruction_mode=result['actual_mode'],
+            requested_chunk_size_m=result['requested_chunk_size_m'],
+            chunk_size_source=result['chunk_size_source'], event=event)
+        fields.update(chunk_manifest_path=f'{CHUNKS_DIR_NAME}/chunks.json',
+                      export_strategy=manifest['export_strategy'],
+                      chunk_count=chunk_totals['chunk_count'],
+                      chunk_vertices_total=chunk_totals['total_vertices'],
+                      chunk_faces_total=chunk_totals['total_faces'],
+                      chunk_union_bounds=chunk_totals['union_bounds'],
+                      chunk_size_m=manifest['effective_chunk_size_m'],
+                      partition_seconds=time.monotonic()-partition_started)
+        fields['output_bytes'] += sum(chunk['file_size_bytes'] for chunk in manifest['chunks'])
+    if output_mode != 'chunks':
+        event('SAVING_MESH')
+        stats = write_mesh(settings.output, vertices, faces)
+        fields.update(stats)
+        fields['output_bytes'] += stats['mesh_file_size']
+        return fields, vertices.min(axis=0), vertices.max(axis=0), len(vertices), len(faces)
+    # chunks only: no merged mesh is written at all.
+    union = chunk_totals['union_bounds']
+    mesh_lo, mesh_hi = np.asarray(union[0]), np.asarray(union[1])
+    fields.update(vertex_count=chunk_totals['total_vertices'], face_count=chunk_totals['total_faces'],
+                  mesh_bbox=[mesh_lo.tolist(), mesh_hi.tolist()])
+    return fields, mesh_lo, mesh_hi, chunk_totals['total_vertices'], chunk_totals['total_faces']
+
+
+class _Parser(argparse.ArgumentParser):
+    """Parser that folds the legacy Low RAM ``--tile-size`` edge into the shared chunk size."""
+
+    def parse_args(self, args=None, namespace=None):
+        settings = super().parse_args(args, namespace)
+        if settings.chunk_size is None and settings.tile_size is not None:
+            # Legacy clients sent the Low RAM tile edge instead of the shared chunk size.
+            settings.chunk_size, settings.chunk_size_source = settings.tile_size, 'legacy_tile_size'
+        settings.tile_size = None
+        settings.requested_chunk_size_m = settings.chunk_size
+        return settings
+
+
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = _Parser(description=__doc__)
     p.add_argument('--input', type=Path); p.add_argument('--output', type=Path)
     p.add_argument('--progress', type=Path); p.add_argument('--metadata', type=Path)
     p.add_argument('--check', action='store_true', help='Real pretrained model + inference + mesh smoke test')
@@ -520,11 +543,15 @@ def parser():
     p.add_argument('--device', choices=['auto','cuda','cpu'], default='auto')
     p.add_argument('--mode', choices=['auto','full','chunked','low_ram'], default='auto')
     p.add_argument('--mesh-output-mode', choices=list(MESH_OUTPUT_MODES), default='merged',
-                   help='merged: fused mesh only; chunks: per-chunk meshes only; both: chunks plus fused mesh')
-    p.add_argument('--tile-size', type=float, default=5., help='Independent low-RAM tile edge length in meters')
+                   help='merged: fused mesh only; chunks: spatial mesh cells only; both: cells plus fused mesh')
+    p.add_argument('--tile-size', type=float,
+                   help='Legacy alias for the shared Low RAM tile edge; prefer --chunk-size')
     p.add_argument('--tile-worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--detail-level', type=float, default=.5)
-    p.add_argument('--chunk-size', type=float)
+    p.add_argument('--chunk-size', type=float,
+                   help='One physical chunk size in metres for reconstruction partitioning and mesh export')
+    p.add_argument('--chunk-size-source', choices=['user','legacy_tile_size'],
+                   help='Where an explicit --chunk-size came from, for reporting only')
     p.add_argument('--overlap-ratio', type=float, default=.05)
     p.add_argument('--normal-knn', type=int, default=64)
     p.add_argument('--normal-drop-angle-deg', type=float, default=85.)
@@ -536,9 +563,7 @@ def main():
     settings = parser().parse_args()
     if not (0 <= settings.detail_level <= 1 and 0 <= settings.overlap_ratio < 1 and
             0 < settings.normal_drop_angle_deg <= 90 and settings.normal_knn > 0 and
-            0 <= settings.mise_iter <= 4 and np.isfinite(settings.tile_size) and settings.tile_size > 0 and
-            (not settings.tile_worker or settings.mode=='full') and
-            (settings.mode != 'low_ram' or settings.mesh_output_mode == 'merged') and
+            0 <= settings.mise_iter <= 4 and (not settings.tile_worker or settings.mode=='full') and
             (settings.chunk_size is None or np.isfinite(settings.chunk_size) and settings.chunk_size > 0)):
         raise SystemExit('Invalid reconstruction settings')
     stage = 'LOADING_INPUT'; metadata = {'python':sys.executable}; started=time.monotonic()
@@ -572,42 +597,8 @@ def main():
         reconstructor=load_model(torch,nksr,device,event)
         vertices,faces,result=execute(points,sensors,settings,event,torch,nksr,device,reconstructor)
         metadata.update(result)
-        output_mode = settings.mesh_output_mode
-        chunks_dir = settings.output.parent / CHUNKS_DIR_NAME
-        write_merged = output_mode != 'chunks'
-        chunk_totals = None
-        if result.get('chunk_manifest') is not None:
-            chunk_totals = dict(total_vertices=result['chunk_vertices_total'],
-                                total_faces=result['chunk_faces_total'],
-                                union_bounds=result['chunk_union_bounds'])
-        # A full (non-chunked) reconstruction has no individual fields; export it as
-        # one chunk so "chunks" and "both" remain meaningful without extra work.
-        if result['actual_mode'] != 'chunked' and output_mode in ('chunks', 'both'):
-            manifest, chunk_totals = write_full_single_chunk(settings, vertices, faces, chunks_dir)
-            metadata.update(chunk_manifest_path=str(chunks_dir/'chunks.json'),
-                            chunk_count=manifest['total_chunks'],
-                            chunk_vertices_total=chunk_totals['total_vertices'],
-                            chunk_faces_total=chunk_totals['total_faces'],
-                            chunk_size_m=manifest['chunk_size_m'],
-                            nksr_chunk_size_scaled=manifest['nksr_chunk_size_scaled'],
-                            chunk_stride_scaled=manifest['chunk_stride_scaled'])
-            metadata['chunk_manifest'] = manifest
-        elif result.get('chunk_manifest') is not None:
-            metadata['chunk_manifest_path'] = str(chunks_dir/'chunks.json')
-        if write_merged:
-            event('SAVING_MESH')
-            metadata.update(write_mesh(settings.output,vertices,faces))
-            mesh_lo,mesh_hi=vertices.min(axis=0),vertices.max(axis=0)
-            mesh_vertices,mesh_faces=len(vertices),len(faces)
-        else:
-            # chunks only: the fused mesh was intentionally not extracted or saved.
-            union=chunk_totals.get('union_bounds') if chunk_totals else None
-            if not union:
-                raise WorkerError('MESH_INVALID','All chunk meshes were empty after core cropping')
-            mesh_lo,mesh_hi=np.asarray(union[0]),np.asarray(union[1])
-            mesh_vertices,mesh_faces=chunk_totals['total_vertices'],chunk_totals['total_faces']
-            metadata.update(vertex_count=mesh_vertices,face_count=mesh_faces,
-                            mesh_bbox=[mesh_lo.tolist(),mesh_hi.tolist()])
+        fields,mesh_lo,mesh_hi,mesh_vertices,mesh_faces=write_outputs(settings,vertices,faces,result,event)
+        metadata.update(fields)
         lo,hi=points.min(axis=0),points.max(axis=0)
         difference=np.maximum(abs(mesh_lo-lo),abs(mesh_hi-hi))
         tolerance=max(1.,float(np.linalg.norm(hi-lo))*.25)
@@ -618,7 +609,7 @@ def main():
         path=settings.metadata or settings.output.parent/'nksr_metadata.json'
         atomic_json(path,metadata)
         event('COMPLETED',vertices=mesh_vertices,faces=mesh_faces,
-              mesh_output_mode=output_mode,chunk_count=metadata.get('chunk_count'))
+              mesh_output_mode=settings.mesh_output_mode,chunk_count=metadata.get('chunk_count'))
         if settings.health_output:
             atomic_json(settings.health_output,dict(metadata, status='READY' if device.type=='cuda' else ('CPU_READY' if metadata['cuda_available'] else 'CUDA_UNAVAILABLE'),
                         cpu_ready=device.type=='cpu', smoke_passed=True, checked_at=time.time()))

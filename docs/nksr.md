@@ -20,16 +20,22 @@ validation/reconstructed_from_bag.ply
 validation/comparison.json
 mesh_job.json                   # independent mesh state and settings
 nksr_progress.json              # latest worker stage
-output/mesh.ply                 # binary little-endian vertices AND triangle faces
+output/mesh.ply                 # binary little-endian vertices AND triangle faces (unless output mode is Separate)
 output/nksr_metadata.json
+output/mesh_chunks/chunks.json  # Full/Chunked separate output manifest
+output/mesh_chunks/chunk_0000.ply
+output/tiles.json               # Low RAM tile manifest
+output/tiles/tile_000001/mesh.ply
 attempts/previous_<id>/         # previous mesh outputs / state, retained on retries
 ```
 
 Mesh completion requires a successful worker exit plus an independently parsed,
 nonempty triangle PLY with finite vertices and valid face indices. Vertex-only
-clouds are rejected. Mesh-bound differences are recorded as PASS or WARNING;
-point-count differences from the optimized GLIM export are expected. No ICP or
-coordinate alignment is applied. A WARNING preserves the mesh for inspection.
+clouds are rejected. In the Separate and Both output modes every exported cell is
+parsed and checked against its manifest as well. Mesh-bound differences are recorded
+as PASS or WARNING; point-count differences from the optimized GLIM export are
+expected. No ICP or coordinate alignment is applied. A WARNING preserves the mesh
+for inspection. A worker exit code of 0 is never sufficient on its own.
 
 ## Isolated installation
 
@@ -94,6 +100,15 @@ failure. Cancel Reconstruction stops the managed worker and preserves all inputs
 
 The Advanced settings keep these two concepts separate:
 
+- **Reconstruction mode: Auto, Full, Chunked, or Low RAM.** How the surface is
+  reconstructed.
+- **Mesh output: Single mesh, Separate meshes, or Both.** How the finished geometry
+  is saved. Internally these remain the `merged`, `chunks`, and `both` values.
+- **Chunk size (meters): Auto or a positive number.** One physical setting shared by
+  reconstruction partitioning and mesh export. There is no second tile-size control.
+
+Preparation settings are separate:
+
 - **Preparation voxel: 1 cm = 0.01 m.** This selects actual world-space observations
   while keeping point, sensor origin, intensity and timestamp paired. Changing it
   or the trajectory marks the selected input stale and requires preparation again.
@@ -151,7 +166,8 @@ examines occupied metric cells for candidate sizes 20, 10, and 5 meters and pick
 the largest with no more than 250,000 points per cell, falling back to 5 meters.
 This is a conservative heuristic, not a guarantee of memory sufficiency. A CUDA
 OOM in AUTO releases tensors/cache and makes at most one chunked retry, capped at
-5 meters. FULL and CHUNKED do not silently retry or switch inference to CPU.
+5 meters; the retry's own chunk size is what gets reported. FULL and CHUNKED do not
+silently retry or switch inference to CPU.
 
 Full inference passes `detail_level=None`, `voxel_size=0.02`, `approx_kernel_grad=True`,
 `solver_tol=1e-4`, `fused_mode=True`, real sensor origins, and the normal preprocessor.
@@ -174,7 +190,10 @@ the upstream `1e-5` solver tolerance. Reconstruction log events report
 `nksr_chunk_size` in model units, and the full-mode `voxel_size` override.
 The worker records requested and actual settings rather than claiming full-mode
 settings applied to chunks. Completed chunks are temporarily stored on CPU;
-chunked dual-mesh extraction explicitly uses CPU to reduce peak GPU memory.
+chunked dual-mesh extraction explicitly uses CPU to reduce peak GPU memory. The
+standard output path extracts the single fused mesh once and splits it spatially, so
+no individual chunk field is meshed independently; see
+[Mesh output and the shared chunk size](#mesh-output-and-the-shared-chunk-size).
 
 CUDA normal estimation uses the official
 `nksr.get_estimate_normal_preprocess_fn(64, 85.0)`: 64 nearest neighbours and an
@@ -186,13 +205,118 @@ sensor orientation and angular filtering. The neural field and dual mesh still
 come exclusively from official NKSR; this is not another surface algorithm.
 CPU inference and extraction can be very slow for large clouds.
 
+## Mesh output and the shared chunk size
+
+Mesh output is independent of the reconstruction mode:
+
+- **Single mesh** (`merged`) saves only `output/mesh.ply`.
+- **Separate meshes** (`chunks`) saves only the per-cell PLYs plus their manifest; it
+  writes no `output/mesh.ply`.
+- **Both** saves the merged mesh and the separate cells.
+
+**Full and Chunked reconstruct once and partition the one final fused surface.**
+The separate output is a *spatial split of the final mesh*, not a set of
+independently extracted NKSR chunk fields. Independent field meshes can disagree at
+their boundaries; partitioning an already fused surface preserves its geometry. This
+means Separate does **not** avoid global mesh extraction in Chunked mode, and the
+native per-field exporter that remains in `nksr_worker.py` is retained only for
+compatibility and future advanced use — the standard output selection never calls it.
+
+Low RAM keeps its existing architecture: every section is reconstructed by its own
+isolated subprocess, so sections can differ at their boundaries. It now accepts all
+three output selections. With **Separate meshes** the final `merge_meshes()` step is
+skipped entirely and no `output/mesh.ply` is created; with **Both** the independent
+tiles and the merged mesh are both written.
+
+### Chunk size resolution
+
+`effective_chunk_size_m` is the one physical size in meters. It is used as the NKSR
+chunk size in Chunked mode and as the export cell edge everywhere. Resolution:
+
+| Path | Effective size | `chunk_size_source` |
+| --- | --- | --- |
+| Explicit user value | That value | `user` |
+| Chunked, Auto | Existing 20/10/5 m density heuristic | `auto_density` |
+| Full, Auto | 5.0 m | `default` |
+| Low RAM, Auto | 5.0 m independent tile edge | `default` |
+| Auto reconstruction | Resolved mode's rule | as above |
+| CUDA OOM retry that shrank the size | The successful retry's size | `oom_retry` |
+| Legacy `tile_size` with no `chunk_size` (Low RAM) | That legacy value | `legacy_tile_size` |
+
+Auto resolves the reconstruction mode first and derives the chunk size afterwards, so
+an OOM retry never reports the abandoned request. Metadata records
+`requested_chunk_size_m`, `effective_chunk_size_m`, and `chunk_size_source`; the UI
+shows the effective value after processing, not just the Auto setting. An explicit
+`chunk_size` always wins over a legacy `tile_size`, and the legacy field is accepted
+only as a Low RAM fallback so old clients and saved metadata keep working.
+
+### Spatial partitioning
+
+`ui/backend/factory_mapping/mesh_partition.py` performs the split in original GLIM
+world meters:
+
+- Cells are 3D cubes of `effective_chunk_size_m` on a grid anchored at `[0, 0, 0]`,
+  matching the physical NKSR chunk-size setting. The overlap-adjusted NKSR stride is
+  never used as the export size.
+- Ownership is `cell = floor(centroid / size)` per triangle, computed in float64.
+  `floor` handles negative coordinates correctly; the grid is stable when input
+  bounds or ordering change, and empty cells produce no file.
+- Each triangle belongs to exactly one cell and is kept whole, with unchanged vertex
+  positions, winding, geometry, and world scale. A triangle may extend past its
+  nominal cell, and neighbouring tiles duplicate shared vertex coordinates without
+  being topologically welded. Nothing is welded, decimated, smoothed, resampled,
+  voxelized, retriangulated, or clipped.
+- Each tile contains only the vertices its triangles reference, renumbered
+  contiguously from zero, so loading every tile at its original world coordinates
+  reproduces the source triangles without a new local origin.
+- Cells are ordered z-major, then y, then x (`(z, y, x)` ascending integer indices),
+  so filenames are deterministic.
+- Memory stays bounded: faces are classified in batches of 65,536, per-cell face
+  references are spooled to disk through at most 64 open handles, and one cell at a
+  time is materialized, compacted, and written atomically as `*.partial.ply`.
+- `SUM(tile_faces)` equals the source face count. `SUM(tile_vertices)` is usually
+  larger than the source vertex count because boundary vertices are duplicated; it is
+  recorded as the exported total, never as the source count.
+
+Full and fused-Chunked output still need enough memory to reconstruct and extract the
+complete surface. Separate output reduces final file sizes and downstream loading
+pressure in Houdini, CloudCompare, or MeshLab, not NKSR's reconstruction peak RAM.
+
+Full/Chunked output directory:
+
+```text
+output/
+  nksr_metadata.json
+  mesh.ply                  # Single mesh / Both only
+  mesh_chunks/
+    chunks.json
+    chunk_0000.ply
+    chunk_0001.ply
+```
+
+`chunks.json` records `version`, `export_strategy`, the actual `reconstruction_mode`,
+`coordinate_system`, `units`, `tile_shape`, `grid_origin_m`, the cell `cell_order`,
+`requested_chunk_size_m`, `effective_chunk_size_m`, `chunk_size_source`,
+`total_chunks`, `source_faces`, `total_vertices`, `total_faces`, and one entry per
+cell with `index`, `grid_index`, `file`, `nominal_bbox_min_m`, `nominal_bbox_max_m`,
+`world_bbox_min`, `world_bbox_max`, `vertices`, `faces`, and `file_size_bytes`.
+Manifest filenames are bare relative names; validation rejects path traversal,
+symlink escapes, duplicate names, missing files, invalid face indices, nonfinite
+vertices, and nonpositive effective chunk sizes. Older native per-field manifests
+(no `export_strategy`) are still read and validated with the previous behavior.
+
+Success is reported only after this validation passes, so a cancelled or partially
+written export is never advertised as complete. Cancellation stays responsive during
+partitioning because the worker keeps handling `SIGTERM`/`SIGINT` between batches.
+
 ## Low-RAM independent tiles
 
 The original **Auto**, **Full**, and **Chunked** modes remain unchanged. For large
 scans, select **Low RAM · independent tiles** in Surface Reconstruction's Advanced
-settings and set **Tile edge length (meters)**. The default is 5 m. This is the
-edge length of a world-aligned 3D cube, not the preparation voxel or mesh resolution.
-Existing prepared input can be reused without repeating preparation or GLIM.
+settings and set **Chunk size (meters)**, which is this mode's independent tile edge.
+The default is 5 m. This is the edge length of a world-aligned 3D cube, not the
+preparation voxel or mesh resolution. Existing prepared input can be reused without
+repeating preparation or GLIM.
 
 This mode partitions paired points and sensor origins onto disk in bounded blocks.
 Each point belongs to exactly one half-open cube, with indices `floor(point / tile_size)`.
@@ -201,13 +325,19 @@ and extracts one tile, saves its mesh, and exits before the next subprocess star
 The coordinator does not load torch, the model, or the entire point cloud into RAM.
 Per-tile inference uses Full mode at the existing 2 cm NKSR target; extraction runs
 on CPU with at most 100,000 field-query points per batch. Device, normal settings,
-and MISE iterations still apply. Detail level, original chunk size, and overlap do not.
+and MISE iterations still apply. Detail level, the original chunk size, and overlap
+do not apply to the per-tile reconstruction.
 
-The final binary PLY is assembled in blocks, preserving world coordinates and
-adjusting triangle indices. It is **not stitched or guaranteed watertight**:
-independent tile surfaces may have gaps or overlap at their boundaries. Metadata
-records this limitation as `validation_status=WARNING` and `boundary_stitching=false`.
-Use an original mode when globally blended surfaces are more important than memory.
+All three mesh output selections are available. With **Single mesh** or **Both** the
+final binary PLY is assembled in blocks, preserving world coordinates and adjusting
+triangle indices. With **Separate meshes** the merge step is skipped entirely and only
+the independent tile PLYs are written, which is the lowest-disk option. Low RAM never
+uses native NKSR `FusedField` reconstruction.
+
+Merged Low RAM output is **not stitched or guaranteed watertight**: independent tile
+surfaces may have gaps or overlap at their boundaries. Metadata records this
+limitation as `validation_status=WARNING` and `boundary_stitching=false`. Use an
+original mode when globally blended surfaces are more important than memory.
 
 Tile size bounds the spatial problem, not a hard RAM budget. A dense 5 m tile may
 still be too large: try 2 m or 1 m, or fewer MISE iterations. Smaller tiles increase
@@ -219,27 +349,29 @@ Cancellation stops the active child; successful tile outputs remain for inspecti
 Outputs under the run's `output/` directory include:
 
 ```text
-tiles.json                         # tile cells, counts, outcomes
+tiles.json                         # tile cells, counts, outcomes, shared chunk size
 tiles/tile_000001/mesh.ply          # independent tile surface
 tiles/tile_000001/nksr_metadata.json
 tiles/tile_000001/progress.json
-mesh.ply                           # combined mesh, only after all tiles finish
+mesh.ply                           # merged mesh; omitted in Separate meshes mode
 nksr_metadata.json                  # aggregate settings, counts, boundary warning
 ```
 
 Temporary decompressed input and partition files are removed on normal completion,
 handled failure, or cancellation. Allow disk space for those temporary files and
-both tile and combined meshes. An uncatchable kill or power loss can leave temporary
+both tile and merged meshes. An uncatchable kill or power loss can leave temporary
 files; UI retries archive the previous output directory rather than overwrite it.
-Retries currently start again, rather than resume individual tiles.
+Retries currently start again, rather than resume individual tiles. Validation reads
+one tile at a time, so it does not load every tile mesh at once.
 
-Manual use with the isolated NKSR interpreter:
+Manual use with the isolated NKSR interpreter (the legacy `--tile-size` alias is
+still accepted for the Low RAM tile edge, but `--chunk-size` is preferred):
 
 ```bash
 "$NKSR_PYTHON" tools/nksr_worker.py \
   --input "path/to/input/nksr_input.npz" \
   --output "path/to/new-output/mesh.ply" \
-  --mode low_ram --tile-size 5 --device cuda
+  --mode low_ram --chunk-size 5 --mesh-output-mode merged --device cuda
 ```
 
 ## Tests and licensing

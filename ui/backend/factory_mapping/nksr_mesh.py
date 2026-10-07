@@ -35,7 +35,10 @@ def write_mesh(path, vertices, faces):
 
 def inspect_mesh(path):
     from plyfile import PlyData
-    mesh = PlyData.read(str(path),known_list_len={'face':{'vertex_indices':3}})
+    try:
+        mesh = PlyData.read(str(path),known_list_len={'face':{'vertex_indices':3}})
+    except Exception as error:
+        raise ValueError(f'Not a readable binary triangle PLY: {error}') from error
     vertex_count=len(mesh['vertex'].data);face_count=len(mesh['face'].data)
     if not vertex_count or not face_count: raise ValueError('Mesh requires vertices and triangle faces')
     lower=np.full(3,np.inf);upper=np.full(3,-np.inf)
