@@ -157,17 +157,18 @@ function renderReconstruction(){
      listing.disabled=true;
      try{
       const state=await json(`sessions/${selected}/artifact?path=${encodeURIComponent(`reconstruction/${job.id}/output/${manifestFile}`)}`);
+      // Low RAM tiles all share the file name mesh.ply, so label them by tile id.
       meshFileCache.set(cacheKey,lowRamResult
-       ?state.tiles.filter(t=>t.state==='COMPLETED').map(t=>`tiles/${t.id}/mesh.ply`)
-       :state.chunks.filter(c=>c.file).map(c=>`mesh_chunks/${c.file}`));
+       ?state.tiles.filter(t=>t.state==='COMPLETED').map(t=>[`tiles/${t.id}/mesh.ply`,t.id])
+       :state.chunks.filter(c=>c.file).map(c=>[`mesh_chunks/${c.file}`,c.file]));
       renderReconstruction();
      }catch(e){listing.disabled=false;error(e)}
     };
     $('nksr-mesh-results').append(listing);
    }else if(files.length){
     const row=document.createElement('div');
-    for(const file of files.slice(0,MESH_LINK_LIMIT)){
-     const link=el('button',file.split('/').pop());
+    for(const [file,label] of files.slice(0,MESH_LINK_LIMIT)){
+     const link=el('button',label);
      link.onclick=()=>download(`reconstruction/${job.id}/output/${file}`);row.append(link);
     }
     if(files.length>MESH_LINK_LIMIT)row.append(el('span',`showing ${MESH_LINK_LIMIT} of ${files.length}; download the manifest for the rest`));

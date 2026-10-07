@@ -37,10 +37,27 @@ def read_tiles(directory):
     return [inspect_mesh(path) for path in sorted(Path(directory).glob('chunk_*.ply'))]
 
 
+def _canonical_triangle(triangle):
+    """Smallest rotation of a 3-vertex triangle.
+
+    Rotation-invariant, so the arbitrary starting vertex of an equivalent triangle does
+    not matter, but reversal-sensitive, so winding stays part of the comparison.
+    """
+    rotations = (triangle, np.roll(triangle, -1, axis=0), np.roll(triangle, -2, axis=0))
+    return min(tuple(map(tuple, rotation)) for rotation in rotations)
+
+
 def triangle_multiset(vertices, faces):
-    """Every triangle as its three vertex coordinate triples, order independent."""
+    """Multiset of ordered 3-vertex triangles, as coordinate triples.
+
+    Each entry is one complete triangle whose cyclic vertex order (winding) is part of
+    the comparison, while the collection itself is sorted so triangle input order does
+    not matter. Vertex occurrences are deliberately not flattened: two meshes can share
+    a vertex-occurrence multiset and still triangulate the surface differently.
+    """
     rounded = np.round(np.asarray(vertices, dtype=np.float64), 6)
-    return sorted(tuple(rounded[index].tolist()) for face in np.asarray(faces) for index in face)
+    triangles = rounded[np.asarray(faces)]  # [F, 3, 3], winding preserved
+    return sorted(_canonical_triangle(triangle) for triangle in triangles)
 
 
 def load_tiles(directory, manifest):
@@ -188,6 +205,57 @@ def test_fidelity_triangle_multiset_matches_the_source_mesh(tmp_path):
     assert triangle_multiset(tiled_vertices, tiled_faces) == triangle_multiset(vertices, faces)
 
 
+def test_triangle_multiset_rejects_altered_face_connectivity():
+    """Same vertices and counts, different connectivity: the fidelity check must reject it."""
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0],
+                         [0, 1, 0], [0, 0, 1], [1, 0, 1]], dtype=np.float32)
+    first = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    second = np.array([[0, 1, 5], [3, 4, 2]], dtype=np.int64)
+    # Both meshes use the identical vertex array and the same face and vertex counts.
+    assert first.shape == second.shape == (2, 3)
+    assert len(np.unique(first)) == len(np.unique(second)) == 6
+    # The old flattened helper only compared vertex occurrences, which are identical here,
+    # so it silently accepted the altered geometry.
+    def flattened(faces):
+        rounded = np.round(np.asarray(vertices, dtype=np.float64), 6)
+        return sorted(tuple(rounded[index].tolist()) for face in faces for index in face)
+    assert flattened(first) == flattened(second)
+    # The triangle multiset must not.
+    assert triangle_multiset(vertices, first) != triangle_multiset(vertices, second)
+
+
+def test_triangle_multiset_is_winding_sensitive():
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    triangle = np.array([[0, 1, 2]], dtype=np.int64)
+    # Reversing the winding is a different triangle.
+    assert triangle_multiset(vertices, triangle) != triangle_multiset(vertices, triangle[:, ::-1])
+    # A cyclic rotation preserves winding, so it is the same triangle.
+    assert triangle_multiset(vertices, triangle) == triangle_multiset(vertices, np.array([[1, 2, 0]]))
+    assert triangle_multiset(vertices, triangle) == triangle_multiset(vertices, np.array([[2, 0, 1]]))
+
+
+def test_triangle_multiset_ignores_triangle_order_but_keeps_each_triangle():
+    vertices, faces = cubes([0.0, 0.0, 0.0], [30.0, 0.0, 0.0])
+    shuffled = faces[np.random.default_rng(3).permutation(len(faces))]
+    assert triangle_multiset(vertices, faces) == triangle_multiset(vertices, shuffled)
+    # Each entry is one complete ordered triangle, not an individual vertex occurrence.
+    entries = triangle_multiset(vertices, faces)
+    assert len(entries) == len(faces)
+    assert all(len(entry) == 3 and all(len(point) == 3 for point in entry) for entry in entries)
+
+
+def test_fidelity_comparison_rejects_a_partition_of_altered_connectivity(tmp_path):
+    """The end-to-end fidelity comparison stays conservative about connectivity."""
+    vertices, faces = spread(3)
+    manifest, _ = partition_mesh(vertices, faces, 10.0, tmp_path / 'mesh_chunks',
+                                 reconstruction_mode='full')
+    tiled_vertices, tiled_faces = load_tiles(tmp_path / 'mesh_chunks', manifest)
+    altered = tiled_faces.copy()
+    altered[0] = altered[0][[0, 2, 1]]  # flip one triangle's winding
+    assert triangle_multiset(tiled_vertices, altered) != triangle_multiset(vertices, faces)
+    assert triangle_multiset(tiled_vertices, tiled_faces) == triangle_multiset(vertices, faces)
+
+
 def test_face_orientation_and_vertex_coordinates_are_unchanged(tmp_path):
     vertices, faces = cubes([0.0, 0.0, 0.0], [30.0, 0.0, 0.0])
     manifest, _ = partition_mesh(vertices, faces, 10.0, tmp_path / 'mesh_chunks',
@@ -265,6 +333,67 @@ def test_large_triangle_sets_are_classified_in_bounded_batches(monkeypatch, tmp_
     # Two bounded passes: one to count cells, one to spool their face references.
     assert len(passes) == 2 * -(-len(faces) // 256)
     assert totals['total_faces'] == len(faces)
+
+
+@pytest.mark.parametrize('dtype', [np.float32, np.float64])
+def test_cell_keys_memory_scales_with_the_face_batch_not_the_vertex_count(dtype):
+    """One small face batch must not widen the whole source vertex array to float64."""
+    count = 4_000_000
+    vertices = np.zeros((count, 3), dtype=dtype)
+    vertices[[0, 1, 2]] = [[0, 0, 0], [30, 0, 0], [0, 30, 0]]
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    tracemalloc.start()
+    try:
+        keys = module.cell_keys(vertices, faces, 10.0, 0, 1)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert keys.tolist() == [[1, 1, 0]]
+    # Widening all 4M vertices would need about 96 MB; gathering only this batch needs bytes.
+    assert peak < 1_000_000
+
+
+@pytest.mark.parametrize('dtype', [np.float32, np.float64])
+def test_cell_keys_peak_grows_with_the_batch_and_the_result_stays_correct(dtype):
+    """Peak follows the batch size, and results are unchanged by the narrow-batch order."""
+    count = 3_000_000
+    vertices = np.zeros((count, 3), dtype=dtype)
+    vertices[[0, 1, 2]] = [[0, 0, 0], [3, 0, 0], [0, 3, 0]]
+    vertices[[3, 4, 5]] = [[40, 0, 0], [43, 0, 0], [40, 3, 0]]
+    faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    peaks = []
+    for stop in (1, 2):
+        tracemalloc.start()
+        try:
+            keys = module.cell_keys(vertices, faces, 10.0, 0, stop)
+            peaks.append(tracemalloc.get_traced_memory()[1])
+        finally:
+            tracemalloc.stop()
+        assert keys.tolist() == [[0, 0, 0], [4, 0, 0]][:stop]
+    # Memory tracks the two-vertex batch, not the three million source vertices.
+    assert max(peaks) < 1_000_000
+
+
+def test_partition_mesh_does_not_pay_for_a_full_float64_vertex_copy(tmp_path):
+    """A whole partition over a huge float32 mesh stays far below a full float64 widening.
+
+    The remaining peak comes from ``validate_mesh``'s own single boolean ``isfinite``
+    pass over the source mesh, which is unchanged and out of this fix's scope.
+    """
+    count = 4_000_000
+    vertices = np.zeros((count, 3), dtype=np.float32)
+    vertices[[0, 1, 2]] = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    full_float64_copy = count * 3 * 8  # about 96 MB for this source
+    tracemalloc.start()
+    try:
+        manifest, totals = partition_mesh(vertices, faces, 10.0, tmp_path / 'mesh_chunks',
+                                          reconstruction_mode='full')
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert manifest['total_chunks'] == 1 and totals['total_faces'] == 1
+    assert peak < full_float64_copy / 4
 
 
 def test_only_one_tile_geometry_is_materialized_at_a_time(monkeypatch, tmp_path):

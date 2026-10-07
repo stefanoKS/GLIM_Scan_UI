@@ -13,9 +13,10 @@ winding and world metres survive unchanged. A triangle may therefore extend past
 nominal cell, and neighbouring tiles share duplicated vertex coordinates without
 being topologically welded.
 
-Memory stays bounded: faces are classified in batches, per-cell face references are
-spooled to disk through a bounded number of open handles, and one cell at a time is
-materialized, compacted and written.
+Memory stays bounded: faces are classified in batches, only the vertices a batch
+references are widened to float64 (never the whole source array), per-cell face
+references are spooled to disk through a bounded number of open handles, and one cell
+at a time is materialized, compacted and written.
 """
 from pathlib import Path
 import tempfile
@@ -36,11 +37,16 @@ _CELL_DTYPE = np.dtype([('i', '<i8'), ('j', '<i8'), ('k', '<i8')])
 def cell_keys(vertices, faces, size, start, stop):
     """Grid cell indices of the centroids of the faces in ``[start, stop)``.
 
+    Only the vertices this batch references are gathered and widened to float64, so the
+    peak allocation follows the bounded face batch instead of the whole source mesh.
+
     Centroids are summed in float64 so a centroid exactly on a grid line floors to
     the cell that starts there, and negative coordinates stay correct because floor
     (not int truncation) rounds towards minus infinity.
     """
-    centroids = np.asarray(vertices, dtype=np.float64)[np.asarray(faces)[start:stop]].mean(axis=1)
+    batch = np.asarray(faces)[start:stop]
+    # copy=False keeps an already-float64 selection from being duplicated for nothing.
+    centroids = np.asarray(vertices)[batch].astype(np.float64, copy=False).mean(axis=1)
     return np.floor(centroids / size).astype(np.int64)
 
 
