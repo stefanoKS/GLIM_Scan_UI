@@ -1,5 +1,5 @@
 """Official GLIM tools, launched against derived working copies."""
-import json, shutil, uuid
+import hashlib, json, shutil, uuid
 from pathlib import Path
 from .storage import atomic_json, now, read_json
 
@@ -15,6 +15,23 @@ CATALOG = [
 def validate_dump(path):
     if not (path/'graph.bin').is_file() or not (path/'graph.txt').is_file(): raise ValueError('A saved GLIM dump is required')
     if any(p.is_symlink() for p in path.rglob('*')): raise ValueError('Symlinks are not accepted inside an editable dump')
+
+def fingerprint(path):
+    path = Path(path)
+    if not path.is_dir() or path.is_symlink(): raise ValueError('Saved map is unavailable')
+    digest = hashlib.sha256()
+    for entry in sorted(path.rglob('*')):
+        if entry.is_symlink(): raise ValueError('Symlinks are not accepted inside a saved map')
+        if entry.is_file():
+            digest.update(str(entry.relative_to(path)).encode('utf-8'))
+            with entry.open('rb') as source:
+                for block in iter(lambda: source.read(1024 * 1024), b''): digest.update(block)
+    return digest.hexdigest()
+
+def file_fingerprint(path):
+    path = Path(path)
+    if not path.is_file() or path.is_symlink(): raise ValueError('Saved map trajectory is unavailable')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 def prepare(root,primary_session,primary_run,sources,kind):
     if kind not in ('offline_viewer','map_editor'): raise ValueError('Unsupported map editing tool')
@@ -37,7 +54,7 @@ def prepare(root,primary_session,primary_run,sources,kind):
             if isinstance(v,dict): v.update(viewer_width=1280,viewer_height=720)
         atomic_json(cfg/'config_viewer.json',view)
         copies.append(str(copy))
-    metadata=dict(id=workspace.name,tool=kind,state='prepared',created_at=now(),source_session=primary_session.name,source_run=primary_run,maps=copies,sources=[{k:str(v) for k,v in s.items()} for s in sources],save_target=str(workspace/'saved_map'),note='Work on the copied maps. Native Save is required; closing a window does not save changes.')
+    metadata=dict(id=workspace.name,tool=kind,state='prepared',created_at=now(),source_session=primary_session.name,source_run=primary_run,maps=copies,sources=[{k:str(v) for k,v in s.items()} for s in sources],save_target=str(workspace/'saved_map'),pose_policy='map_editor_fixed_poses' if kind=='map_editor' else 'offline_viewer_may_optimize',note='Work on the copied maps. Native Save As to saved_map is required; closing a window does not save changes.')
     atomic_json(workspace/'workspace.json',metadata)
     return workspace,metadata
 

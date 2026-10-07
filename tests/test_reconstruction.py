@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 import numpy as np
 import pytest
-from factory_mapping.reconstruction import (DEFAULT_VOXEL_SIZE_M, parser, sample_records,
-    save_inputs, transform_points, voxel_indices, prepare)
+from factory_mapping.reconstruction import (DEFAULT_VOXEL_SIZE_M, edited_ply_points,
+    filter_records_by_edited_geometry, parser, sample_records, save_inputs, transform_points,
+    voxel_indices, prepare)
 from factory_mapping.api import ReconstructionRequest
 
 
@@ -38,6 +39,34 @@ def test_pairing_order_and_determinism(size):
         np.testing.assert_array_equal(a[name],data[name][indices])
         np.testing.assert_array_equal(a[name],b[name])
         if size == 0: np.testing.assert_array_equal(a[name],data[name])
+
+
+def test_edited_geometry_filter_retains_boundary_and_pairs_before_sampling(tmp_path):
+    data=records()
+    data['points']=np.array([[0.,0.,0.],[.1,0.,0.],[.100001,0.,0.],[-.1,0.,0.],[1.,0.,0.],[2.,0.,0.]])
+    export=tmp_path/'saved_cleanup.ply'
+    export.write_bytes(b'ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n'+np.array([[0,0,0]],dtype='<f4').tobytes())
+    edited,index=edited_ply_points(export)
+    assert index['reference_points']==1
+    filtered,metadata=filter_records_by_edited_geometry(data,edited,.1,lambda _:None)
+    retained=np.array([0,1,3])
+    assert metadata['points_before_filter']==6 and metadata['points_after_filter']==3
+    for name,values in data.items(): np.testing.assert_array_equal(filtered[name],values[retained])
+    selected=sample_records(filtered,.2)
+    assert len(selected['points'])==2
+    for name in data: np.testing.assert_array_equal(selected[name],filtered[name][[0,2]])
+    save_inputs(filtered,tmp_path/'prepared',.2,metadata_extra=metadata)
+    assert (tmp_path/'prepared/validation/reconstructed_from_bag.ply').is_file()
+    assert json.loads((tmp_path/'prepared/validation/comparison.json').read_text())['points_after_filter']==3
+    with pytest.raises(ValueError,match='zero raw observations'):
+        filter_records_by_edited_geometry(data,np.array([[20.,0.,0.]]),.01,lambda _:None)
+
+
+def test_edited_geometry_filter_rejects_invalid_tolerance_and_empty_reference():
+    for tolerance in (0,-1,float('nan'),float('inf')):
+        with pytest.raises(ValueError): filter_records_by_edited_geometry(records(),np.array([[0.,0.,0.]]),tolerance,lambda _:None)
+    with pytest.raises(ValueError,match='no retained points'):
+        filter_records_by_edited_geometry(records(),np.empty((0,3)),.1,lambda _:None)
 
 
 @pytest.mark.parametrize('size', [-1,float('nan'),float('inf')])
@@ -104,6 +133,41 @@ def test_job_passes_parameter_and_preserves_exports(root,monkeypatch):
     with pytest.raises(ValueError): asyncio.run(start(service,m['id'],'../traj_lidar.txt',.01))
 
 
+def test_saved_edit_source_validates_frame_provenance_and_paths(root):
+    from factory_mapping.service import Service
+    from factory_mapping.reconstruction_jobs import saved_edit_source
+    from factory_mapping.glim_tools import file_fingerprint, fingerprint
+    from factory_mapping.storage import atomic_json
+    service=Service(root,mock=True);session=service.sessions.create('saved edit','',service.config);folder=service.sessions.get(session['id'])
+    workspace=folder/'edits'/'edit_012345abcdef';saved=workspace/'saved_map';original=workspace/'map_01'
+    for dump in (saved,original):
+        dump.mkdir(parents=True);(dump/'graph.bin').write_bytes(b'graph');(dump/'graph.txt').write_text('num_submaps: 1');(dump/'traj_lidar.txt').write_text('0 0 0 0 0 0 0 1\n1 1 0 0 0 0 0 1\n')
+    export=folder/'exports'/'saved_cleanup.ply';export.write_bytes(b'ply')
+    atomic_json(workspace/'workspace.json',{'tool':'map_editor','pose_policy':'map_editor_fixed_poses','sources':[{'session':session['id'],'run':'run_001'}]})
+    atomic_json(workspace/'export.json',{'state':'completed','edit_id':workspace.name,'source_session':session['id'],'export_path':'exports/saved_cleanup.ply','saved_map_fingerprint':fingerprint(saved),'trajectory_fingerprint':file_fingerprint(saved/'traj_lidar.txt')})
+    source=saved_edit_source(service,folder,workspace.name,.05)
+    assert source['trajectory']==saved/'traj_lidar.txt' and source['export']==export
+    (saved/'graph.bin').write_bytes(b'changed graph')
+    with pytest.raises(ValueError,match='changed after export'):
+        saved_edit_source(service,folder,workspace.name,.05)
+    (saved/'graph.bin').write_bytes(b'graph')
+    (saved/'traj_lidar.txt').write_text('0 1 0 0 0 0 0 1\n1 2 0 0 0 0 0 1\n')
+    with pytest.raises(ValueError,match='differs'):
+        saved_edit_source(service,folder,workspace.name,.05)
+    (saved/'traj_lidar.txt').write_text((original/'traj_lidar.txt').read_text())
+    metadata=json.loads((workspace/'workspace.json').read_text());metadata['sources'].append({'session':session['id'],'run':'run_002'});atomic_json(workspace/'workspace.json',metadata)
+    with pytest.raises(ValueError,match='single-session'):
+        saved_edit_source(service,folder,workspace.name,.05)
+    metadata['sources']=metadata['sources'][:1];atomic_json(workspace/'workspace.json',metadata)
+    exported=json.loads((workspace/'export.json').read_text());exported['export_path']='../outside.ply';atomic_json(workspace/'export.json',exported)
+    with pytest.raises(ValueError,match='provenance is invalid'):
+        saved_edit_source(service,folder,workspace.name,.05)
+    original.rename(workspace/'map_copy')
+    original.symlink_to('map_copy',target_is_directory=True)
+    with pytest.raises(ValueError,match='cannot contain symlinks'):
+        saved_edit_source(service,folder,workspace.name,.05)
+
+
 def test_ui_units_and_advanced_scope():
     root=Path(__file__).resolve().parents[1]
     html=(root/'ui/frontend/index.html').read_text()
@@ -111,7 +175,10 @@ def test_ui_units_and_advanced_scope():
     advanced=section.split('<details>')[1].split('</details>')[0]
     assert 'id="voxel-size-cm"' in advanced and 'value="1.0"' in advanced
     assert 'min="0.2"' in advanced and 'max="20"' in advanced
-    assert 'voxel_size_m:cm/100.0' in (root/'ui/frontend/app.js').read_text()
+    app=(root/'ui/frontend/app.js').read_text()
+    assert 'voxel_size_m:cm/100.0' in app
+    assert 'filter_edited_geometry:filtering' in app and 'filter_tolerance_m:tolerance' in app
+    assert 'id="filter-edited-geometry"' in section and 'id="edited-source"' in section
 
 
 def test_api_preparation_default_and_overrides(root, monkeypatch):

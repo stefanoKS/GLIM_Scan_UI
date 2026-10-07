@@ -10,6 +10,9 @@ import numpy as np
 from .storage import atomic_json
 
 DEFAULT_VOXEL_SIZE_M = 0.01
+FILTER_QUERY_BATCH_SIZE = 250_000
+MAX_EDITED_REFERENCE_POINTS = 2_000_000
+REFERENCE_INDEX_BYTES_PER_POINT = 88
 
 
 def validate_voxel_size(value):
@@ -17,6 +20,103 @@ def validate_voxel_size(value):
     if not math.isfinite(value) or value < 0:
         raise ValueError('Voxel size must be finite and nonnegative, in meters (0 disables sampling)')
     return value
+
+
+def validate_filter_tolerance(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError('Edited-geometry tolerance must be a positive, finite distance in meters')
+    return value
+
+
+def edited_ply_points(path):
+    """Read the official binary PLY export through a memmap, without a scene matrix."""
+    path = Path(path)
+    try:
+        with path.open('rb') as source:
+            header = bytearray()
+            while len(header) < 65536:
+                line = source.readline()
+                if not line:
+                    raise ValueError('Edited-map export has no complete PLY header')
+                header.extend(line)
+                if line == b'end_header\n':
+                    break
+            else:
+                raise ValueError('Edited-map export PLY header is too large')
+            data_offset = source.tell()
+    except OSError as error:
+        raise ValueError('Saved edited-map export is unavailable') from error
+    lines = header.decode('ascii', 'strict').splitlines()
+    if len(lines) < 3 or lines[0] != 'ply' or lines[1] != 'format binary_little_endian 1.0':
+        raise ValueError('Saved edited-map export must be a binary little-endian PLY')
+    count = None
+    properties = []
+    in_vertex = False
+    for line in lines[2:]:
+        fields = line.split()
+        if fields[:1] == ['element']:
+            if len(fields) != 3:
+                raise ValueError('Saved edited-map export has an invalid PLY element')
+            in_vertex = fields[1] == 'vertex'
+            if in_vertex:
+                count = int(fields[2])
+                properties = []
+        elif in_vertex and fields[:1] == ['property']:
+            if len(fields) != 3 or fields[1] == 'list':
+                raise ValueError('Saved edited-map export has unsupported vertex properties')
+            properties.append((fields[2], fields[1]))
+    if count is None or count <= 0:
+        raise ValueError('Saved edited-map export contains no retained points')
+    estimate = count * REFERENCE_INDEX_BYTES_PER_POINT
+    if count > MAX_EDITED_REFERENCE_POINTS or estimate > 256 * 1024**2:
+        raise ValueError(f'Saved edited-map export has {count:,} points; its spatial index would need about {estimate / 1024**2:.0f} MiB. Export a smaller cleanup region before filtering.')
+    types = {'char':'i1', 'uchar':'u1', 'short':'i2', 'ushort':'u2', 'int':'i4', 'uint':'u4',
+             'float':'f4', 'float32':'f4', 'double':'f8', 'float64':'f8'}
+    try:
+        dtype = np.dtype([(name, '<' + types[kind]) for name, kind in properties])
+        if not {'x', 'y', 'z'} <= set(dtype.names):
+            raise ValueError('Saved edited-map export needs x, y, and z vertex properties')
+        expected = data_offset + count * dtype.itemsize
+        if path.stat().st_size < expected:
+            raise ValueError('Saved edited-map export is incomplete')
+        vertices = np.memmap(path, dtype=dtype, mode='r', offset=data_offset, shape=(count,))
+        points = np.column_stack((vertices['x'], vertices['y'], vertices['z'])).astype(np.float64)
+    except (TypeError, ValueError, OSError) as error:
+        raise ValueError('Saved edited-map export has unsupported or incomplete vertex data') from error
+    if not np.isfinite(points).all():
+        raise ValueError('Saved edited-map export contains non-finite points')
+    return points, dict(reference_points=count, estimated_index_bytes=estimate)
+
+
+def filter_records_by_edited_geometry(records, edited_points, tolerance_m, progress=print):
+    """Approximate retained geometry with bounded nearest-neighbour queries."""
+    tolerance_m = validate_filter_tolerance(tolerance_m)
+    count = len(records['points'])
+    if any(len(values) != count for values in records.values()):
+        raise ValueError('Measurement attribute arrays must have identical lengths')
+    if not len(edited_points):
+        raise ValueError('Saved edited-map export contains no retained points')
+    from scipy.spatial import cKDTree
+    progress(f'Building edited-geometry reference index for {len(edited_points):,} points')
+    index = cKDTree(edited_points, compact_nodes=True, balanced_tree=True)
+    retained = np.zeros(count, dtype=bool)
+    query_limit = np.nextafter(tolerance_m, math.inf)
+    for start in range(0, count, FILTER_QUERY_BATCH_SIZE):
+        stop = min(start + FILTER_QUERY_BATCH_SIZE, count)
+        distances, _ = index.query(records['points'][start:stop], k=1,
+                                   distance_upper_bound=query_limit, workers=1)
+        retained[start:stop] = np.isfinite(distances) & (distances <= tolerance_m)
+        progress(f'Filtering retained edited geometry: {stop:,}/{count:,} raw observations')
+    after = int(retained.sum())
+    if not after:
+        raise ValueError('Edited-geometry filtering retained zero raw observations; increase tolerance or verify the saved map frame')
+    ratio = after / count if count else 0.0
+    if ratio < .01:
+        progress(f'Warning: edited-geometry filtering retained only {ratio:.2%} of raw observations')
+    return {name: values[retained] for name, values in records.items()}, dict(
+        points_before_filter=count, points_after_filter=after, filter_retention_ratio=ratio,
+        filter_note='Approximate retained-geometry filtering; NKSR can still bridge deleted regions.')
 
 
 def voxel_indices(points, voxel_size_m=DEFAULT_VOXEL_SIZE_M):
@@ -291,7 +391,7 @@ def write_ply(path, records):
 
 
 def save_inputs(records, output, voxel_size_m=DEFAULT_VOXEL_SIZE_M,
-                save_full_density=False, progress=print):
+                save_full_density=False, progress=print, metadata_extra=None):
     voxel_size_m = validate_voxel_size(voxel_size_m)
     output = Path(output)
     (output/'input').mkdir(parents=True, exist_ok=False)
@@ -307,6 +407,8 @@ def save_inputs(records, output, voxel_size_m=DEFAULT_VOXEL_SIZE_M,
                     points_after_voxel=after, voxel_reduction_ratio=after/before if before else 0.0,
                     representative_selection='first_measurement_in_acquisition_order',
                     validation_note='Compare spatial agreement with GLIM; different point counts are expected.')
+    if metadata_extra:
+        metadata.update(metadata_extra)
     progress(f'Saving NKSR input: {before:,} → {after:,} measurements')
     np.savez_compressed(output/'input/nksr_input.npz', **selected)
     write_ply(output/'validation/reconstructed_from_bag.ply', selected)
@@ -318,7 +420,8 @@ def save_inputs(records, output, voxel_size_m=DEFAULT_VOXEL_SIZE_M,
 
 
 def prepare(bag, trajectory_path, output, voxel_size_m=DEFAULT_VOXEL_SIZE_M,
-            save_full_density=False, topic='/livox/lidar', progress=print):
+            save_full_density=False, topic='/livox/lidar', progress=print,
+            edited_export=None, filter_tolerance_m=None, provenance=None):
     validate_voxel_size(voxel_size_m)
     trajectory = np.loadtxt(trajectory_path, ndmin=2)
     if (trajectory.shape[1] != 8 or len(trajectory) < 2 or
@@ -327,7 +430,18 @@ def prepare(bag, trajectory_path, output, voxel_size_m=DEFAULT_VOXEL_SIZE_M,
         raise ValueError('Trajectory requires increasing timestamps and finite XYZ / XYZW poses')
     progress('Interpolating trajectory and transforming raw measurements into world space')
     records = read_measurements(bag, trajectory, topic, progress)
-    return save_inputs(records, output, voxel_size_m, save_full_density, progress)
+    metadata_extra = dict(provenance or {})
+    if edited_export is not None:
+        edited_points, index_metadata = edited_ply_points(edited_export)
+        records, filter_metadata = filter_records_by_edited_geometry(records, edited_points,
+                                                                       filter_tolerance_m, progress)
+        metadata_extra.update(index_metadata)
+        metadata_extra.update(filter_metadata)
+        metadata_extra['filter_enabled'] = True
+        metadata_extra['filter_tolerance_m'] = validate_filter_tolerance(filter_tolerance_m)
+    else:
+        metadata_extra['filter_enabled'] = False
+    return save_inputs(records, output, voxel_size_m, save_full_density, progress, metadata_extra)
 
 
 def parser():
@@ -338,6 +452,9 @@ def parser():
     p.add_argument('--voxel-size', type=validate_voxel_size, default=DEFAULT_VOXEL_SIZE_M,
                    help='World-space voxel size in METERS (default: %(default)s = 1 cm; 0 disables sampling)')
     p.add_argument('--save-full-density', action='store_true', help='Also save full-density debug PLY')
+    p.add_argument('--edited-export', type=Path, help='Verified saved-map binary PLY export for approximate filtering')
+    p.add_argument('--filter-tolerance', type=validate_filter_tolerance, help='Positive retained-geometry tolerance in meters')
+    p.add_argument('--provenance-json', type=Path, help='Verified server-generated preparation provenance')
     p.add_argument('--topic', default='/livox/lidar')
     return p
 
@@ -351,8 +468,12 @@ def main():
     def progress(message):
         print(message, flush=True)
         atomic_json(args.output_dir/'progress.json', {'message': message})
+    if (args.edited_export is None) != (args.filter_tolerance is None):
+        raise ValueError('Edited export and filter tolerance must be provided together')
+    provenance = json.loads(args.provenance_json.read_text()) if args.provenance_json else None
     result = prepare(args.bag, args.trajectory, args.output_dir, args.voxel_size,
-                     args.save_full_density, args.topic, progress)
+                     args.save_full_density, args.topic, progress, args.edited_export,
+                     args.filter_tolerance, provenance)
     progress('Preparation complete')
     print(json.dumps(result, indent=2), flush=True)
 

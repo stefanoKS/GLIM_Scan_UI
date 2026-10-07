@@ -101,6 +101,18 @@ The Advanced settings keep these two concepts separate:
   preparation sampling. The existing detail-level setting is retained as requested
   metadata but does not apply with this explicit target. Changing inference
   settings does not invalidate the prepared points; existing NPZ files work unchanged.
+- **Use saved edited geometry (optional, off by default).** Select a completed export
+  from one explicitly saved `map_editor` cleanup and choose a positive retention
+  tolerance in meters. Preparation transforms the raw bag with that saved map's
+  verified trajectory, then retains a raw observation only when its nearest retained
+  exported point is within the tolerance, before preparation voxel sampling. Points,
+  sensor origins, timestamps and intensity stay paired. This is approximate
+  retained-geometry filtering, not an exact deletion mask: NKSR can still bridge a
+  deleted region. Merged/offline-viewer edits, missing exports, changed saved maps,
+  changed trajectories, unsafe paths and mismatched coordinate frames are rejected;
+  no ICP alignment is attempted. The reference index is capped at 2,000,000 exported
+  points (about 256 MiB estimated index memory) to avoid host OOM. Re-export and
+  prepare again after changing a saved cleanup or tolerance.
 
 Manual preparation, from a fresh shell (replace paths with your scan and choose
 a new output directory):

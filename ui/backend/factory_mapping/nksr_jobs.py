@@ -89,9 +89,15 @@ async def reconstruct(service,sid,rid,settings):
     if preparation_state(run,job)!='PREPARED': raise ValueError('Prepare point input first')
     if abs(settings['preparation_voxel_size_m']-job.get('voxel_size_m',.01))>1e-12:
         raise ValueError('Prepared input is stale; prepare again with the selected voxel size')
+    if job.get('filter_edited_geometry'):
+        from .reconstruction_jobs import saved_edit_source
+        source=job.get('edited_geometry_source') or {}
+        current=saved_edit_source(service,service.sessions.get(sid),source.get('edit_id'),source.get('tolerance_m'))
+        if any(current.get(key)!=source.get(key) for key in ('saved_map_fingerprint','trajectory_fingerprint','export_path')):
+            raise ValueError('Prepared input is stale because the saved cleanup source changed; prepare again')
     if service.mock: raise ValueError('Real NKSR requires real prepared input')
     if service.capture.busy or service.active or any(service.pm.active(k) for k in
-            ('nksr','nksr_check','reconstruction','offline','tool','glim','recording')):
+            ('nksr','nksr_check','reconstruction','offline','export','tool','glim','recording')):
         raise ValueError('Finish capture and active processing first')
     python=interpreter(service.root)
     if not python.is_file(): raise ValueError('NKSR_NOT_INSTALLED: run scripts/setup_nksr.sh')

@@ -21,6 +21,9 @@ class ReconstructionRequest(BaseModel):
     trajectory: str
     voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0, allow_inf_nan=False)
     save_full_density: bool=False
+    filter_edited_geometry: bool=False
+    edit_id: str | None=None
+    filter_tolerance_m: float | None=Field(default=None, gt=0, allow_inf_nan=False)
 
 class MeshRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', allow_inf_nan=False)
@@ -287,7 +290,10 @@ def make_app(root=ROOT,mock=None):
         from .reconstruction_jobs import start
         s=app.state.service
         async with s.lock:
-            return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density)
+            if not body.filter_edited_geometry:
+                return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density)
+            return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density,
+                               True, body.edit_id, body.filter_tolerance_m)
 
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)

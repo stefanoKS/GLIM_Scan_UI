@@ -364,14 +364,23 @@ class Service:
         self.require_processing()
         if any(self.pm.active(k) for k in ('recording','glim','offline','export','tool','calibration_record','calibration_tool')): raise ValueError('Close editing and finish processing before export')
         if not os.environ.get('DISPLAY'): raise ValueError('Official GLIM exporter requires a display')
-        workspace=self.edit_workspace(sid,eid); dump=workspace/'saved_map'
+        workspace=self.edit_workspace(sid,eid); metadata=read_json(workspace/'workspace.json',{})
+        if metadata.get('tool')!='map_editor' or len(metadata.get('sources',[]))!=1:
+            raise ValueError('Only a saved single-session map-editor cleanup can be exported for retained-geometry filtering')
+        dump=workspace/'saved_map'
         # Native tools must save explicitly into the displayed output location.
         glim_tools.validate_dump(dump)
+        trajectory=dump/'traj_lidar.txt'
+        if not trajectory.is_file() or trajectory.is_symlink(): raise ValueError('Saved map has no safe trajectory; save the complete map-editor workspace')
         target=self.sessions.get(sid)/'exports'/f'{eid}_{uuid.uuid4().hex[:8]}.ply'
         cfg=dump/'config'
         if not cfg.is_dir(): cfg=workspace/'map_01/config'
         async def done(item):
-            if item['returncode']!=0 or not target.is_file(): raise ValueError('Edited-map export failed; inspect the workspace export.log')
+            if item['returncode']!=0 or not target.is_file() or target.stat().st_size == 0: raise ValueError('Edited-map export failed; inspect the workspace export.log')
+            atomic_json(workspace/'export.json',dict(version=1,state='completed',created_at=now(),edit_id=eid,
+                source_session=sid,tool='map_editor',export_path=str(target.relative_to(self.sessions.get(sid))),
+                saved_map_fingerprint=glim_tools.fingerprint(dump),trajectory_fingerprint=glim_tools.file_fingerprint(trajectory),
+                saved_map_trajectory=str(trajectory.relative_to(workspace))))
         return await self.start_process('export',commands.export(dump,target,cfg),workspace/'export.log',done=done)
     async def background(self):
         while not self.closed:
