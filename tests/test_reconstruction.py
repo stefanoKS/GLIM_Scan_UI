@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import numpy as np
 import pytest
+import factory_mapping.reconstruction as reconstruction
 from factory_mapping.reconstruction import (DEFAULT_VOXEL_SIZE_M, edited_ply_points,
     filter_records_by_edited_geometry, parser, sample_records, save_inputs, transform_points,
     voxel_indices, prepare)
@@ -60,6 +61,14 @@ def test_edited_geometry_filter_retains_boundary_and_pairs_before_sampling(tmp_p
     assert json.loads((tmp_path/'prepared/validation/comparison.json').read_text())['points_after_filter']==3
     with pytest.raises(ValueError,match='zero raw observations'):
         filter_records_by_edited_geometry(data,np.array([[20.,0.,0.]]),.01,lambda _:None)
+
+
+def test_edited_geometry_filter_enforces_memory_limit_only(tmp_path, monkeypatch):
+    export=tmp_path/'saved_cleanup.ply'
+    export.write_bytes(b'ply\nformat binary_little_endian 1.0\nelement vertex 2\nproperty float x\nproperty float y\nproperty float z\nend_header\n')
+    monkeypatch.setattr(reconstruction, 'MAX_EDITED_REFERENCE_INDEX_BYTES', 175)
+    with pytest.raises(ValueError,match='exceeding the 5 GiB limit'):
+        edited_ply_points(export)
 
 
 def test_edited_geometry_filter_rejects_invalid_tolerance_and_empty_reference():

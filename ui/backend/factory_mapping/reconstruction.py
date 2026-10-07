@@ -11,8 +11,8 @@ from .storage import atomic_json
 
 DEFAULT_VOXEL_SIZE_M = 0.01
 FILTER_QUERY_BATCH_SIZE = 250_000
-MAX_EDITED_REFERENCE_POINTS = 2_000_000
 REFERENCE_INDEX_BYTES_PER_POINT = 88
+MAX_EDITED_REFERENCE_INDEX_BYTES = 5 * 1024**3
 
 
 def validate_voxel_size(value):
@@ -69,8 +69,8 @@ def edited_ply_points(path):
     if count is None or count <= 0:
         raise ValueError('Saved edited-map export contains no retained points')
     estimate = count * REFERENCE_INDEX_BYTES_PER_POINT
-    if count > MAX_EDITED_REFERENCE_POINTS or estimate > 256 * 1024**2:
-        raise ValueError(f'Saved edited-map export has {count:,} points; its spatial index would need about {estimate / 1024**2:.0f} MiB. Export a smaller cleanup region before filtering.')
+    if estimate > MAX_EDITED_REFERENCE_INDEX_BYTES:
+        raise ValueError(f'Saved edited-map export has {count:,} points; its spatial index would need about {estimate / 1024**3:.1f} GiB, exceeding the 5 GiB limit. Export a smaller cleanup region before filtering.')
     types = {'char':'i1', 'uchar':'u1', 'short':'i2', 'ushort':'u2', 'int':'i4', 'uint':'u4',
              'float':'f4', 'float32':'f4', 'double':'f8', 'float64':'f8'}
     try:
