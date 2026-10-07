@@ -174,6 +174,62 @@ sensor orientation and angular filtering. The neural field and dual mesh still
 come exclusively from official NKSR; this is not another surface algorithm.
 CPU inference and extraction can be very slow for large clouds.
 
+## Low-RAM independent tiles
+
+The original **Auto**, **Full**, and **Chunked** modes remain unchanged. For large
+scans, select **Low RAM · independent tiles** in Surface Reconstruction's Advanced
+settings and set **Tile edge length (meters)**. The default is 5 m. This is the
+edge length of a world-aligned 3D cube, not the preparation voxel or mesh resolution.
+Existing prepared input can be reused without repeating preparation or GLIM.
+
+This mode partitions paired points and sensor origins onto disk in bounded blocks.
+Each point belongs to exactly one half-open cube, with indices `floor(point / tile_size)`.
+Tiles have no overlap or cross-tile field blending. One fresh subprocess reconstructs
+and extracts one tile, saves its mesh, and exits before the next subprocess starts.
+The coordinator does not load torch, the model, or the entire point cloud into RAM.
+Per-tile inference uses Full mode at the existing 2 cm NKSR target; extraction runs
+on CPU with at most 100,000 field-query points per batch. Device, normal settings,
+and MISE iterations still apply. Detail level, original chunk size, and overlap do not.
+
+The final binary PLY is assembled in blocks, preserving world coordinates and
+adjusting triangle indices. It is **not stitched or guaranteed watertight**:
+independent tile surfaces may have gaps or overlap at their boundaries. Metadata
+records this limitation as `validation_status=WARNING` and `boundary_stitching=false`.
+Use an original mode when globally blended surfaces are more important than memory.
+
+Tile size bounds the spatial problem, not a hard RAM budget. A dense 5 m tile may
+still be too large: try 2 m or 1 m, or fewer MISE iterations. Smaller tiles increase
+process/model startup overhead and boundary artifacts. Tiles with fewer points than
+Normal KNN or no reconstructed surface are recorded as skipped; if all tiles are
+empty, the job fails. Other tile failures stop the job without publishing a final mesh.
+Cancellation stops the active child; successful tile outputs remain for inspection.
+
+Outputs under the run's `output/` directory include:
+
+```text
+tiles.json                         # tile cells, counts, outcomes
+tiles/tile_000001/mesh.ply          # independent tile surface
+tiles/tile_000001/nksr_metadata.json
+tiles/tile_000001/progress.json
+mesh.ply                           # combined mesh, only after all tiles finish
+nksr_metadata.json                  # aggregate settings, counts, boundary warning
+```
+
+Temporary decompressed input and partition files are removed on normal completion,
+handled failure, or cancellation. Allow disk space for those temporary files and
+both tile and combined meshes. An uncatchable kill or power loss can leave temporary
+files; UI retries archive the previous output directory rather than overwrite it.
+Retries currently start again, rather than resume individual tiles.
+
+Manual use with the isolated NKSR interpreter:
+
+```bash
+"$NKSR_PYTHON" tools/nksr_worker.py \
+  --input "path/to/input/nksr_input.npz" \
+  --output "path/to/new-output/mesh.ply" \
+  --mode low_ram --tile-size 5 --device cuda
+```
+
 ## Tests and licensing
 
 ```bash

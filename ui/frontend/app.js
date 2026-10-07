@@ -89,7 +89,8 @@ $('open-viewer').onclick=()=>openTool('offline_viewer');$('open-editor').onclick
 let reconstructionPending=false,reconstructionData=null,reconstructionSession=null;
 function nksrSettings(){
  return {preparation_voxel_size_m:Number($('voxel-size-cm').value)/100.0,mode:$('nksr-mode').value,device:$('nksr-device').value,
-  detail_level:Number($('nksr-detail').value),chunk_size:$('nksr-chunk').value?Number($('nksr-chunk').value):null,
+  detail_level:Number($('nksr-detail').value),chunk_size:$('nksr-mode').value!=='low_ram'&&$('nksr-chunk').value?Number($('nksr-chunk').value):null,
+  tile_size:$('nksr-mode').value==='low_ram'?Number($('nksr-tile').value):5,
   normal_knn:Number($('nksr-knn').value),normal_drop_angle_deg:Number($('nksr-angle').value),mise_iter:Number($('nksr-mise').value)};
 }
 function renderReconstruction(){
@@ -112,13 +113,21 @@ function renderReconstruction(){
  $('nksr-check').disabled=!h||h.status==='NKSR_NOT_INSTALLED'||h.status==='CHECKING'||busy;
  const ready=h?.smoke_passed&&(h.status==='READY'||(h.cpu_ready&&$('nksr-device').value!=='cuda'));
  $('reconstruct-mesh').disabled=!prepared||stale||!ready||busy||!!preparing||!!latestStatus?.capture?.busy;
- $('nksr-detail').disabled=$('nksr-mode').value==='chunked';
+ const lowRam=$('nksr-mode').value==='low_ram';
+ $('nksr-detail').disabled=lowRam||$('nksr-mode').value==='chunked';
+ $('nksr-chunk-label').hidden=lowRam;$('nksr-chunk').disabled=lowRam;
+ $('nksr-tile-label').hidden=!lowRam;$('nksr-tile').disabled=!lowRam;
+ if(lowRam&&!$('nksr-tile').checkValidity())$('reconstruct-mesh').disabled=true;
+ $('nksr-mode-note').textContent=lowRam?'Independent tile boundaries may contain gaps or overlaps. No boundary stitching.':
+  'Auto selects full or chunked inference from point count and available GPU memory. Detail level applies only to full mode. Chunked extraction uses CPU. CPU inference can be very slow.';
  const mesh=job?.mesh;
  $('cancel-mesh').hidden=mesh?.state!=='RUNNING';
  $('nksr-mesh-status').textContent=mesh?`${mesh.stage||mesh.state}${mesh.message?' · '+mesh.message:''}${mesh.progress?.message?' · '+mesh.progress.message:''}`:'NOT_RECONSTRUCTED';
  if(mesh?.state==='COMPLETED'){
   const m=mesh.metadata;
-  $('nksr-mesh-results').append(el('p',`NKSR mesh · ${m.vertex_count.toLocaleString()} vertices · ${m.face_count.toLocaleString()} triangles · ${m.actual_mode}${m.chunk_size?' · '+m.chunk_size+' m chunks':''} · Bounds: ${m.validation_status}`));
+  const modeLabel=m.actual_mode==='low_ram'?`Low RAM · ${m.completed_tiles}/${m.tile_count} tiles · ${m.tile_size_m} m`:m.actual_mode;
+  $('nksr-mesh-results').append(el('p',`NKSR mesh · ${m.vertex_count.toLocaleString()} vertices · ${m.face_count.toLocaleString()} triangles · ${modeLabel}${m.chunk_size?' · '+m.chunk_size+' m chunks':''} · Bounds: ${m.validation_status}`));
+  if(m.validation_note)$('nksr-mesh-results').append(el('p',m.validation_note));
   const button=el('button','Download Mesh');button.onclick=()=>download(`reconstruction/${job.id}/output/mesh.ply`);$('nksr-mesh-results').append(button);
  }
  if(job){const button=el('button','Preparation / reconstruction log');button.onclick=()=>download(`reconstruction/${job.id}/job.log`);$('reconstruction-results').append(button)}
@@ -145,7 +154,7 @@ $('reconstruction-form').onsubmit=async event=>{
  reconstructionPending=true;$('prepare-reconstruction').disabled=true;
  try{await json(`sessions/${selected}/reconstruction`,{trajectory:$('reconstruction-trajectory').value,voxel_size_m:cm/100.0});reconstructionSession=null;await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };
-for(const id of ['voxel-size-cm','reconstruction-trajectory','nksr-input-run','nksr-mode','nksr-device','nksr-detail','nksr-chunk','nksr-knn','nksr-angle','nksr-mise'])$(id).addEventListener('input',renderReconstruction);
+for(const id of ['voxel-size-cm','reconstruction-trajectory','nksr-input-run','nksr-mode','nksr-device','nksr-detail','nksr-chunk','nksr-tile','nksr-knn','nksr-angle','nksr-mise'])$(id).addEventListener('input',renderReconstruction);
 $('nksr-check').onclick=async()=>{try{await json('nksr/check',{device:$('nksr-device').value});await refresh()}catch(e){error(e)}};
 $('reconstruct-mesh').onclick=async()=>{
  if(reconstructionPending)return;reconstructionPending=true;renderReconstruction();

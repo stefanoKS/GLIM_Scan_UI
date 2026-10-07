@@ -8,9 +8,10 @@
 <form id="reconstruction-form"><label>Trajectory<select id="reconstruction-trajectory" required></select></label>
 <details><summary>Advanced</summary>
 <label>Preparation voxel: <input id="voxel-size-cm" type="number" value="1.0" min="0.2" max="20" step="0.1" required/> cm</label>
-<label>Mode<select id="nksr-mode"><option value="auto">Auto</option><option value="full">Full</option><option value="chunked">Chunked</option></select></label>
+<label>Mode<select id="nksr-mode"><option value="auto">Auto</option><option value="full">Full</option><option value="chunked">Chunked</option><option value="low_ram">Low RAM · independent tiles</option></select></label>
 <label>Detail level<input id="nksr-detail" type="number" value="0.5" min="0" max="1" step="0.1"/></label>
-<label>Chunk size (meters)<input id="nksr-chunk" type="number" min="0.1" step="0.1" placeholder="Auto"/></label>
+<label id="nksr-chunk-label">Chunk size (meters)<input id="nksr-chunk" type="number" min="0.1" step="0.1" placeholder="Auto"/></label>
+<label id="nksr-tile-label" hidden>Tile edge length (meters)<input id="nksr-tile" type="number" value="5" min="0.1" step="0.1" required disabled/></label>
 <label>Normal KNN<input id="nksr-knn" type="number" value="64" min="1" max="1024"/></label>
 <label>Normal angle threshold (degrees)<input id="nksr-angle" type="number" value="85" min="0.1" max="90" step="0.1"/></label>
 <label>MISE iterations<input id="nksr-mise" type="number" value="1" min="0" max="4"/></label>

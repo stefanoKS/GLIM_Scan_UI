@@ -10,7 +10,7 @@ import pytest
 from factory_mapping import nksr_jobs as jobs
 from factory_mapping.nksr_worker import (parser, reconstruction_kwargs, classify, WorkerError,
     load_input, execute)
-from factory_mapping.nksr_mesh import write_mesh, inspect_mesh
+from factory_mapping.nksr_mesh import write_mesh, inspect_mesh, merge_meshes
 from factory_mapping.reconstruction_jobs import preparation_state
 from factory_mapping.api import MeshRequest
 from factory_mapping.storage import atomic_json, read_json
@@ -73,6 +73,142 @@ def test_only_valid_triangle_mesh_completes(tmp_path):
     with pytest.raises(ValueError):write_mesh(tmp_path/'bad.ply',np.zeros((3,3)),np.array([[0,1,9]]))
 
 
+def test_streamed_mesh_merge_preserves_coordinates_and_offsets(tmp_path):
+    from plyfile import PlyData
+    vertices=np.array([[0,0,0],[1,0,0],[0,1,0]],dtype=np.float32)
+    faces=np.array([[0,1,2]],dtype=np.int32)
+    sources=[tmp_path/'first.ply',tmp_path/'second.ply']
+    for index,source in enumerate(sources): write_mesh(source,vertices+index*10,faces)
+    output=tmp_path/'combined.ply'
+    stats=merge_meshes(output,sources)
+    assert stats['vertex_count']==6 and stats['face_count']==2
+    assert stats['bounding_box_min']==[0,0,0] and stats['bounding_box_max']==[11,11,10]
+    mesh=PlyData.read(str(output),known_list_len={'face':{'vertex_indices':3}})
+    np.testing.assert_array_equal(mesh['face']['vertex_indices'],[[0,1,2],[3,4,5]])
+    np.testing.assert_array_equal(mesh['vertex']['x'],[0,1,0,10,11,10])
+    with pytest.raises(ValueError,match='already exists'): merge_meshes(output,sources)
+    with pytest.raises(ValueError,match='No tile'): merge_meshes(tmp_path/'empty.ply',[])
+
+
+def test_inspect_mesh_validates_across_blocks(tmp_path):
+    vertices=np.zeros((65539,3),dtype=np.float32)
+    vertices[-1]=[4,5,6]
+    path=tmp_path/'large.ply'
+    write_mesh(path,vertices,np.array([[65536,65537,65538]],dtype=np.int32))
+    assert inspect_mesh(path)['bounding_box_max']==[4,5,6]
+
+
+def test_tile_partition_is_spatial_paired_and_nonoverlapping(tmp_path):
+    from factory_mapping.nksr_tiled import partition_input
+    points=np.array([[-5,0,0],[-.01,0,0],[0,0,0],[4.99,0,0],[5,0,0]],dtype=np.float32)
+    sensors=points+10
+    source=tmp_path/'input.npz';np.savez_compressed(source,points=points,sensor_origins=sensors)
+    tiles,stats=partition_input(source,tmp_path,5,lambda *args,**kwargs:None)
+    assert [tile['cell'] for tile in tiles]==[[-1,0,0],[0,0,0],[1,0,0]]
+    assert [tile['points'] for tile in tiles]==[2,2,1] and stats['input_points']==5
+    recovered=np.concatenate([np.fromfile(tmp_path/(tile['id']+'.bin'),dtype='<f4').reshape(-1,6) for tile in tiles])
+    np.testing.assert_array_equal(recovered[:,:3],points)
+    np.testing.assert_array_equal(recovered[:,3:],sensors)
+
+
+def test_low_ram_tiles_are_sequential_and_merge(tmp_path,monkeypatch):
+    from factory_mapping import nksr_tiled as tiled
+    points=np.array([[0,0,0],[1,0,0],[0,1,0],[10,0,0],[11,0,0],[10,1,0],[20,0,0]],dtype=np.float32)
+    source=tmp_path/'input.npz';np.savez(source,points=points,sensor_origins=points+3)
+    original=source.read_bytes();calls=[];events=[]
+    def run(args):
+        assert '--tile-worker' in args and args[args.index('--mode')+1]=='full'
+        with np.load(args[args.index('--input')+1]) as data:
+            vertices=data['points'];np.testing.assert_array_equal(data['sensor_origins'],vertices+3)
+        output=Path(args[args.index('--output')+1])
+        if calls: assert calls[-1].is_file()
+        write_mesh(output,vertices,np.array([[0,1,2]],dtype=np.int32))
+        atomic_json(Path(args[args.index('--metadata')+1]),{})
+        calls.append(output)
+        return 0
+    monkeypatch.setattr(tiled,'run_tile',run)
+    settings=parser().parse_args(['--input',str(source),'--output',str(tmp_path/'output/mesh.ply'),
+                                  '--mode','low_ram','--tile-size','5','--normal-knn','3'])
+    assert tiled.run_tiled(settings,lambda stage,**kw:events.append((stage,kw)))==0
+    assert len(calls)==2 and inspect_mesh(settings.output)['face_count']==2
+    metadata=read_json(settings.output.parent/'nksr_metadata.json')
+    assert metadata['actual_mode']=='low_ram' and metadata['skipped_tiles']==1
+    assert metadata['boundary_stitching'] is False and metadata['tile_size_m']==5
+    assert events[-1][0]=='COMPLETED' and source.read_bytes()==original
+    assert not list(settings.output.parent.glob('nksr-tiles-*'))
+
+
+def test_low_ram_tile_failure_stops_before_merge(tmp_path,monkeypatch):
+    from factory_mapping import nksr_tiled as tiled
+    source=tmp_path/'input.npz'
+    points=np.array([[0,0,0],[1,0,0],[0,1,0],[10,0,0],[11,0,0],[10,1,0]],dtype=np.float32)
+    np.savez(source,points=points,sensor_origins=points+3)
+    calls=[]
+    def run(args): calls.append(args);return -9
+    monkeypatch.setattr(tiled,'run_tile',run)
+    settings=parser().parse_args(['--input',str(source),'--output',str(tmp_path/'out/mesh.ply'),
+                                  '--mode','low_ram','--normal-knn','3'])
+    with pytest.raises(WorkerError,match='smaller tile size'): tiled.run_tiled(settings,lambda *args,**kw:None)
+    assert len(calls)==1 and not settings.output.exists()
+    assert not list(settings.output.parent.glob('nksr-tiles-*'))
+    assert read_json(settings.output.parent/'tiles.json')['tiles'][0]['state']=='FAILED'
+
+
+def test_tile_worker_bounds_extraction_without_changing_original_modes():
+    torch,nksr,reconstructor,_,_=fake_runtime(0)
+    captured=[]
+    field=SimpleNamespace(to_=lambda device:captured.append(device),
+                          extract_dual_mesh=lambda **kwargs:(captured.append(kwargs) or
+                              SimpleNamespace(v=np.zeros((3,3)),f=np.array([[0,1,2]]))))
+    reconstructor.reconstruct=lambda *args,**kwargs:field
+    for flag in ([],['--tile-worker']):
+        settings=parser().parse_args(['--mode','full',*flag])
+        execute(np.ones((70,3)),np.ones((70,3)),settings,lambda *args,**kwargs:None,
+                torch,nksr,torch.device('cuda'),reconstructor)
+    assert captured==[{'mise_iter':1},'cpu:0',{'mise_iter':1,'max_points':100000}]
+
+
+def test_tile_subprocess_is_reaped_on_cancellation(monkeypatch):
+    from factory_mapping import nksr_tiled as tiled
+    events=[]
+    class Process:
+        def wait(self,timeout=None):
+            events.append(('wait',timeout))
+            if timeout is None: raise WorkerError('CANCELLED','cancelled')
+        def poll(self): return None
+        def terminate(self): events.append('terminate')
+    monkeypatch.setattr(tiled.subprocess,'Popen',lambda args:Process())
+    with pytest.raises(WorkerError,match='cancelled'): tiled.run_tile(['worker'])
+    assert events==[('wait',None),'terminate',('wait',5)]
+
+
+def test_low_ram_coordinator_does_not_load_model_or_whole_input(tmp_path,monkeypatch):
+    from factory_mapping import nksr_worker as worker, nksr_tiled as tiled
+    calls=[]
+    monkeypatch.setattr(worker.sys,'argv',['worker','--mode','low_ram','--input','source.npz',
+                                         '--output',str(tmp_path/'mesh.ply')])
+    monkeypatch.setattr(worker.signal,'signal',lambda *args:None)
+    def forbidden(*args): pytest.fail('Coordinator must not load the model or whole input')
+    monkeypatch.setattr(worker,'runtime',forbidden);monkeypatch.setattr(worker,'load_input',forbidden)
+    monkeypatch.setattr(tiled,'run_tiled',lambda settings,event:(calls.append(settings.mode) or 0))
+    assert worker.main()==0 and calls==['low_ram']
+
+
+def test_empty_tile_does_not_fail_worker(tmp_path,monkeypatch):
+    from factory_mapping import nksr_worker as worker
+    source=tmp_path/'input.npz';np.savez(source,points=np.ones((70,3)),sensor_origins=np.ones((70,3)))
+    torch,nksr,reconstructor,_,_=fake_runtime(0)
+    reconstructor.reconstruct=lambda *args,**kwargs:None
+    monkeypatch.setattr(worker.sys,'argv',['worker','--mode','full','--tile-worker','--input',str(source),
+                                         '--output',str(tmp_path/'mesh.ply')])
+    monkeypatch.setattr(worker.signal,'signal',lambda *args:None)
+    monkeypatch.setattr(worker,'runtime',lambda device:(torch,nksr,torch.device('cuda'),{}))
+    monkeypatch.setattr(worker,'load_model',lambda *args:reconstructor)
+    assert worker.main()==0
+    assert read_json(tmp_path/'nksr_metadata.json')['status']=='EMPTY_TILE'
+    assert not (tmp_path/'mesh.ply').exists()
+
+
 @pytest.fixture
 def prepared(root,monkeypatch):
     from factory_mapping.service import Service
@@ -121,6 +257,18 @@ def test_stale_preparation_and_missing_runtime(prepared,monkeypatch):
     with pytest.raises(ValueError,match='NKSR_NOT_INSTALLED'):
         asyncio.run(jobs.reconstruct(service,sid,run.name,MeshRequest().model_dump()))
     assert preparation_state(run,read_json(run/'job.json'))=='PREPARED'
+
+
+def test_low_ram_settings_reach_worker(prepared,monkeypatch):
+    service,sid,run,_=prepared
+    calls=[]
+    async def start(key,args,*rest): calls.append(args)
+    monkeypatch.setattr(service.pm,'start',start)
+    settings=MeshRequest(mode='low_ram',tile_size=2.5).model_dump()
+    asyncio.run(jobs.reconstruct(service,sid,run.name,settings))
+    assert calls[0][calls[0].index('--mode')+1]=='low_ram'
+    assert calls[0][calls[0].index('--tile-size')+1]=='2.5'
+    assert read_json(run/'mesh_job.json')['settings']['tile_size']==2.5
 
 
 def test_import_only_is_not_ready(prepared):
@@ -235,13 +383,20 @@ def test_failure_classification():
 
 
 @pytest.mark.skipif(os.environ.get('RUN_NKSR_INTEGRATION')!='1',reason='Opt-in real NKSR model/inference test')
-def test_real_nksr_integration(tmp_path):
+@pytest.mark.parametrize('mode',['full','low_ram'])
+def test_real_nksr_integration(tmp_path,mode):
     root=Path(__file__).resolve().parents[1]
     python=jobs.interpreter(root)
     configured=os.environ.get('NKSR_TEST_INPUT')
     saved=root/'.state/nksr-validation-run.txt'
     if not configured and saved.exists(): configured=str(Path(saved.read_text())/'input/nksr_input.npz')
-    if configured:
+    if mode=='low_ram':
+        rng=np.random.default_rng(42);directions=rng.normal(size=(2048,3)).astype(np.float32)
+        directions/=np.linalg.norm(directions,axis=1,keepdims=True)
+        centers=[np.array([2.5,2.5,2.5]),np.array([7.5,2.5,2.5])]
+        points=np.concatenate([directions+center for center in centers]).astype(np.float32)
+        sensors=np.concatenate([directions*3+center for center in centers]).astype(np.float32)
+    elif configured:
         with np.load(configured) as data:
             points=data['points'][:20000];sensors=data['sensor_origins'][:20000]
     else:
@@ -249,12 +404,17 @@ def test_real_nksr_integration(tmp_path):
         points/=np.linalg.norm(points,axis=1,keepdims=True);sensors=points*3
     np.savez(tmp_path/'prepared sample.npz',points=points,sensor_origins=sensors)
     result=subprocess.run([str(python),str(jobs.worker_path()),'--input',str(tmp_path/'prepared sample.npz'),
-                           '--output',str(tmp_path/'mesh.ply'),'--mode','full'],
+                           '--output',str(tmp_path/'mesh.ply'),'--mode',mode],
                           env=jobs.worker_environment(),capture_output=True,text=True,timeout=600)
     assert result.returncode==0,result.stdout+result.stderr
     assert inspect_mesh(tmp_path/'mesh.ply')['face_count']>0
     metadata=read_json(tmp_path/'nksr_metadata.json')
     assert metadata['checkpoint_loaded'] and metadata['vertex_count']>0 and metadata['face_count']>0
+    if mode=='low_ram':
+        assert metadata['tile_count']==2 and metadata['completed_tiles']==2
+        assert metadata['actual_mode']=='low_ram' and metadata['extraction_max_points']==100000
+        manifest=read_json(tmp_path/'tiles.json')
+        assert all(tile['state']=='COMPLETED' for tile in manifest['tiles'])
 
 
 
@@ -280,5 +440,8 @@ def test_api_reconstruction_validation_and_routes(root,monkeypatch):
         url='/api/sessions/session/reconstruction/run_0123456789ab/mesh'
         assert client.post(url,json={'mode':'chunked','chunk_size':5}).status_code==202
         assert calls[-1]['preparation_voxel_size_m']==.01 and calls[-1]['detail_level']==.5
-        for obj in ({'mode':'poisson'},{'chunk_size':-1},{'normal_knn':0},{'normal_drop_angle_deg':91}):
+        assert client.post(url,json={'mode':'low_ram','tile_size':2.5}).status_code==202
+        assert calls[-1]['mode']=='low_ram' and calls[-1]['tile_size']==2.5
+        for obj in ({'mode':'poisson'},{'chunk_size':-1},{'normal_knn':0},{'normal_drop_angle_deg':91},
+                    {'mode':'low_ram','tile_size':0},{'tile_size':-1},{'tile_size':'NaN'}):
             assert client.post(url,json=obj).status_code==422

@@ -166,17 +166,24 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
         started = time.monotonic()
         with torch.inference_mode():
             field = reconstructor.reconstruct(xyz, **kwargs)
-            if field is None: raise WorkerError('NKSR_RECONSTRUCTION_FAILED', 'NKSR returned no field after normal filtering')
+            if field is None:
+                raise WorkerError('EMPTY_TILE' if settings.tile_worker else 'NKSR_RECONSTRUCTION_FAILED',
+                                  'NKSR returned no field after normal filtering')
             reconstruct_seconds = time.monotonic()-started
             del xyz, sensor, kwargs
             # Official small-memory recipe: CPU extraction, no silent CPU inference fallback.
-            if current_mode == 'chunked':
-                event('EXTRACTING_MESH', extraction_device='cpu', message='Chunked mesh extraction uses CPU and may be slow')
+            if current_mode == 'chunked' or settings.tile_worker:
+                message='Independent tile extraction on CPU' if settings.tile_worker else 'Chunked mesh extraction uses CPU and may be slow'
+                event('EXTRACTING_MESH', extraction_device='cpu', message=message)
                 field.to_('cpu:0'); reconstructor.network.to('cpu:0')
                 if device.type == 'cuda': torch.cuda.empty_cache()
             else: event('EXTRACTING_MESH', extraction_device=str(device))
             started = time.monotonic()
-            mesh = field.extract_dual_mesh(mise_iter=settings.mise_iter)
+            extraction=dict(mise_iter=settings.mise_iter)
+            if settings.tile_worker: extraction['max_points']=100000
+            mesh = field.extract_dual_mesh(**extraction)
+            if settings.tile_worker and (not len(mesh.v) or not len(mesh.f)):
+                raise WorkerError('EMPTY_TILE','Tile produced no triangles')
             def array(value): return value.detach().cpu().numpy() if hasattr(value,'detach') else np.asarray(value)
             vertices = array(mesh.v)
             if current_mode == 'chunked': vertices = vertices / scale
@@ -219,7 +226,9 @@ def parser():
     p.add_argument('--check', action='store_true', help='Real pretrained model + inference + mesh smoke test')
     p.add_argument('--health-output', type=Path)
     p.add_argument('--device', choices=['auto','cuda','cpu'], default='auto')
-    p.add_argument('--mode', choices=['auto','full','chunked'], default='auto')
+    p.add_argument('--mode', choices=['auto','full','chunked','low_ram'], default='auto')
+    p.add_argument('--tile-size', type=float, default=5., help='Independent low-RAM tile edge length in meters')
+    p.add_argument('--tile-worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--detail-level', type=float, default=.5)
     p.add_argument('--chunk-size', type=float)
     p.add_argument('--overlap-ratio', type=float, default=.05)
@@ -233,7 +242,9 @@ def main():
     settings = parser().parse_args()
     if not (0 <= settings.detail_level <= 1 and 0 <= settings.overlap_ratio < 1 and
             0 < settings.normal_drop_angle_deg <= 90 and settings.normal_knn > 0 and
-            0 <= settings.mise_iter <= 4 and (settings.chunk_size is None or np.isfinite(settings.chunk_size) and settings.chunk_size > 0)):
+            0 <= settings.mise_iter <= 4 and np.isfinite(settings.tile_size) and settings.tile_size > 0 and
+            (not settings.tile_worker or settings.mode=='full') and
+            (settings.chunk_size is None or np.isfinite(settings.chunk_size) and settings.chunk_size > 0)):
         raise SystemExit('Invalid reconstruction settings')
     stage = 'LOADING_INPUT'; metadata = {'python':sys.executable}; started=time.monotonic()
     def event(next_stage, **fields):
@@ -254,6 +265,9 @@ def main():
             settings.output=Path(scratch.name)/'mesh.ply'
         else:
             if not settings.input or not settings.output: raise WorkerError('INPUT_INVALID','--input and --output are required')
+            if settings.mode=='low_ram':
+                from .nksr_tiled import run_tiled
+                return run_tiled(settings,event)
             points, sensors=load_input(settings.input)
         if settings.output.exists(): raise WorkerError('MESH_INVALID','Output exists; choose a new output path')
         torch,nksr,device,metadata=runtime(settings.device)
@@ -281,6 +295,11 @@ def main():
                         cpu_ready=device.type=='cpu', smoke_passed=True, checked_at=time.time()))
     except Exception as error:
         code=classify(error,stage)
+        if code=='EMPTY_TILE' and settings.tile_worker:
+            path=settings.metadata or settings.output.parent/'nksr_metadata.json'
+            atomic_json(path,dict(metadata,status='EMPTY_TILE',message=str(error)))
+            event('SKIPPED',message=str(error))
+            return 0
         if isinstance(error,WorkerError): metadata.update(error.details)
         traceback.print_exc()
         event('CANCELLED' if code=='CANCELLED' else 'FAILED',error_type=code,message=str(error))

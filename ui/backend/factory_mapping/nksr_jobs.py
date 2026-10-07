@@ -111,6 +111,7 @@ async def reconstruct(service,sid,rid,settings):
           '--metadata',str(output/'nksr_metadata.json'),'--progress',str(run/'nksr_progress.json')]
     for key in ('device','mode','detail_level','chunk_size','normal_knn','normal_drop_angle_deg','mise_iter','overlap_ratio'):
         if settings.get(key) is not None: args.extend(['--'+key.replace('_','-'),str(settings[key])])
+    if settings.get('mode')=='low_ram': args.extend(['--tile-size',str(settings.get('tile_size',5.))])
     async def done(item):
         progress=read_json(run/'nksr_progress.json',{})
         data.update(ended_at=now(),returncode=item['returncode'])

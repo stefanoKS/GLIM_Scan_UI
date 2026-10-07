@@ -26,9 +26,10 @@ class MeshRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', allow_inf_nan=False)
     preparation_voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0)
     device: Literal['auto','cuda','cpu']='auto'
-    mode: Literal['auto','full','chunked']='auto'
+    mode: Literal['auto','full','chunked','low_ram']='auto'
     detail_level: float=Field(default=.5, ge=0, le=1)
     chunk_size: float | None=Field(default=None, gt=0)
+    tile_size: float=Field(default=5., gt=0)
     overlap_ratio: float=Field(default=.05, ge=0, lt=1)
     normal_knn: int=Field(default=64, ge=1, le=1024)
     normal_drop_angle_deg: float=Field(default=85, gt=0, le=90)
