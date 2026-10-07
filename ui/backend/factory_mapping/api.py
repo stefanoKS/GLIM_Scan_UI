@@ -47,6 +47,14 @@ class ColorizationRequest(BaseModel):
     allow_unvalidated_calibration: bool=False
     transfer_glim: bool=False
     transfer_nksr: bool=False
+    max_color_observations_per_voxel: int | None = Field(default=None, ge=1, le=64)
+    transfer_radius: float | None = Field(default=None, gt=0, le=10)
+    transfer_k: int | None = Field(default=None, ge=1, le=64)
+    depth_edge_rejection: bool=False
+    depth_edge_radius: int | None = Field(default=None, ge=1, le=3)
+    depth_edge_threshold: float | None = Field(default=None, gt=0, le=10)
+    surface_transfer_radius: float | None = Field(default=None, gt=0, le=10)
+    surface_transfer_k: int | None = Field(default=None, ge=1, le=64)
 
 class CaptureAction(BaseModel):
     model_config=ConfigDict(extra='forbid')

@@ -70,3 +70,47 @@ def test_api_colorization_endpoint(root, monkeypatch):
         assert calls[-1][1]['transfer_glim'] is True
         assert client.post('/api/sessions/test/colorization',
                            json={'allow_unvalidated_calibration': 'x'}).status_code == 422
+
+
+def test_colorization_job_forwards_observation_and_transfer_knobs(root, monkeypatch):
+    from factory_mapping.service import Service
+    from factory_mapping.colorization_jobs import start
+    service = Service(root, mock=True)
+    m = service.sessions.create('knobs', '', service.config)
+    session = service.sessions.get(m['id'])
+    (session/'raw_bag').mkdir()
+    (session/'raw_bag/metadata.yaml').write_text('test')
+    config = read_json(session/'active_config.json', {})
+    config['system'] = {'camera': {'enabled': True}}
+    config['camera'] = {'image_topic': '/camera/image_raw', 'camera_info_topic': '/camera/camera_info'}
+    atomic_json(session/'active_config.json', config)
+    calls = []
+
+    async def launch(*args):
+        calls.append(args)
+    monkeypatch.setattr(service.pm, 'start', launch)
+    service.mock = False
+    import asyncio
+    asyncio.run(start(service, m['id'], {
+        'max_color_observations_per_voxel': 2, 'transfer_radius': 0.04, 'transfer_k': 3,
+        'depth_edge_rejection': True, 'depth_edge_radius': 2, 'depth_edge_threshold': 0.1,
+        'surface_transfer_radius': 0.03, 'surface_transfer_k': 4}))
+    argv = calls[0][1]
+    for flag, value in (('--max-color-observations-per-voxel', '2'), ('--transfer-radius', '0.04'),
+                        ('--transfer-k', '3'), ('--depth-edge-radius', '2'),
+                        ('--depth-edge-threshold', '0.1'), ('--surface-transfer-radius', '0.03'),
+                        ('--surface-transfer-k', '4')):
+        assert argv[argv.index(flag) + 1] == value, flag
+    assert '--depth-edge-rejection' in argv
+
+
+def test_colorization_request_rejects_out_of_range_knobs(root):
+    from fastapi.testclient import TestClient
+    from factory_mapping.api import make_app
+    with TestClient(make_app(root, True)) as client:
+        for body in ({'max_color_observations_per_voxel': 0}, {'transfer_k': 0},
+                     {'depth_edge_radius': 9}, {'transfer_radius': 0.0}):
+            assert client.post('/api/sessions/test/colorization', json=body).status_code == 422, body
+        assert client.post('/api/sessions/test/colorization',
+                           json={'max_color_observations_per_voxel': 4, 'depth_edge_rejection': True}
+                           ).status_code != 422

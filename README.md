@@ -84,6 +84,8 @@ scripts/process_bag.sh SESSION_ID --preset jetson_cpu
 
 Optional [NKSR surface reconstruction](docs/nksr.md) uses a separate workstation environment. Preparing point input and reconstructing a mesh are separate steps from GLIM optimized PLY export.
 
+Optional [camera RGB colorization](docs/colorization.md) produces the master colored point cloud and can copy its color onto the GLIM PLY and the NKSR mesh. Automatic target selection is bound to the colorized processing run and refuses to guess when the lineage is ambiguous.
+
 ## Verify this build
 
 The latest recorded implementation run for the camera-selection build (`ba70f6d`, 2026-10-05) reported **178 passed, 1 skipped, 1 warning** on x86_64. The skip was opt-in NKSR inference; native RealSense projection tests ran without physical cameras. JavaScript checks also passed. See [validation history and remaining checks](docs/validation.md). These results do not certify Jetson hardware or sustained 30 FPS recording.
@@ -117,6 +119,7 @@ Run the [four camera hardware cases](docs/camera_auto_resolution.md#jetson-comma
 | [GLIM tools](docs/glim_tools.md) | Native editing, merging and cleanup on the workstation |
 | [Editing and surfacing](docs/editing_and_surfacing.md) | End-to-end saved-map cleanup, export, preparation and NKSR mesh workflow |
 | [NKSR](docs/nksr.md) | Workstation surface preparation, reconstruction and validation |
+| [Colorization](docs/colorization.md) | RGB point cloud, run lineage, bounded observations and color transfer |
 | [Architecture](docs/architecture.md) | Process ownership, snapshots, camera isolation and recovery |
 | [Validation](docs/validation.md) | Dated evidence and hardware limitations |
 | [Upstream contracts](docs/upstream_interfaces.md) | Pinned driver/GLIM interfaces and preset behavior |

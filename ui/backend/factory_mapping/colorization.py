@@ -9,6 +9,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import uuid
 import warnings
 
@@ -120,6 +121,28 @@ def camera_pose(trajectory, camera_time, offset, extrinsic):
     return rotation @ camera_rotation, rotation @ extrinsic[:3] + world[0], lidar_time
 
 
+def pixel_indices(pixels, width, height):
+    """The single integer-pixel convention for projected LiDAR samples.
+
+    Floating pixels are floored to the containing pixel and then clipped into
+    the image, so a sample at ``u = width - 0.2`` cannot produce the invalid
+    index ``width``. Depth-buffer construction and depth-buffer lookup must both
+    use this helper; bilinear RGB sampling keeps using the floating coordinates.
+    """
+    u = np.clip(np.floor(pixels[:, 0]), 0, width - 1).astype(np.int64)
+    v = np.clip(np.floor(pixels[:, 1]), 0, height - 1).astype(np.int64)
+    return u, v
+
+
+def accumulate_depth_buffer(buffer, pixels, depth, valid):
+    """Merge one projection block into an existing per-image depth buffer."""
+    if not valid.any():
+        return buffer
+    u, v = pixel_indices(pixels[valid], buffer.shape[1], buffer.shape[0])
+    np.minimum.at(buffer, (v, u), depth[valid].astype(np.float32))
+    return buffer
+
+
 def project_points(points, rotation, origin, intrinsics, width, height, max_range):
     relative = points.astype(np.float64) - origin
     relative = relative[np.einsum('ij,ij->i', relative, relative) <= max_range**2]
@@ -129,12 +152,13 @@ def project_points(points, rotation, origin, intrinsics, width, height, max_rang
     pixels = camera[:, :2] / camera[:, 2:3] * [fx, fy] + [cx, cy]
     valid = ((pixels[:, 0] >= 0) & (pixels[:, 0] < width) &
              (pixels[:, 1] >= 0) & (pixels[:, 1] < height))
-    pixels, depth = pixels[valid].astype(int), camera[valid, 2]
+    pixels, depth = pixels[valid], camera[valid, 2]
+    u, v = pixel_indices(pixels, width, height)
     # Simple per-pixel z-buffer; a radius-one display dot is not an occlusion model.
     order = np.argsort(depth)
-    _, first = np.unique(pixels[order, 1]*width + pixels[order, 0], return_index=True)
+    _, first = np.unique(v[order]*width + u[order], return_index=True)
     keep = order[first]
-    return pixels[keep], depth[keep]
+    return np.column_stack((u, v))[keep], depth[keep]
 
 
 def bag_images(bag, topic):
@@ -255,6 +279,10 @@ class ColorizationConfig:
     occlusion_range_scale: float = 0.0075
     validation_frames: int = 0
     chunk_points: int = 1_000_000
+    max_color_observations_per_voxel: int = 8
+    depth_edge_rejection: bool = False
+    depth_edge_radius: int = 1
+    depth_edge_threshold: float = 0.05
     fallback_color: tuple = (128, 128, 128)
 
     def validated(self):
@@ -271,6 +299,14 @@ class ColorizationConfig:
             raise ValueError('validation_frames must be an integer between 0 and 1000')
         if type(self.chunk_points) is not int or self.chunk_points <= 0:
             raise ValueError('chunk_points must be a positive integer')
+        if type(self.max_color_observations_per_voxel) is not int or not 1 <= self.max_color_observations_per_voxel <= 64:
+            raise ValueError('max_color_observations_per_voxel must be an integer between 1 and 64')
+        if type(self.depth_edge_rejection) is not bool:
+            raise ValueError('depth_edge_rejection must be a boolean')
+        if type(self.depth_edge_radius) is not int or not 0 <= self.depth_edge_radius <= 3:
+            raise ValueError('depth_edge_radius must be an integer between 0 and 3')
+        if not np.isfinite(self.depth_edge_threshold) or self.depth_edge_threshold <= 0:
+            raise ValueError('depth_edge_threshold must be a positive, finite depth in meters')
         color = tuple(self.fallback_color)
         if len(color) != 3 or not all(type(v) is int and 0 <= v <= 255 for v in color):
             raise ValueError('fallback_color must be three integers between 0 and 255')
@@ -284,6 +320,10 @@ class ColorizationConfig:
                     occlusion_base_tolerance=self.occlusion_base_tolerance,
                     occlusion_range_scale=self.occlusion_range_scale,
                     validation_frames=self.validation_frames, chunk_points=self.chunk_points,
+                    max_color_observations_per_voxel=self.max_color_observations_per_voxel,
+                    depth_edge_rejection=self.depth_edge_rejection,
+                    depth_edge_radius=self.depth_edge_radius,
+                    depth_edge_threshold=self.depth_edge_threshold,
                     fallback_color=list(self.fallback_color))
 
 
@@ -341,6 +381,107 @@ def resolve_lidar_topic(session, explicit):
     return topic
 
 
+def processing_run_id(session, trajectory_path):
+    """GLIM processing run that owns a session trajectory, or ``None``.
+
+    ``session/processing/run_003/glim_dump/traj_lidar.txt`` -> ``run_003``.
+    Trajectories outside ``processing/run_*`` (for example a saved map-editor
+    cleanup under ``edits/``) have no processing run and return ``None``.
+    """
+    if trajectory_path is None:
+        return None
+    try:
+        relative = Path(trajectory_path).resolve().relative_to(Path(session).resolve())
+    except (OSError, ValueError):
+        return None
+    parts = relative.parts
+    if len(parts) >= 2 and parts[0] == 'processing' and re.fullmatch(r'run_\d{3,}', parts[1]):
+        return parts[1]
+    return None
+
+
+def _session_file(session, explicit, kind):
+    """Resolve an explicitly selected input file inside the session."""
+    path = Path(explicit).expanduser()
+    if not path.is_absolute():
+        candidate = session/path
+        path = candidate if candidate.is_file() else path.resolve()
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f'{kind} not found: {explicit}')
+    if session.resolve() not in path.resolve().parents:
+        raise ValueError(f'{kind} must be a file inside this session: {explicit}')
+    return path
+
+
+def resolve_glim_ply(session, explicit=None, trajectory_path=None):
+    """Resolve the GLIM PLY export produced from the same processing run.
+
+    Returns ``(path, provenance)``. Automatic resolution never guesses: the
+    export name records its processing run (``<run_id>_<hex>.ply``), and an
+    unknown or ambiguous lineage is an error rather than "newest file wins".
+    """
+    session = Path(session).resolve()
+    if explicit is not None:
+        path = _session_file(session, explicit, 'GLIM PLY')
+        return path, dict(source_glim_ply=str(path), glim_ply_lineage='explicit')
+    run_id = processing_run_id(session, trajectory_path)
+    if run_id is None:
+        raise ValueError('The colorization trajectory has no GLIM processing run, so the matching '
+                         'export cannot be determined safely. Specify --glim-ply explicitly.')
+    candidates = sorted(entry for entry in (session/'exports').glob(f'{run_id}_*.ply')
+                        if entry.is_file() and not entry.is_symlink())
+    if not candidates:
+        raise ValueError(f'No GLIM PLY export found for {run_id}; export that run or specify '
+                         '--glim-ply explicitly.')
+    if len(candidates) > 1:
+        listing = ', '.join(entry.name for entry in candidates)
+        raise ValueError(f'Multiple GLIM exports exist for {run_id} ({listing}) and the matching '
+                         'source run cannot be determined safely. Specify --glim-ply explicitly.')
+    return candidates[0], dict(source_glim_ply=str(candidates[0]), glim_ply_lineage=run_id)
+
+
+def resolve_nksr_mesh(session, explicit=None, trajectory_path=None):
+    """Resolve the NKSR mesh reconstructed from the same trajectory.
+
+    Returns ``(path, provenance)``. Only reconstruction runs whose ``job.json``
+    references the colorized trajectory are candidates; zero or several
+    candidates raise instead of selecting the newest mesh.
+    """
+    session = Path(session).resolve()
+    if explicit is not None:
+        path = _session_file(session, explicit, 'NKSR mesh')
+        return path, dict(source_nksr_mesh=str(path), nksr_mesh_lineage='explicit',
+                          source_reconstruction_run=None)
+    if trajectory_path is None:
+        raise ValueError('NKSR mesh resolution needs the colorized trajectory; specify --nksr-mesh explicitly.')
+    wanted = Path(trajectory_path).resolve()
+    candidates = []
+    for run in sorted((session/'reconstruction').glob('run_*')):
+        mesh = run/'output/mesh.ply'
+        job = read_json(run/'job.json', {})
+        if (not mesh.is_file() or mesh.is_symlink()
+                or read_json(run/'mesh_job.json', {}).get('state') not in ('COMPLETED', 'completed')
+                or not isinstance(job.get('trajectory'), str)):
+            continue
+        try:
+            referenced = Path(safe_trajectory(session, job['trajectory'])).resolve()
+        except ValueError:
+            continue
+        if referenced == wanted:
+            candidates.append(run)
+    if not candidates:
+        raise ValueError('No NKSR mesh is associated with this colorization trajectory; reconstruct '
+                         'it or specify --nksr-mesh explicitly.')
+    if len(candidates) > 1:
+        listing = ', '.join(run.name for run in candidates)
+        raise ValueError(f'Multiple NKSR meshes exist for this trajectory ({listing}) and the matching '
+                         'run cannot be determined safely. Specify --nksr-mesh explicitly.')
+    run = candidates[0]
+    return run/'output/mesh.ply', dict(source_nksr_mesh=str(run/'output/mesh.ply'),
+                                       nksr_mesh_lineage=run.name,
+                                       source_reconstruction_run=run.name)
+
+
 def transform_world_to_camera(points, rotation, origin):
     """Row-vector world points into camera coordinates: ``P_camera = (P_world - origin) @ R``."""
     return (points.astype(np.float64) - origin) @ rotation
@@ -364,27 +505,54 @@ def project_to_pixels(points, rotation, origin, intrinsics, width, height, min_d
 
 
 def build_depth_buffer(pixels, depth, valid, height, width):
-    """Nearest projected depth per rounded pixel; ``inf`` marks empty pixels."""
-    buffer = np.full((height, width), np.inf, dtype=np.float32)
-    if valid.any():
-        u = np.rint(pixels[valid, 0]).astype(np.int64)
-        v = np.rint(pixels[valid, 1]).astype(np.int64)
-        np.minimum.at(buffer, (v, u), depth[valid].astype(np.float32))
-    return buffer
+    """Nearest projected depth per integer pixel; ``inf`` marks empty pixels."""
+    return accumulate_depth_buffer(np.full((height, width), np.inf, dtype=np.float32),
+                                   pixels, depth, valid)
 
 
 def occlusion_keep(pixels, depth, valid, depth_buffer, base_tolerance, range_scale):
-    """Keep valid projections not significantly behind the front surface."""
+    """Keep valid projections not significantly behind the front surface.
+
+    Uses exactly the same pixel quantization as :func:`build_depth_buffer`.
+    """
     keep = np.zeros(depth.shape[0], dtype=bool)
     if not valid.any():
         return keep
     idx = np.flatnonzero(valid)
-    u = np.rint(pixels[idx, 0]).astype(np.int64)
-    v = np.rint(pixels[idx, 1]).astype(np.int64)
+    u, v = pixel_indices(pixels[idx], depth_buffer.shape[1], depth_buffer.shape[0])
     front = depth_buffer[v, u]
     d = depth[idx]
     tolerance = base_tolerance + range_scale * d
     keep[idx] = d <= front + tolerance
+    return keep
+
+
+def depth_edge_keep(pixels, depth, keep, depth_buffer, radius, threshold):
+    """Optionally reject samples next to a depth discontinuity.
+
+    The center pixel is excluded: the ring neighbourhood only tests how
+    discontinuous the front surface is around the sample, which is what causes
+    color bleeding along pipes, silhouettes and wall edges. Disabled by default
+    (``radius = 0``); this is a heuristic, not an occlusion model.
+    """
+    keep = np.array(keep, dtype=bool)
+    if radius <= 0:
+        return keep
+    idx = np.flatnonzero(keep)
+    if not len(idx):
+        return keep
+    height, width = depth_buffer.shape
+    u, v = pixel_indices(pixels[idx], width, height)
+    d = depth[idx].astype(np.float32)
+    reject = np.zeros(len(idx), dtype=bool)
+    for dv in range(-radius, radius + 1):
+        vv = np.clip(v + dv, 0, height - 1)
+        for du in range(-radius, radius + 1):
+            if du == 0 and dv == 0:
+                continue
+            neighbor = depth_buffer[vv, np.clip(u + du, 0, width - 1)]
+            reject |= np.isfinite(neighbor) & (np.abs(neighbor - d) > threshold)
+    keep[idx] = ~reject
     return keep
 
 
@@ -435,6 +603,133 @@ def fuse_grouped_median(group_ids, rgb, n_groups):
         upper = starts[occupied] + counts_sorted[occupied] // 2
         fused[occupied, channel] = (v_sorted[lower] + v_sorted[upper]) * 0.5
     return fused, counts
+
+
+FUSION_BATCH_ROWS = 500_000
+
+
+def fuse_bounded_observations(table, counts, batch_rows=FUSION_BATCH_ROWS):
+    """Per-channel median fusion of a bounded observation table.
+
+    ``table`` is ``[rows, max_observations, 3]`` with NaN padding and ``counts``
+    holds the number of stored observations per row. The median definition is
+    exactly the one used by :func:`fuse_grouped_median` (mean of the two middle
+    values for an even count), so bounded storage does not change fusion.
+    """
+    table = np.asarray(table, dtype=np.float32)
+    counts = np.asarray(counts, dtype=np.int64)
+    rows = len(counts)
+    if table.ndim != 3 or table.shape[0] < rows or table.shape[2] != 3:
+        raise ValueError('Observation table must be [rows, max_observations, 3]')
+    fused = np.full((rows, 3), np.nan, dtype=np.float32)
+    occupied = counts > 0
+    if not occupied.any():
+        return fused
+    lower, upper = (counts - 1) // 2, counts // 2
+    for start in range(0, rows, batch_rows):
+        stop = min(start + batch_rows, rows)
+        block = slice(start, stop)
+        filled = occupied[block]
+        if not filled.any():
+            continue
+        padding = np.arange(table.shape[1])[None, :] >= counts[block, None]
+        for channel in range(3):
+            values = table[block, :, channel].copy()
+            values[padding] = np.nan  # only the stored observations take part
+            ordered = np.sort(values, axis=1)
+            fused[block, channel][filled] = (ordered[filled, lower[block][filled]] +
+                                            ordered[filled, upper[block][filled]]) * 0.5
+    return fused
+
+
+class BoundedObservationStore:
+    """Deterministic bounded per-voxel storage of camera RGB observations.
+
+    At most ``max_observations`` samples are retained per voxel, in the order
+    they are accepted (camera frames are streamed in recorded order, and within
+    a frame in projected-sample order), so memory scales with
+    ``colored_voxels * max_observations`` instead of the total number of valid
+    projections. Selection is deterministic: no sampling, no random reservoir.
+    """
+
+    GROWTH = 1.5
+
+    def __init__(self, n_voxels, max_observations):
+        if type(n_voxels) is not int or n_voxels < 0:
+            raise ValueError('n_voxels must be a nonnegative integer')
+        if type(max_observations) is not int or max_observations <= 0:
+            raise ValueError('max_observations must be a positive integer')
+        self.n_voxels = n_voxels
+        self.max_observations = max_observations
+        self.dropped = 0
+        self.rows = 0
+        self._row = np.full(n_voxels, -1, dtype=np.int32)
+        self._counts = np.zeros(0, dtype=np.int32)
+        self._table = np.empty((0, max_observations, 3), dtype=np.float32)
+
+    def _reserve(self, needed):
+        if needed <= len(self._counts):
+            return
+        capacity = max(1024, int(len(self._counts) * self.GROWTH) + 1, needed)
+        counts = np.zeros(capacity, dtype=np.int32)
+        counts[:self.rows] = self._counts[:self.rows]
+        table = np.full((capacity, self.max_observations, 3), np.nan, dtype=np.float32)
+        table[:self.rows] = self._table[:self.rows]
+        self._counts, self._table = counts, table
+
+    def add(self, voxel_ids, rgb):
+        """Store observations, keeping the first ``max_observations`` per voxel."""
+        voxel_ids = np.asarray(voxel_ids)
+        rgb = np.asarray(rgb, dtype=np.float32)
+        if voxel_ids.ndim != 1 or rgb.shape != (len(voxel_ids), 3):
+            raise ValueError('Observations need [M] voxel ids and [M,3] float RGB')
+        if not len(voxel_ids):
+            return
+        if voxel_ids.min() < 0 or voxel_ids.max() >= self.n_voxels:
+            raise ValueError('Observation voxel ids are out of range')
+        rows = self._row[voxel_ids]
+        unseen = rows < 0
+        if unseen.any():
+            new_voxels = np.unique(voxel_ids[unseen])
+            self._reserve(self.rows + len(new_voxels))
+            self._row[new_voxels] = np.arange(self.rows, self.rows + len(new_voxels), dtype=np.int32)
+            self.rows += len(new_voxels)
+            rows = self._row[voxel_ids]
+        used = self._counts[rows]
+        accepted = np.flatnonzero(used < self.max_observations)
+        self.dropped += int(len(voxel_ids) - len(accepted))
+        if not len(accepted):
+            return
+        rows = rows[accepted]
+        order = np.argsort(rows, kind='stable')  # group by row, keep batch order inside a group
+        grouped = rows[order]
+        starts = np.flatnonzero(np.r_[True, grouped[1:] != grouped[:-1]])
+        rank = np.arange(len(grouped)) - np.repeat(starts, np.diff(np.r_[starts, len(grouped)]))
+        slots = (self._counts[grouped].astype(np.int64) + rank)
+        room = slots < self.max_observations  # same-frame duplicates can overflow a row
+        self.dropped += int((~room).sum())
+        stored = accepted[order][room]
+        self._table[grouped[room], slots[room]] = rgb[stored]
+        self._counts += np.bincount(grouped[room], minlength=len(self._counts))
+
+    def fusion(self):
+        """Return ``(fused, counts, voxel_rows)`` for the compact row table."""
+        return (fuse_bounded_observations(self._table[:self.rows], self._counts[:self.rows]),
+                self._counts[:self.rows], self._row)
+
+    def voxel_observations(self):
+        """Expand compact fusion results into per-voxel ``(fused, counts)``."""
+        fused, counts, row = self.fusion()
+        voxel_fused = np.full((self.n_voxels, 3), np.nan, dtype=np.float32)
+        voxel_counts = np.zeros(self.n_voxels, dtype=np.int64)
+        filled = row >= 0
+        voxel_fused[filled] = fused[row[filled]]
+        voxel_counts[filled] = counts[row[filled]]
+        return voxel_fused, voxel_counts
+
+    @property
+    def stored(self):
+        return int(self._counts[:self.rows].sum())
 
 
 def write_colored_ply(path, points, rgb_u8, intensity=None):
@@ -520,6 +815,8 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
                      voxel_size=DEFAULT_VOXEL_SIZE_M, max_time_delta=0.15, min_depth=0.0,
                      max_depth=20.0, occlusion_base_tolerance=0.03, occlusion_range_scale=0.0075,
                      validation_frames=0, chunk_points=1_000_000,
+                     max_color_observations_per_voxel=8, depth_edge_rejection=False,
+                     depth_edge_radius=1, depth_edge_threshold=0.05,
                      allow_unvalidated_calibration=False, progress=print, output_dir=None):
     """Run the full camera→LiDAR→master colored point cloud pipeline."""
     import cv2
@@ -529,7 +826,11 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
                                 occlusion_base_tolerance=occlusion_base_tolerance,
                                 occlusion_range_scale=occlusion_range_scale,
                                 validation_frames=validation_frames,
-                                chunk_points=chunk_points).validated()
+                                chunk_points=chunk_points,
+                                max_color_observations_per_voxel=max_color_observations_per_voxel,
+                                depth_edge_rejection=depth_edge_rejection,
+                                depth_edge_radius=depth_edge_radius,
+                                depth_edge_threshold=depth_edge_threshold).validated()
 
     camera, intr, extrinsic, calibration = session_calibration(session, allow_unvalidated_calibration)
     offset = calibration['calibration_time_offset_sec']
@@ -553,6 +854,7 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
     representative, voxel_of_point, voxel_of_representative = _voxel_grouping(points, config.voxel_size)
     n_voxels = len(representative)
 
+    store = BoundedObservationStore(n_voxels, config.max_color_observations_per_voxel)
     order = np.argsort(timestamps, kind='stable')
     sorted_timestamps = timestamps[order]
     trajectory_t0, trajectory_t1 = trajectory[0, 0], trajectory[-1, 0]
@@ -560,9 +862,9 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
     stats = dict(input_point_count=int(len(points)), camera_frame_count=0, frames_projected=0,
                  frames_skipped=0, candidate_projections=0, behind_camera_count=0,
                  out_of_range_count=0, out_of_frame_count=0, valid_projections=0,
-                 occlusion_rejected_count=0, colored_observation_count=0)
-
-    obs_voxel, obs_rgb = [], []
+                 occlusion_rejected_count=0, depth_edge_rejected_count=0,
+                 colored_observation_count=0)
+    validation_records = []
     max_depth_range = config.max_depth
 
     def frames():
@@ -589,9 +891,8 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
         image = image_bgr(msg)
         width, height = msg.width, msg.height
 
-        # Pass 1: project in chunks and build the per-frame depth buffer.
-        buffers = []
-        frame_valid = 0
+        # Pass 1: one depth buffer per image, fed by every projection chunk.
+        depth_buffer = np.full((height, width), np.inf, dtype=np.float32)
         for start in range(0, len(selected), config.chunk_points):
             block = selected[start:start + config.chunk_points]
             _, pixels, depth, masks = project_to_pixels(points[block], rotation, origin,
@@ -602,16 +903,9 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
             stats['out_of_range_count'] += int((masks['finite'] & masks['in_front'] & ~masks['in_range']).sum())
             stats['out_of_frame_count'] += int((masks['finite'] & masks['in_front'] & masks['in_range'] & ~masks['in_bounds']).sum())
             stats['valid_projections'] += int(valid.sum())
-            frame_valid += int(valid.sum())
-            buffers.append((pixels, depth, valid))
-        depth_buffer = np.full((height, width), np.inf, dtype=np.float32)
-        for pixels, depth, valid in buffers:
-            if valid.any():
-                u = np.rint(pixels[valid, 0]).astype(np.int64)
-                v = np.rint(pixels[valid, 1]).astype(np.int64)
-                np.minimum.at(depth_buffer, (v, u), depth[valid].astype(np.float32))
+            accumulate_depth_buffer(depth_buffer, pixels, depth, valid)
 
-        # Pass 2: occlusion test, bilinear sampling and observation accumulation.
+        # Pass 2: that completed buffer decides visibility for every chunk.
         for start in range(0, len(selected), config.chunk_points):
             stop = min(start + config.chunk_points, len(selected))
             block = selected[start:stop]
@@ -621,24 +915,23 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
             keep = occlusion_keep(pixels, depth, masks['valid'], depth_buffer,
                                   config.occlusion_base_tolerance, config.occlusion_range_scale)
             stats['occlusion_rejected_count'] += int(masks['valid'].sum() - keep.sum())
+            if config.depth_edge_rejection:
+                before = int(keep.sum())
+                keep = depth_edge_keep(pixels, depth, keep, depth_buffer,
+                                       config.depth_edge_radius, config.depth_edge_threshold)
+                stats['depth_edge_rejected_count'] += before - int(keep.sum())
             if keep.any():
                 idx = np.flatnonzero(keep)
                 rgb = bilinear_sample_rgb(image, pixels[idx, 0], pixels[idx, 1])
-                obs_voxel.append(voxel_of_point[block[idx]])
-                obs_rgb.append(rgb)
+                store.add(voxel_of_point[block[idx]], rgb)
                 stats['colored_observation_count'] += int(len(idx))
         if stats['frames_projected'] % 50 == 0:
-            progress(f'Frame {stats["frames_projected"]:,}: {frame_valid:,} projected, '
+            progress(f'Frame {stats["frames_projected"]:,}: {stats["valid_projections"]:,} projected, '
                      f'{stats["colored_observation_count"]:,} colored observations')
 
     progress('Fusing multi-view RGB observations')
-    if obs_voxel:
-        all_voxel = np.concatenate(obs_voxel)
-        all_rgb = np.concatenate(obs_rgb)
-    else:
-        all_voxel = np.empty(0, dtype=np.int64)
-        all_rgb = np.empty((0, 3), dtype=np.float32)
-    fused, color_count = fuse_grouped_median(all_voxel, all_rgb, n_voxels)
+    fused, color_count = store.voxel_observations()
+    color_count = color_count.astype(np.int64)
 
     # Reorder voxel-indexed fusion results into acquisition order for output.
     fused = fused[voxel_of_representative]
@@ -650,6 +943,9 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
     final_origins = origins[representative].astype(np.float32)
 
     colored = color_count > 0
+    # color_confidence is observation-support confidence only: the number of
+    # retained valid camera observations per voxel, capped at three, not a
+    # photometric quality measure. Uncolored points stay at zero.
     confidence = np.zeros(n_voxels, dtype=np.float32)
     confidence[colored] = np.clip(color_count[colored] / 3.0, 0.0, 1.0)
     cd = np.where(colored[:, None], fused, np.nan).astype(np.float32)
@@ -669,15 +965,38 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
 
     colored_point_count = int(colored.sum())
     if colored_point_count:
-        mean_obs = float(color_count[colored].mean())
-        median_obs = float(np.median(color_count[colored]))
+        observations = color_count[colored]
+        mean_obs = float(observations.mean())
+        median_obs = float(np.median(observations))
+        max_obs = int(observations.max())
     else:
         mean_obs = median_obs = 0.0
+        max_obs = 0
 
     stats.update(final_point_count=int(n_voxels), colored_point_count=colored_point_count,
                  uncolored_point_count=int(n_voxels - colored_point_count),
                  percentage_colored=100.0 * colored_point_count / n_voxels if n_voxels else 0.0,
-                 mean_observation_count=mean_obs, median_observation_count=median_obs)
+                 mean_observation_count=mean_obs, median_observation_count=median_obs,
+                 raw_lidar_observations=int(len(points)), world_observations=int(len(points)),
+                 camera_frames_seen=stats['camera_frame_count'],
+                 camera_frames_used=stats['frames_projected'],
+                 behind_camera=stats['behind_camera_count'],
+                 out_of_frame=stats['out_of_frame_count'],
+                 occlusion_rejected=stats['occlusion_rejected_count'],
+                 depth_rejected=stats['out_of_range_count'] + stats['occlusion_rejected_count'],
+                 valid_rgb_observations=stats['colored_observation_count'],
+                 observations_dropped_due_to_per_voxel_limit=store.dropped,
+                 final_voxels=int(n_voxels), colored_voxels=colored_point_count,
+                 uncolored_voxels=int(n_voxels - colored_point_count),
+                 coverage_percent=100.0 * colored_point_count / n_voxels if n_voxels else 0.0,
+                 mean_color_observations_per_colored_voxel=mean_obs,
+                 median_color_observations_per_colored_voxel=median_obs,
+                 max_color_observations_per_voxel=max_obs,
+                 max_observations_per_voxel_limit=config.max_color_observations_per_voxel,
+                 voxel_size=config.voxel_size, max_time_delta=config.max_time_delta,
+                 time_offset_sec=offset,
+                 occlusion_base_tolerance=config.occlusion_base_tolerance,
+                 occlusion_range_scale=config.occlusion_range_scale)
 
     if config.validation_frames:
         progress(f'Generating {config.validation_frames} projection validation overlays')
@@ -695,23 +1014,41 @@ def colorize_session(session, trajectory=None, run=None, image_topic=None, lidar
                 continue
             if (msg.width, msg.height) != (camera['width'], camera['height']):
                 raise ValueError('Recorded image dimensions differ from session intrinsics')
-            rotation, origin, _ = camera_pose(trajectory, stamp, offset, extrinsic)
+            rotation, origin, lidar_pose_time = camera_pose(trajectory, stamp, offset, extrinsic)
             overlay = render_projection_overlay(image_bgr(msg), points, rotation, origin,
                                                 intr['intrinsics'], msg.width, msg.height, max_depth_range)
             filename = f'frame_{index:06d}_overlay.jpg'
             if not cv2.imwrite(str(output/'validation'/filename), overlay,
                                [cv2.IMWRITE_JPEG_QUALITY, 92]):
                 raise ValueError(f'Could not write {filename}')
+            validation_records.append(dict(file=filename, bag_frame_index=index,
+                                           camera_timestamp=stamp,
+                                           lidar_pose_timestamp=lidar_pose_time,
+                                           bag_timestamp_ns=bag_ns,
+                                           image_topic=image_topic, time_offset_sec=offset))
             written += 1
         stats['validation_frames_written'] = written
 
     metadata = dict(calibration, image_topic=image_topic, lidar_topic=topic,
+                    camera_info_topic=read_json(session/'active_config.json', {}).get(
+                        'camera', {}).get('camera_info_topic'),
+                    source_session=session.name, source_bag=str(bag),
+                    source_processing_run=processing_run_id(session, trajectory_path),
+                    source_trajectory=str(trajectory_path),
+                    source_glim_ply=None, source_reconstruction_run=None, source_nksr_mesh=None,
+                    camera_calibration=str(calibration['extrinsics_file']),
                     trajectory_path=str(trajectory_path), raw_bag=str(bag),
                     configuration=config.as_dict(), statistics=stats,
                     timestamp_source='recorded Image.header.stamp',
                     temporal_association=f'|point_t - (image_t + offset)| <= max_time_delta',
                     time_offset_sec=offset,
                     fusion='per-channel median',
+                    color_confidence_definition=('observation-support confidence = number of retained '
+                                                 'valid camera observations per voxel, capped at 3; '
+                                                 'no color for count 0'),
+                    observation_selection=('deterministic: first max_color_observations_per_voxel '
+                                           'accepted observations per voxel in recorded frame order'),
+                    validation=validation_records,
                     output=dict(colored_ply=str(output/'output/colored_points.ply'),
                                 colored_npz=str(output/'output/colored_points.npz'),
                                 stats_json=str(output/'output/colorization_stats.json')))

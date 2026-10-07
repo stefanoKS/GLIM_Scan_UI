@@ -205,7 +205,7 @@ NKSR worker exited successfully and the triangle mesh passed validation.
 | --- | --- | --- |
 | `export required` | No completed, fingerprinted edited-map export is available | Save the native edit, close the tool, and export again |
 | `source points have not been allocated` | Upstream GLIM tried to rebuild optimization factors for a nearly empty submap | Restart onto a build with staged edited-map export, then export again |
-| `No module named scipy` | App dependencies were not installed inside `.venv` | Install the pinned requirements into `.venv` and retry preparation |
+| `No module named scipy` | App dependencies were not installed inside `.venv` | Install the pinned requirements (`requirements.lock` includes SciPy) into `.venv` and retry preparation |
 | Spatial index exceeds 5 GiB | The retained edited PLY is too large for the configured preparation guard | Export a smaller cleanup or raise the reviewed memory limit |
 | Preparation stops after transforming frames | A later filtering or save step failed | Open `reconstruction/run_ID/job.log`; transformed frames alone do not mean PREPARED |
 | NKSR READY but preparation FAILED | NKSR health is independent from point preparation | Fix and rerun preparation before starting the mesh worker |

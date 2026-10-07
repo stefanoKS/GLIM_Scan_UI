@@ -229,3 +229,7 @@ done
 The eligible frame interval may change at trajectory boundaries with each offset;
 use the recorded camera timestamps in metadata when comparing runs. There is no
 automatic offset optimization or assertion that an overlay validates calibration.
+
+Actual point colorization and color transfer onto GLIM/NKSR outputs are a separate
+tool described in [colorization](colorization.md); they reuse this calibration and
+the same `Image.header.stamp` + offset association.

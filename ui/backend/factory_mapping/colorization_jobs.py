@@ -8,10 +8,11 @@ from .storage import atomic_json, read_json, now
 SCRIPT = Path(__file__).resolve().parents[3] / 'tools' / 'glim_colorize.py'
 
 # CLI flags passed through from job settings (snake_case -> dash-case).
-BOOLEAN_FLAGS = ('transfer_glim', 'transfer_nksr')
+BOOLEAN_FLAGS = ('transfer_glim', 'transfer_nksr', 'depth_edge_rejection')
 VALUE_FLAGS = ('voxel_size', 'max_time_delta', 'min_depth', 'max_depth',
                'occlusion_base_tolerance', 'occlusion_range_scale',
                'validation_frames', 'chunk_points',
+               'max_color_observations_per_voxel', 'depth_edge_radius', 'depth_edge_threshold',
                'transfer_radius', 'transfer_k',
                'surface_transfer_radius', 'surface_transfer_k')
 
