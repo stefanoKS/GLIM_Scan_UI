@@ -27,6 +27,7 @@ export function showPage(name,hash=true){
 }
 function updateButtons(){
  if(!latest)return;const c=latest.capture,scanning=['PREFLIGHT','SCANNING','FINALIZING'].includes(c.state),isCamera=c.mode==='camera';
+ document.querySelector('[data-page="capture"]').dataset.recording=String(scanning);
  $('start-scan').hidden=scanning&&!isCamera;$('stop-scan').hidden=!scanning||isCamera;
  $('record-camera').hidden=scanning&&isCamera;$('stop-camera-recording').hidden=!scanning||!isCamera;
  $('start-scan').disabled=actionPending||!c.can_start;$('record-camera').disabled=actionPending||!c.can_start||!c.capabilities.camera;
@@ -36,6 +37,7 @@ function updateButtons(){
 }
 export function refreshCapture(s){
  latest=s;const c=s.capture;if(!c)return;const capabilities=c.capabilities,h=s.health;
+ $('capture-page').dataset.state=String(c.state||'').toLowerCase();
  $('rgb-recording-warning').hidden=!!s.config.system.camera.enabled;
  const set=(id,label,ok,text)=>{$(id).textContent=`${ok?'✓':'○'} ${label} · ${text}`;$(id).dataset.ready=String(ok)};
  for(const [key,label] of [['lidar','LiDAR'],['imu','IMU']]){const healthy=['healthy','mock'].includes(h[key]?.state);set('health-'+key,label,healthy,healthy?'Ready':key==='lidar'&&s.detection?.mid360?.detected?'Connected':'Waiting')}

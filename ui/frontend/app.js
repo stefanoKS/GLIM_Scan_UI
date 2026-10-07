@@ -8,7 +8,7 @@ async function api(path,body,method){const r=await fetch('/api/'+path,{method:me
 async function json(path,body,method){return(await api(path,body,method)).json()}
 const bytes=n=>n==null?'—':n>1e9?(n/1e9).toFixed(2)+' GB':(n/1e6).toFixed(1)+' MB';const hz=n=>n==null?'—':n.toFixed(1)+' Hz';const sec=n=>n==null?'—':Math.round(n)+' s';
 function el(tag,text){const e=document.createElement(tag);e.textContent=text;return e}
-async function refresh(){try{const s=await json('status');latestStatus=s;refreshCapture(s);$('mode').textContent=s.mock?'MOCK · simulated data':'LIVE HARDWARE MODE';const x=s.system;
+async function refresh(){try{const s=await json('status');latestStatus=s;refreshCapture(s);$('mode').textContent=s.mock?'MOCK · simulated data':'LIVE HARDWARE MODE';$('mode').dataset.mode=s.mock?'mock':'live';const x=s.system;
 $('system').textContent=`${x.model}\nCPU ${x.cpu_percent}% · RAM ${x.ram_percent}%\nGPU ${x.gpu_percent==null?'unavailable':x.gpu_percent+'%'}\nDisk free ${bytes(x.disk_free)}\n${s.config.sensor.interface}: ${s.config.sensor.host_ip||'no matching wired address'}\nROS domain ${s.config.sensor.ros_domain_id}\nTemperature ${Object.entries(x.temperatures).map(([k,v])=>k+': '+v.join('/')+'°C').join(', ')||'unavailable'}`;
 const l=s.health.lidar||{},i=s.health.imu||{};$('sensor').textContent=`${s.detection?.mid360?.detected?'✓ Mid-360 detected (IP reachable)':'○ Mid-360 not detected'}\nNetwork: ${s.network.state||'checking'}\nDriver: ${s.processes.driver?.state||'stopped'}\n${s.config.sensor.points_topic}\nLiDAR ${l.state}: ${hz(l.hz)}\nPoints/s ${Math.round(l.point_rate||0)}\n${s.config.sensor.imu_topic}\nIMU ${i.state}: ${hz(i.hz)}\nLatest stamp ${l.stamp||'—'}`;
 const g=s.processes.glim;$('glim').textContent=`${s.glim_available?(g?.state||'stopped'):'not installed · record-only available'} · ${s.live_preset?(['jetson_cpu','pc_dense'].includes(s.live_preset)?'CPU':'CUDA'):'—'}\nLoop detection ${s.loop_detection}\nSession ${s.active_session||'none'}\nRuntime ${g?.started_at?sec(((g.ended_at?Date.parse(g.ended_at):Date.now())-Date.parse(g.started_at))/1000):'—'}`;
@@ -16,7 +16,7 @@ $('record').textContent=`${s.processes.recording?.state||'stopped'}\nElapsed ${s
 $('diagnostics').textContent=JSON.stringify({network:s.network,health:s.health,processes:s.processes,errors:s.errors},null,2);
 if(!configured){$('preset').value=s.capture.capabilities.preset;for(const [k,type] of [['lidar_ip','text'],['interface','text'],['points_topic','text'],['imu_topic','text'],['publish_freq','number'],['ros_domain_id','number']]){const label=el('label',k);const input=document.createElement('input');input.name=k;input.type=type;input.value=k==='interface'?(s.config.sensor.interface_setting||s.config.sensor.interface):s.config.sensor[k];label.append(input);$('network').querySelector('.fields').append(label)}configured=true}
 await sessions();await toolsPanel();await refreshCamera(s);if(!previewWS||previewWS.readyState>1)connectPreview();}catch(e){error(e)}}
-async function sessions(){sessionData=await json('sessions');$('sessions').replaceChildren();for(const m of sessionData){const tr=document.createElement('tr');tr.dataset.id=m.id;if(m.id===selected)tr.className='selected';for(const text of [m.name+'\n'+m.created_at,sec(m.duration),bytes(m.bag_size_bytes),m.state,m.notes])tr.append(el('td',text));tr.tabIndex=0;tr.onclick=()=>{selected=m.id;logKey='';sessions().catch(error)};tr.onkeydown=e=>{if(e.key==='Enter')tr.click()};$('sessions').append(tr)}const m=sessionData.find(x=>x.id===selected);$('project-export').disabled=!m||!!latestStatus?.capture?.busy;
+async function sessions(){sessionData=await json('sessions');$('sessions').replaceChildren();for(const m of sessionData){const tr=document.createElement('tr');tr.dataset.id=m.id;tr.dataset.state=String(m.state||'').toLowerCase();if(m.id===selected)tr.className='selected';for(const text of [m.name+'\n'+m.created_at,sec(m.duration),bytes(m.bag_size_bytes),m.state,m.notes])tr.append(el('td',text));tr.tabIndex=0;tr.onclick=()=>{selected=m.id;logKey='';sessions().catch(error)};tr.onkeydown=e=>{if(e.key==='Enter')tr.click()};$('sessions').append(tr)}const m=sessionData.find(x=>x.id===selected);$('project-export').disabled=!m||!!latestStatus?.capture?.busy;
 if(editLoadedId!==selected){$('session-rename').value=m?.name||'';$('session-notes').value=m?.notes||'';editLoadedId=selected}
 const canProcess=!!m&&m.kind!=='camera'&&!!latestStatus?.glim_available&&!latestStatus?.capture?.busy;
 for(const b of document.querySelectorAll('[data-action=process],#open-viewer,#open-editor,#merge-maps'))b.disabled=!canProcess;
@@ -105,6 +105,7 @@ function renderReconstruction(){
  $('reconstruction-results').replaceChildren();$('nksr-mesh-results').replaceChildren();
  const preparing=data?.jobs.find(j=>j.state==='PREPARING');
  $('reconstruction-status').textContent=preparing?`PREPARING · ${preparing.progress}`:stale?'Prepared input is stale. Prepare again with the selected trajectory and voxel size.':prepared?'PREPARED · ready for mesh reconstruction.':data?.jobs.at(-1)?.state||'NOT_PREPARED';
+ $('reconstruction-status').dataset.state=preparing?'preparing':stale?'stale':prepared?'prepared':String(data?.jobs.at(-1)?.state||'').toLowerCase();
  if(prepared&&meta?.points_after_voxel!==undefined){
   const label=meta.voxel_size_m===0?'sampling disabled':`after ${(meta.voxel_size_m*100).toFixed(1)} cm voxel sampling`;
   const filtered=meta.filter_enabled?` · ${meta.points_before_filter.toLocaleString()} raw → ${meta.points_after_filter.toLocaleString()} retained before sampling`:'';
@@ -129,6 +130,7 @@ function renderReconstruction(){
  const mesh=job?.mesh;
  $('cancel-mesh').hidden=mesh?.state!=='RUNNING';
  $('nksr-mesh-status').textContent=mesh?`${mesh.stage||mesh.state}${mesh.message?' · '+mesh.message:''}${mesh.progress?.message?' · '+mesh.progress.message:''}`:'NOT_RECONSTRUCTED';
+ $('nksr-mesh-status').dataset.state=mesh?String(mesh.state||'').toLowerCase():'';
  if(mesh?.state==='COMPLETED'){
   const m=mesh.metadata;
   const modeLabel=m.actual_mode==='low_ram'?`Low RAM · ${m.completed_tiles}/${m.tile_count} tiles · ${m.tile_size_m} m`:m.actual_mode;
@@ -182,9 +184,10 @@ function renderColorization(){
  $('colorize-start').disabled=!enabled||busy||!!latestStatus?.capture?.busy;
  $('colorize-cancel').hidden=last?.state!=='RUNNING';
  $('colorization-results').replaceChildren();
- if(!last){$('colorization-status').textContent='NOT_RUN';return}
+ if(!last){$('colorization-status').textContent='NOT_RUN';$('colorization-status').dataset.state='';return}
  $('colorization-status').textContent=last.state==='RUNNING'?`RUNNING · ${last.progress||''}`:
   (last.state==='COMPLETED'?`COMPLETED · ${(last.percentage_colored??0).toFixed(1)}% colored`:last.state);
+ $('colorization-status').dataset.state=String(last.state||'').toLowerCase();
  if(last.state==='COMPLETED'){
   $('colorization-results').append(el('p',`${(last.colored_point_count??0).toLocaleString()} / ${(last.final_point_count??0).toLocaleString()} points colored · ${(last.percentage_colored??0).toFixed(1)}%`));
   for(const path of last.outputs||[]){
