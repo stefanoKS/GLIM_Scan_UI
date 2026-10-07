@@ -181,3 +181,180 @@ def test_bag_reader_uses_header_timestamp_and_saved_topic(monkeypatch):
     assert list(c.bag_images(Path('/bag'), '/saved/rgb')) == [(12.5, 13000000000, msg)]
     with pytest.raises(ValueError, match='No recorded RGB Image topic'):
         list(c.bag_images(Path('/bag'), '/wrong'))
+
+
+# ---------------------------------------------------------------------------
+# Colorization pipeline unit and integration tests.
+# ---------------------------------------------------------------------------
+
+def test_project_to_pixels_rejects_behind_and_out_of_bounds():
+    intrinsics = [100.0, 100.0, 50.0, 50.0]
+    points = np.array([[0, 0, 2], [0, 0, -1], [0, 0, 0], [1, 0, 1], [0, 0, 30]])
+    _, pixels, depth, masks = c.project_to_pixels(
+        points, np.eye(3), np.zeros(3), intrinsics, 100, 100, 0.1, 20.0)
+    assert masks['valid'].tolist() == [True, False, False, False, False]
+    assert masks['in_front'].tolist() == [True, False, False, True, True]
+    assert not masks['in_bounds'][3]  # u == 150 outside the 100-wide image
+    assert not masks['in_range'][4]   # 30 m beyond max_depth
+    np.testing.assert_allclose(pixels[0], [50.0, 50.0])
+    assert depth[0] == 2.0
+
+
+def test_bilinear_sample_rgb_corners_and_center():
+    image = np.zeros((2, 2, 3), np.uint8)
+    image[0, 0] = [0, 0, 255]    # BGR -> red
+    image[0, 1] = [0, 255, 0]    # -> green
+    image[1, 0] = [255, 0, 0]    # -> blue
+    image[1, 1] = [255, 255, 255]
+    rgb = c.bilinear_sample_rgb(image, np.array([0.0, 1.0, 0.0, 1.0]),
+                                np.array([0.0, 0.0, 1.0, 1.0]))
+    np.testing.assert_allclose(rgb, [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], atol=1/255)
+    center = c.bilinear_sample_rgb(image, np.array([0.5]), np.array([0.5]))
+    np.testing.assert_allclose(center[0], [0.5, 0.5, 0.5], atol=1/255)
+
+
+def test_depth_buffer_and_occlusion_front_surface_wins():
+    pixels = np.array([[5.2, 5.1], [5.4, 5.3]])
+    depth = np.array([1.0, 2.0])
+    valid = np.array([True, True])
+    buffer = c.build_depth_buffer(pixels, depth, valid, 10, 10)
+    assert buffer[5, 5] == 1.0
+    keep = c.occlusion_keep(pixels, depth, np.array([True, True]), buffer, 0.03, 0.0075)
+    assert keep.tolist() == [True, False]
+    # A point well behind the front surface is rejected even with tolerance.
+    keep_far = c.occlusion_keep(np.array([[5.0, 5.0]]), np.array([3.0]),
+                                np.array([True]), buffer, 0.03, 0.0075)
+    assert keep_far.tolist() == [False]
+
+
+def test_fuse_grouped_median_per_channel():
+    group = np.array([0, 0, 0, 1, 1, 2])
+    rgb = np.array([[1, 0, 0], [0.5, 0, 0], [0, 0, 0],
+                    [0, 1, 0], [0, 0.2, 0], [0, 0, 1]], np.float32)
+    fused, counts = c.fuse_grouped_median(group, rgb, 3)
+    assert counts.tolist() == [3, 2, 1]
+    np.testing.assert_allclose(fused[0], [0.5, 0.0, 0.0])
+    np.testing.assert_allclose(fused[1], [0.0, 0.6, 0.0])
+    np.testing.assert_allclose(fused[2], [0.0, 0.0, 1.0])
+
+
+def test_fuse_grouped_median_empty_group_is_nan():
+    fused, counts = c.fuse_grouped_median(np.array([0]), np.array([[1.0, 1.0, 1.0]], np.float32), 3)
+    assert counts.tolist() == [1, 0, 0]
+    assert np.isnan(fused[1]).all() and np.isnan(fused[2]).all()
+    np.testing.assert_allclose(fused[0], [1.0, 1.0, 1.0])
+
+
+def test_voxel_grouping_representative_shares_voxel_observations():
+    points = np.array([[0.0, 0, 0], [0.001, 0, 0], [0.1, 0, 0]])
+    representative, voxel_of_point, voxel_of_rep = c._voxel_grouping(points, 0.01)
+    assert representative.tolist() == [0, 2]
+    assert voxel_of_point.tolist() == [0, 0, 1]
+    # Voxel 0 (point 0) and voxel 1 (point 2) map back to the two output rows.
+    assert voxel_of_rep.tolist() == [0, 1]
+    # Observation collected from the non-representative point colors the voxel.
+    fused, counts = c.fuse_grouped_median(np.array([0]), np.array([[1.0, 0.5, 0.25]], np.float32), 2)
+    np.testing.assert_allclose(fused[0], [1.0, 0.5, 0.25])
+    np.testing.assert_allclose(points[representative], [[0, 0, 0], [0.1, 0, 0]])
+
+
+def test_write_colored_ply_and_npz(tmp_path):
+    points = np.array([[1, 2, 3], [4, 5, 6]], np.float32)
+    rgb = np.array([[255, 0, 0], [0, 0, 255]], np.uint8)
+    intensity = np.array([0.5, 1.0], np.float32)
+    ply = tmp_path/'out.ply'
+    c.write_colored_ply(ply, points, rgb, intensity)
+    from plyfile import PlyData
+    vertex = PlyData.read(str(ply))['vertex'].data
+    assert list(vertex.dtype.names) == ['x', 'y', 'z', 'red', 'green', 'blue', 'intensity']
+    np.testing.assert_array_equal(vertex['red'], [255, 0])
+    np.testing.assert_array_equal(vertex['blue'], [0, 255])
+    np.testing.assert_allclose(vertex['intensity'], [0.5, 1.0])
+
+    cd = np.array([[0.25, 0.5, 0.75]], np.float32)
+    npz = tmp_path/'out.npz'
+    c.write_colored_npz(npz, points[:1], cd, np.array([0.5], np.float32), np.array([2], np.int32),
+                        intensity=np.array([1.0], np.float32))
+    data = np.load(npz, allow_pickle=False)
+    assert data['points'].shape == (1, 3)
+    assert data['Cd'].shape == (1, 3)
+    assert data['Cd'].min() >= 0.0 and data['Cd'].max() <= 1.0
+    assert data['color_count'].shape == (1,)
+    assert data['color_confidence'].shape == (1,)
+    np.testing.assert_allclose(data['Cd'][0], [0.25, 0.5, 0.75])
+
+
+def test_deterministic_fusion_and_grouping():
+    points = np.array([[0.0, 0, 0], [0.001, 0, 0], [0.1, 0, 0], [0.2, 0, 0]])
+    first = c._voxel_grouping(points, 0.01)
+    second = c._voxel_grouping(points, 0.01)
+    assert first[0].tolist() == second[0].tolist()
+    assert first[1].tolist() == second[1].tolist()
+    assert first[2].tolist() == second[2].tolist()
+    group = np.tile(np.arange(2), 3)
+    rgb = np.random.default_rng(0).random((6, 3)).astype(np.float32)
+    f1, n1 = c.fuse_grouped_median(group, rgb, 2)
+    f2, n2 = c.fuse_grouped_median(group, rgb, 2)
+    np.testing.assert_array_equal(f1, f2)
+    np.testing.assert_array_equal(n1, n2)
+
+
+def test_colorize_session_end_to_end(session, monkeypatch):
+    camera, intr, _, _ = c.session_calibration(session)
+    width, height = camera['width'], camera['height']
+    fx, fy, cx, cy = intr['intrinsics']
+
+    def make_image(color):
+        rgb = np.zeros((height, width, 3), np.uint8)
+        rgb[:, :, 0] = color[0]
+        rgb[:, :, 1] = color[1]
+        rgb[:, :, 2] = color[2]
+        return SimpleNamespace(width=width, height=height, encoding='rgb8',
+                               step=width * 3, data=rgb.tobytes())
+
+    frames = [(1.5, make_image((255, 0, 0))), (2.5, make_image((0, 0, 255)))]
+
+    def images(bag, topic):
+        for stamp, msg in frames:
+            yield stamp, int(stamp * 1e9), msg
+    monkeypatch.setattr(c, 'bag_images', images)
+
+    records = dict(
+        points=np.array([[0.5, 0, 2], [0.5, 0, -1], [0.5, 0, 6]], np.float64),
+        sensor_origins=np.zeros((3, 3)),
+        intensity=np.array([0.2, 0.4, 0.6], np.float32),
+        timestamps=np.array([1.5, 1.5, 2.5], np.float64))
+    monkeypatch.setattr(c, 'read_measurements', lambda *a, **k: records)
+
+    output = c.colorize_session(session, voxel_size=0.01, max_time_delta=0.15,
+                                max_depth=20.0, validation_frames=1)
+    meta = json.loads((output/'metadata.json').read_text())
+    assert meta['statistics']['input_point_count'] == 3
+    assert meta['statistics']['final_point_count'] == 3
+    assert meta['statistics']['colored_point_count'] == 2
+    assert meta['statistics']['uncolored_point_count'] == 1
+    assert meta['statistics']['behind_camera_count'] == 1
+    assert meta['statistics']['colored_observation_count'] == 2
+
+    data = np.load(output/'output/colored_points.npz', allow_pickle=False)
+    assert data['points'].shape == (3, 3)
+    assert data['Cd'].shape == (3, 3)
+    assert data['color_count'].tolist() == [1, 0, 1]
+    assert np.isnan(data['Cd'][1]).all()
+    np.testing.assert_allclose(data['Cd'][0], [1.0, 0.0, 0.0], atol=1/255)
+    np.testing.assert_allclose(data['Cd'][2], [0.0, 0.0, 1.0], atol=1/255)
+    assert data['Cd'][data['color_count'] > 0].min() >= 0.0
+    assert data['Cd'][data['color_count'] > 0].max() <= 1.0
+
+    from plyfile import PlyData
+    vertex = PlyData.read(str(output/'output/colored_points.ply'))['vertex'].data
+    assert list(vertex['red']) == [255, 128, 0]
+    assert list(vertex['blue']) == [0, 128, 255]
+
+    stats = json.loads((output/'output/colorization_stats.json').read_text())
+    assert stats['final_point_count'] == 3 and stats['colored_point_count'] == 2
+    assert (output/'calibration_snapshot.yaml').is_file()
+
+    overlays = list((output/'validation').glob('frame_*_overlay.jpg'))
+    assert len(overlays) == 1
+    assert meta['statistics']['validation_frames_written'] == 1

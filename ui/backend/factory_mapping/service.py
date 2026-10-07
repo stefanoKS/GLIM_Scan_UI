@@ -373,15 +373,24 @@ class Service:
         trajectory=dump/'traj_lidar.txt'
         if not trajectory.is_file() or trajectory.is_symlink(): raise ValueError('Saved map has no safe trajectory; save the complete map-editor workspace')
         target=self.sessions.get(sid)/'exports'/f'{eid}_{uuid.uuid4().hex[:8]}.ply'
-        cfg=dump/'config'
+        export_dump=workspace/f'.export_{uuid.uuid4().hex[:12]}'
+        await asyncio.to_thread(glim_tools.prepare_export_dump,dump,export_dump)
+        cfg=export_dump/'config'
         if not cfg.is_dir(): cfg=workspace/'map_01/config'
         async def done(item):
-            if item['returncode']!=0 or not target.is_file() or target.stat().st_size == 0: raise ValueError('Edited-map export failed; inspect the workspace export.log')
-            atomic_json(workspace/'export.json',dict(version=1,state='completed',created_at=now(),edit_id=eid,
-                source_session=sid,tool='map_editor',export_path=str(target.relative_to(self.sessions.get(sid))),
-                saved_map_fingerprint=glim_tools.fingerprint(dump),trajectory_fingerprint=glim_tools.file_fingerprint(trajectory),
-                saved_map_trajectory=str(trajectory.relative_to(workspace))))
-        return await self.start_process('export',commands.export(dump,target,cfg),workspace/'export.log',done=done)
+            try:
+                if item['returncode']!=0 or not target.is_file() or target.stat().st_size == 0: raise ValueError('Edited-map export failed; inspect the workspace export.log')
+                atomic_json(workspace/'export.json',dict(version=1,state='completed',created_at=now(),edit_id=eid,
+                    source_session=sid,tool='map_editor',export_path=str(target.relative_to(self.sessions.get(sid))),
+                    saved_map_fingerprint=glim_tools.fingerprint(dump),trajectory_fingerprint=glim_tools.file_fingerprint(trajectory),
+                    saved_map_trajectory=str(trajectory.relative_to(workspace))))
+            finally:
+                await asyncio.to_thread(shutil.rmtree,export_dump)
+        try:
+            return await self.start_process('export',commands.export(export_dump,target,cfg),workspace/'export.log',done=done)
+        except Exception:
+            await asyncio.to_thread(shutil.rmtree,export_dump)
+            raise
     async def background(self):
         while not self.closed:
             try:

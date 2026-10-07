@@ -21,7 +21,7 @@ if(editLoadedId!==selected){$('session-rename').value=m?.name||'';$('session-not
 const canProcess=!!m&&m.kind!=='camera'&&!!latestStatus?.glim_available&&!latestStatus?.capture?.busy;
 for(const b of document.querySelectorAll('[data-action=process],#open-viewer,#open-editor,#merge-maps'))b.disabled=!canProcess;
 $('selected').textContent=m?.name||'None';$('selected-job').textContent=m?.name||'None';const old=$('runs').value;$('runs').replaceChildren();for(const j of m?.processing||[]){if(j){const o=el('option',`${j.id} · ${j.preset} · ${j.state}`);o.value=j.id;$('runs').append(o)}}if([...$('runs').options].some(o=>o.value===old))$('runs').value=old;else if($('runs').options.length)$('runs').selectedIndex=$('runs').options.length-1;
-$('exports').replaceChildren();for(const path of m?.exports||[]){const row=el('div',path.split('/').pop()+' ');if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b);const c=el('button','Convert PCD');c.onclick=()=>json(`sessions/${selected}/pcd?path=${encodeURIComponent(path)}`,{}).then(sessions).catch(error);row.append(c)}const d=el('button','Download');d.onclick=()=>download(path);row.append(d);$('exports').append(row)}connectLogs();await reconstructionPanel()}
+$('exports').replaceChildren();for(const path of m?.exports||[]){const row=el('div',path.split('/').pop()+' ');if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b);const c=el('button','Convert PCD');c.onclick=()=>json(`sessions/${selected}/pcd?path=${encodeURIComponent(path)}`,{}).then(sessions).catch(error);row.append(c)}const d=el('button','Download');d.onclick=()=>download(path);row.append(d);$('exports').append(row)}connectLogs();await reconstructionPanel();await colorizationPanel()}
 async function action(a){$('error').hidden=true;try{const out=await json('action',{action:a,session:selected,preset:$('preset').value,run:$('runs').value||null});if(a==='diagnose'){$('diagnostics').textContent=JSON.stringify(out,null,2);$('diagnostics').parentElement.open=true}await refresh()}catch(e){error(e)}}
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{b.disabled=true;await action(b.dataset.action);b.disabled=false});
 $('refresh').onclick=refresh;
@@ -172,3 +172,38 @@ $('reconstruct-mesh').onclick=async()=>{
  try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/mesh`,nksrSettings());await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };
 $('cancel-mesh').onclick=async()=>{try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/cancel`,{});await refresh()}catch(e){error(e)}};
+
+let colorizationPending=false,colorizationData=null;
+function renderColorization(){
+ const data=colorizationData,last=data?.jobs?.at(-1);
+ const busy=colorizationPending||['running','stopping','orphaned'].includes(latestStatus?.processes?.colorization?.state);
+ const enabled=!!selected&&!!data?.raw_bag&&!!data?.camera_enabled;
+ $('colorization-input-status').textContent=data?`${data.raw_bag?'✓':'○'} Raw bag · ${data.camera_enabled?'✓':'○'} RGB recorded`:'Select a scan recorded with RGB camera images.';
+ $('colorize-start').disabled=!enabled||busy||!!latestStatus?.capture?.busy;
+ $('colorize-cancel').hidden=last?.state!=='RUNNING';
+ $('colorization-results').replaceChildren();
+ if(!last){$('colorization-status').textContent='NOT_RUN';return}
+ $('colorization-status').textContent=last.state==='RUNNING'?`RUNNING · ${last.progress||''}`:
+  (last.state==='COMPLETED'?`COMPLETED · ${(last.percentage_colored??0).toFixed(1)}% colored`:last.state);
+ if(last.state==='COMPLETED'){
+  $('colorization-results').append(el('p',`${(last.colored_point_count??0).toLocaleString()} / ${(last.final_point_count??0).toLocaleString()} points colored · ${(last.percentage_colored??0).toFixed(1)}%`));
+  for(const path of last.outputs||[]){
+   const row=el('div',path.split('/').pop()+' ');
+   if(path.endsWith('.ply')){const b=el('button','Preview');b.onclick=()=>showCloud(path);row.append(b)}
+   const d=el('button','Download');d.onclick=()=>download(path);row.append(d);
+   $('colorization-results').append(row);
+  }
+  const log=el('button','Colorization log');log.onclick=()=>download(`colorization/${last.id}/job.log`);$('colorization-results').append(log);
+ }
+}
+async function colorizationPanel(){
+ const sid=selected;
+ if(!sid){colorizationData=null;renderColorization();return}
+ const data=await json(`sessions/${sid}/colorization`);if(sid!==selected)return;
+ colorizationData=data;renderColorization();
+}
+$('colorize-start').onclick=async()=>{
+ if(colorizationPending||!selected)return;colorizationPending=true;renderColorization();
+ try{await json(`sessions/${selected}/colorization`,{allow_unvalidated_calibration:$('colorization-allow-unvalidated').checked});await refresh()}catch(e){error(e)}finally{colorizationPending=false;await colorizationPanel()}
+};
+$('colorize-cancel').onclick=async()=>{try{const last=colorizationData?.jobs?.at(-1);if(last)await json(`sessions/${selected}/colorization/${last.id}/cancel`,{});await refresh()}catch(e){error(e)}};

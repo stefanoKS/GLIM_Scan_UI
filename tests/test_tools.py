@@ -2,7 +2,7 @@ import json, shutil, zipfile
 import pytest
 from factory_mapping.config import load
 from factory_mapping.storage import Sessions,atomic_json
-from factory_mapping.glim_tools import prepare,command
+from factory_mapping.glim_tools import prepare,prepare_export_dump,command
 from factory_mapping import commands
 
 def test_offline_isolation_keeps_bag_topic_names(root):
@@ -30,6 +30,19 @@ def test_edit_workspace_is_independent(root):
     assert json.loads((copy/'config/config.json').read_text())['global']['config_global_mapping']=='config_global_mapping_cpu.json'
     assert command('map_editor',copy)==['ros2','run','glim_ros','map_editor',str(copy)]
     with pytest.raises(ValueError):prepare(root,p,'run_001',[src,src],'map_editor')
+
+
+def test_export_dump_omits_matching_factors_without_changing_saved_map(tmp_path):
+    source=tmp_path/'saved_map';source.mkdir()
+    (source/'graph.bin').write_bytes(b'graph')
+    original='num_submaps: 2\nnum_all_frames: 10\nnum_matching_cost_factors: 2\nmatching_cost vgicp_gpu 0 1\nmatching_cost vgicp 1 0\ntrailing metadata\n'
+    (source/'graph.txt').write_text(original)
+    (source/'points.bin').write_bytes(b'points')
+    staged=prepare_export_dump(source,tmp_path/'export_dump')
+    assert (source/'graph.txt').read_text()==original
+    assert (staged/'graph.txt').read_text()=='num_submaps: 2\nnum_all_frames: 10\nnum_matching_cost_factors: 0\ntrailing metadata\n'
+    assert (staged/'points.bin').read_bytes()==b'points'
+
 
 def test_project_archive_preserves_bag_map_and_settings(root,tmp_path):
     sessions=Sessions(root);session=sessions.create('portable','',load(root));folder=sessions.get(session['id'])

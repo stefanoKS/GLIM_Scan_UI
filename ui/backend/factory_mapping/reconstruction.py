@@ -119,21 +119,35 @@ def filter_records_by_edited_geometry(records, edited_points, tolerance_m, progr
         filter_note='Approximate retained-geometry filtering; NKSR can still bridge deleted regions.')
 
 
+def voxel_keys(points, voxel_size_m=DEFAULT_VOXEL_SIZE_M):
+    """Integer voxel coordinates for every point, matching voxel_indices grouping.
+
+    int64 coordinates avoid packed-key collisions. Chunked quantization bounds
+    float temporaries; NumPy unique performs the global grouping across frames.
+    """
+    size = validate_voxel_size(voxel_size_m)
+    keys = np.empty((len(points), 3), dtype=np.int64)
+    if size == 0:
+        keys[:, :] = 0
+        keys[:, 0] = np.arange(len(points))
+        return keys
+    for start in range(0, len(points), 250_000):
+        block = np.floor(points[start:start+250_000].astype(np.float64) / size)
+        if not np.isfinite(block).all() or np.any(block < -(2.**63)) or np.any(block >= 2.**63):
+            raise ValueError('World coordinates exceed the supported voxel index range')
+        keys[start:start+len(block)] = block
+    return keys
+
+
 def voxel_indices(points, voxel_size_m=DEFAULT_VOXEL_SIZE_M):
     """First input measurement per world voxel, in original acquisition order.
 
     int64 coordinates avoid packed-key collisions. Chunked quantization bounds
     float temporaries; NumPy unique performs the global grouping across frames.
     """
-    size = validate_voxel_size(voxel_size_m)
-    if size == 0:
+    keys = voxel_keys(points, voxel_size_m)
+    if validate_voxel_size(voxel_size_m) == 0:
         return np.arange(len(points))
-    keys = np.empty((len(points), 3), dtype=np.int64)
-    for start in range(0, len(points), 250_000):
-        block = np.floor(points[start:start+250_000].astype(np.float64) / size)
-        if not np.isfinite(block).all() or np.any(block < -(2.**63)) or np.any(block >= 2.**63):
-            raise ValueError('World coordinates exceed the supported voxel index range')
-        keys[start:start+len(block)] = block
     _, indices = np.unique(keys, axis=0, return_index=True)
     indices.sort()
     return indices

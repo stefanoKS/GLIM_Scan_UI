@@ -42,6 +42,12 @@ class NKSRCheck(BaseModel):
     model_config=ConfigDict(extra='forbid')
     device: Literal['auto','cuda','cpu']='auto'
 
+class ColorizationRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    allow_unvalidated_calibration: bool=False
+    transfer_glim: bool=False
+    transfer_nksr: bool=False
+
 class CaptureAction(BaseModel):
     model_config=ConfigDict(extra='forbid')
     action: Literal['start_scan','stop_scan','start_camera_recording','stop_camera_recording']
@@ -294,6 +300,23 @@ def make_app(root=ROOT,mock=None):
                 return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density)
             return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density,
                                True, body.edit_id, body.filter_tolerance_m)
+
+    @app.get('/api/sessions/{sid}/colorization')
+    async def colorization_status(sid:str):
+        from .colorization_jobs import view
+        return await asyncio.to_thread(view, app.state.service, sid)
+
+    @app.post('/api/sessions/{sid}/colorization', status_code=202)
+    async def colorize(sid:str, body:ColorizationRequest):
+        from .colorization_jobs import start
+        s=app.state.service
+        async with s.lock: return await start(s, sid, body.model_dump())
+
+    @app.post('/api/sessions/{sid}/colorization/{cid}/cancel')
+    async def cancel_colorization(sid:str, cid:str):
+        from .colorization_jobs import cancel
+        s=app.state.service
+        async with s.lock: return await cancel(s, sid, cid)
 
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)

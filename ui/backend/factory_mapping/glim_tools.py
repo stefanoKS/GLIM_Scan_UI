@@ -1,5 +1,5 @@
 """Official GLIM tools, launched against derived working copies."""
-import hashlib, json, shutil, uuid
+import hashlib, json, os, shutil, uuid
 from pathlib import Path
 from .storage import atomic_json, now, read_json
 
@@ -32,6 +32,27 @@ def file_fingerprint(path):
     path = Path(path)
     if not path.is_file() or path.is_symlink(): raise ValueError('Saved map trajectory is unavailable')
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def prepare_export_dump(source, destination):
+    source, destination = Path(source), Path(destination)
+    validate_dump(source)
+    shutil.copytree(source, destination, copy_function=os.link)
+    graph = destination/'graph.txt'
+    lines = graph.read_text().splitlines()
+    try:
+        if len(lines) < 3 or not lines[2].startswith('num_matching_cost_factors:'):
+            raise ValueError
+        count = int(lines[2].split(':', 1)[1])
+        if count < 0 or len(lines) < 3 + count or any(not line.startswith('matching_cost ') for line in lines[3:3 + count]):
+            raise ValueError
+    except (ValueError, IndexError) as error:
+        shutil.rmtree(destination)
+        raise ValueError('Saved map has an invalid matching-cost factor manifest') from error
+    lines[2] = 'num_matching_cost_factors: 0'
+    staged = graph.with_name('.graph.txt.tmp')
+    staged.write_text('\n'.join(lines[:3] + lines[3 + count:]) + '\n')
+    staged.replace(graph)
+    return destination
 
 def prepare(root,primary_session,primary_run,sources,kind):
     if kind not in ('offline_viewer','map_editor'): raise ValueError('Unsupported map editing tool')

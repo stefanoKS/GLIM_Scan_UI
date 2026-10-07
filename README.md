@@ -115,6 +115,7 @@ Run the [four camera hardware cases](docs/camera_auto_resolution.md#jetson-comma
 | [Camera setup](docs/camera_calibration.md) | D405/DFK installation, intrinsics and alignment datasets |
 | [Camera selection](docs/camera_auto_resolution.md) | State machine, performance tests and hardware commands |
 | [GLIM tools](docs/glim_tools.md) | Native editing, merging and cleanup on the workstation |
+| [Editing and surfacing](docs/editing_and_surfacing.md) | End-to-end saved-map cleanup, export, preparation and NKSR mesh workflow |
 | [NKSR](docs/nksr.md) | Workstation surface preparation, reconstruction and validation |
 | [Architecture](docs/architecture.md) | Process ownership, snapshots, camera isolation and recovery |
 | [Validation](docs/validation.md) | Dated evidence and hardware limitations |
