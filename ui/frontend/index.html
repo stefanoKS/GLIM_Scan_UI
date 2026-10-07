@@ -14,6 +14,7 @@
 <label>Preparation voxel: <input id="voxel-size-cm" type="number" value="1.0" min="0.2" max="20" step="0.1" required/> cm</label>
 <label>Mode<select id="nksr-mode"><option value="auto">Auto</option><option value="full">Full</option><option value="chunked">Chunked</option><option value="low_ram">Low RAM · independent tiles</option></select></label>
 <label>Mesh output<select id="nksr-output-mode"><option value="merged">Merged</option><option value="chunks">Per-chunk</option><option value="both">Both</option></select></label>
+<p id="nksr-output-note" hidden>Low RAM keeps its existing independent tile meshes and merged output; Mesh output does not apply.</p>
 <label>Detail level<input id="nksr-detail" type="number" value="0.5" min="0" max="1" step="0.1"/></label>
 <label id="nksr-chunk-label">Chunk size (meters)<input id="nksr-chunk" type="number" min="0.1" step="0.1" placeholder="Auto"/></label>
 <label id="nksr-tile-label" hidden>Tile edge length (meters)<input id="nksr-tile" type="number" value="5" min="0.1" step="0.1" required disabled/></label>

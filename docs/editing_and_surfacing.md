@@ -222,19 +222,35 @@ reconstruction/run_ID/output/mesh_chunks/
 Each `chunk_NNNN.ply` contains world-space vertices in meters in the original
 GLIM/world coordinate system, so loading all chunks together (for example in
 Houdini, with no transform) aligns them with the point cloud, each other, and
-the fused mesh. `chunks.json` records the coordinate system, units, scale,
-per-chunk grid index and world bounding boxes.
+the fused mesh. `chunks.json` records the coordinate system, units, the physical
+and scaled chunk size, the scaled stride, and per-chunk grid indices and world
+bounding boxes. `core_bbox_min`/`core_bbox_max` are in world meters;
+`core_bbox_min_scaled`/`core_bbox_max_scaled`, `field_origin_scaled` and
+`chunk_stride_scaled` stay in scaled NKSR coordinates, which is stated in the
+field names.
 
-Chunks reconstructed by NKSR overlap slightly to give each field reconstruction
-context. To avoid exporting duplicate surfaces, each chunk keeps only its core
-region: adjacent chunks split the overlap at the midpoint between their centers
-(half-open bounds), and outermost chunks keep their outer boundary. Triangle
-ownership is decided by triangle centroid, so no triangle is exported by two
-neighboring chunks. Neighboring chunk meshes are **not** welded together.
+NKSR reconstructs each chunk with overlap to give the field context, and it
+skips candidate cells that contain no points, so the reconstructed fields do not
+form a complete Cartesian grid. Ownership therefore works as follows:
+
+- every triangle belongs to the active chunk whose nominal cube contains its
+  centroid, choosing the nearest chunk center and the lowest field index on a tie
+  (this also resolves diagonal overlaps);
+- geometry whose centroid lies inside no active cube stays with the chunk that
+  emitted it, so a chunk in an unrelated grid cell can never crop it;
+- because ownership is decided from the centroid and the full active set, no
+  triangle is exported by two neighboring chunks.
+
+Ownership by triangle centroid means a triangle is never split, so neighboring
+chunk meshes meet with a hairline seam (under half a triangle wide) instead of
+being welded. Neighboring chunks are intentionally **not** welded together.
 
 In full (non-chunked) mode, **Per-chunk** saves a single chunk representing the
 whole field, and **Both** saves that chunk plus the normal fused mesh; no extra
 reconstruction pass is performed.
+
+Low RAM mode keeps its existing independent tile meshes plus the merged output;
+**Mesh output** does not apply there and is disabled in the UI.
 
 ## Common failures
 

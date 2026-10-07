@@ -62,70 +62,132 @@ def finite_or_none(values):
     return [None if not np.isfinite(value) else float(value) for value in np.asarray(values).ravel()]
 
 
-def chunk_grid_from_centers(centers):
-    """Per-axis chunk stride and grid indices derived from the actual chunk centers.
+def derived_stride(centers):
+    """Fallback stride from the surviving centers, only if the NKSR grid disagrees."""
+    steps = [np.diff(np.unique(np.asarray(centers, dtype=np.float64)[:, axis])) for axis in range(3)]
+    steps = [step[step > 0].min() for step in steps if step.size]
+    return float(min(steps)) if steps else 1.0
 
-    NKSR lays chunk centers on a regular axis-aligned grid. Empty chunks are
-    never reconstructed by NKSR, so the returned grid index is the 0-based rank
-    of each center along its axis rather than the absolute NKSR cell index.
+
+def chunk_grid_layout(centers, chunk_size_scaled, overlap_ratio):
+    """Relative NKSR grid indices that preserve skipped cells, plus the stride used.
+
+    NKSR lays chunk centers on the regular grid
+    ``stride = chunk_size * (1 - overlap_ratio)`` and skips candidate cells with
+    no points, so ``field.transforms`` is not a complete Cartesian grid. Relative
+    indices come from the nominal stride and the smallest surviving center per
+    axis, so holes are preserved (``[0, 38] -> [0, 2]`` for a 19 m scaled stride)
+    instead of being rank-compressed to ``[0, 1]``.
     """
     centers = np.asarray(centers, dtype=np.float64)
     if centers.ndim != 2 or centers.shape[1] != 3 or not len(centers):
         raise WorkerError('EMPTY_TILE', 'NKSR produced no chunk fields')
-    strides = np.full(3, np.inf)
-    grid_index = np.zeros((len(centers), 3), dtype=np.int64)
-    for axis in range(3):
-        values, inverse = np.unique(centers[:, axis], return_inverse=True)
-        if len(values) > 1:
-            strides[axis] = float(np.min(np.diff(values)))
-        grid_index[:, axis] = inverse
-    return strides, grid_index
+    stride = float(chunk_size_scaled) * (1.0 - overlap_ratio) if chunk_size_scaled else None
+    source = 'nksr_chunk_size'
+    if not (stride and np.isfinite(stride) and stride > 0):
+        stride, source = derived_stride(centers), 'derived_from_centers'
+    origin = centers.min(axis=0)
+    relative = np.rint((centers - origin) / stride).astype(np.int64)
+    # A mismatched nominal stride would silently mis-index the grid; only then fall back.
+    if source == 'nksr_chunk_size' and np.abs(centers - (origin + relative * stride)).max() > max(1e-3 * stride, 1e-6):
+        stride, source = derived_stride(centers), 'derived_from_centers'
+        relative = np.rint((centers - origin) / stride).astype(np.int64)
+    return stride, relative, source
 
 
-def chunk_core_bounds(centers):
-    """Half-open [min, max) core ownership bounds per chunk, in scaled coordinates.
+def chunk_core_bounds(centers, relative_index, stride_scaled):
+    """Nominal core ownership box per chunk, in scaled coordinates.
 
-    Adjacent chunks split each axis at the midpoint between their centers, so
-    every region belongs to exactly one chunk and no triangle is exported by two
-    neighboring chunks. The outermost chunk along each axis keeps its outer
-    boundary by extending to +/-inf.
+    A side is bounded by the midpoint to a genuinely adjacent active grid cell:
+    relative index difference of one along that axis and at most one on the
+    other axes. Cells elsewhere in the scene never bound a chunk, so sparse
+    active grids are not split against unrelated chunks. Unbounded sides stay
+    +/-inf. Triangle ownership itself is decided by :func:`owned_triangle_mask`;
+    this box is the nominal core cell for reporting.
     """
     centers = np.asarray(centers, dtype=np.float64)
+    relative_index = np.asarray(relative_index, dtype=np.int64)
     bounds = []
-    for center in centers:
+    for index in range(len(centers)):
         lo = np.full(3, -np.inf)
         hi = np.full(3, np.inf)
         for axis in range(3):
-            values = np.unique(centers[:, axis])
-            pos = int(np.searchsorted(values, center[axis]))
-            if pos > 0:
-                lo[axis] = 0.5 * (values[pos - 1] + center[axis])
-            if pos + 1 < len(values):
-                hi[axis] = 0.5 * (center[axis] + values[pos + 1])
+            others = [other for other in range(3) if other != axis]
+            for other in range(len(centers)):
+                if other == index:
+                    continue
+                if any(abs(relative_index[other][a] - relative_index[index][a]) > 1 for a in others):
+                    continue
+                step = int(relative_index[other][axis] - relative_index[index][axis])
+                if step == -1:
+                    lo[axis] = max(lo[axis], 0.5 * (centers[index][axis] + centers[other][axis]))
+                elif step == 1:
+                    hi[axis] = min(hi[axis], 0.5 * (centers[index][axis] + centers[other][axis]))
         bounds.append((lo, hi))
     return bounds
 
 
-def crop_mesh_to_core(vertices, faces, core_min, core_max):
-    """Remove triangles whose centroid lies outside the half-open core region.
+OWNERSHIP_BLOCK_ELEMENTS = 2_000_000
 
-    Triangle ownership by centroid is deterministic: each centroid falls in
-    exactly one chunk core, so overlap regions are never exported twice.
+
+def owned_triangle_mask(centroids, centers, chunk_size_scaled, index):
+    """Mask of the triangles the emitting chunk ``index`` keeps, in scaled coordinates.
+
+    A triangle belongs to the active chunk whose nominal cube contains its
+    centroid, choosing the nearest chunk center and, on a tie (for example a
+    diagonal overlap), the lowest field index. When no active cube contains the
+    centroid, the emitting chunk keeps the triangle: NKSR skips empty cells, so
+    ``field.transforms`` is not a complete grid and a chunk elsewhere in the
+    scene must never crop geometry that no cube claims. Working on centroids
+    keeps ownership deterministic, so an overlap region is never exported twice.
     """
-    vertices = np.asarray(vertices)
+    centers = np.asarray(centers, dtype=np.float64)
+    points = np.asarray(centroids, dtype=np.float64)
+    fields = len(centers)
+    if not fields:
+        raise WorkerError('EMPTY_TILE', 'NKSR produced no chunk fields')
+    if points.size == 0:
+        return np.zeros(0, dtype=bool)
+    half = 0.5 * float(chunk_size_scaled) if chunk_size_scaled else np.inf
+    keep = np.zeros(len(points), dtype=bool)
+    block = max(1, min(len(points), OWNERSHIP_BLOCK_ELEMENTS // fields))
+    for start in range(0, len(points), block):
+        stop = min(start + block, len(points))
+        local = points[start:stop]
+        distance = np.zeros((stop - start, fields), dtype=np.float64)
+        inside = np.ones((stop - start, fields), dtype=bool)
+        for axis in range(3):
+            delta = local[:, axis][:, None] - centers[:, axis][None, :]
+            distance += delta * delta
+            if np.isfinite(half):
+                inside &= np.abs(delta) <= half
+        covered = inside.any(axis=1)
+        distance = np.where(inside | ~covered[:, None], distance, np.inf)
+        block_keep = np.argmin(distance, axis=1) == index
+        keep[start:stop] = block_keep | ~covered
+    return keep
+
+
+def compact_mesh(vertices, faces):
+    """Drop vertices unused by the surviving triangles and remap the faces."""
     faces = np.asarray(faces)
     if faces.size == 0:
-        return vertices[:0].copy(), faces[:0].copy()
-    centroids = vertices[faces].mean(axis=1)
-    keep = np.all(centroids >= core_min, axis=1) & np.all(centroids < core_max, axis=1)
-    faces = faces[keep]
-    if faces.size == 0:
-        return vertices[:0].copy(), faces[:0].copy()
+        return np.asarray(vertices)[:0].copy(), faces.reshape(0, 3)
     used = np.zeros(len(vertices), dtype=bool)
     used[faces.reshape(-1)] = True
     remap = np.full(len(vertices), -1, dtype=np.int64)
     remap[used] = np.arange(int(used.sum()))
-    return vertices[used].copy(), remap[faces]
+    return np.asarray(vertices)[used].copy(), remap[faces]
+
+
+def crop_mesh_to_owned(vertices, faces, index, centers, chunk_size_scaled):
+    """Keep only the triangles that ``index`` owns, then compact the mesh."""
+    vertices = np.asarray(vertices)
+    faces = np.asarray(faces)
+    if faces.size == 0:
+        return vertices[:0].copy(), faces.reshape(0, 3)
+    keep = owned_triangle_mask(vertices[faces].mean(axis=1), centers, chunk_size_scaled, index)
+    return compact_mesh(vertices, faces[keep])
 
 
 def select_chunk(points):
@@ -215,16 +277,19 @@ def cpu_normal_preprocess(knn, drop_angle):
     return preprocess
 
 
-def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunks_dir, event, torch, device):
+def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunk_size_m,
+                            chunks_dir, event, torch, device):
     """Extract, crop, transform and save each NKSR chunk field independently.
 
     Chunk meshes are processed one at a time and never held simultaneously. Each
     field is moved to CPU before extraction (the existing small-memory recipe),
-    transformed into scaled global coordinates, cropped to its half-open core
-    ownership region, compacted, and written in world meters.
+    transformed into scaled global coordinates, cropped to its owned triangles,
+    compacted, and written in world meters.
     """
-    strides, grid_index = chunk_grid_from_centers(centers)
-    bounds = chunk_core_bounds(centers)
+    chunk_size_scaled = chunk_size_m * scale
+    stride_scaled, relative_index, stride_source = chunk_grid_layout(
+        centers, chunk_size_scaled, settings.overlap_ratio)
+    bounds = chunk_core_bounds(centers, relative_index, stride_scaled)
     chunks_dir = Path(chunks_dir)
     if chunks_dir.exists():
         raise WorkerError('MESH_INVALID', 'Chunk output exists; choose a new output directory')
@@ -245,12 +310,16 @@ def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunks_
             global_vertices = local_vertices + center
         else:
             global_vertices = local_vertices @ np.asarray(rotation).T + center
-        core_min, core_max = bounds[index]
-        core_vertices, core_faces = crop_mesh_to_core(global_vertices, faces, core_min, core_max)
+        core_vertices, core_faces = crop_mesh_to_owned(
+            global_vertices, faces, index, centers, chunk_size_scaled)
         del local_vertices, global_vertices, faces
-        entry = dict(index=index, grid_index=grid_index[index].tolist(),
+        core_min, core_max = bounds[index]
+        entry = dict(index=index, grid_index=relative_index[index].tolist(),
                      field_origin_scaled=center.tolist(),
-                     core_bbox_min=finite_or_none(core_min), core_bbox_max=finite_or_none(core_max))
+                     core_bbox_min=finite_or_none(core_min / scale),
+                     core_bbox_max=finite_or_none(core_max / scale),
+                     core_bbox_min_scaled=finite_or_none(core_min),
+                     core_bbox_max_scaled=finite_or_none(core_max))
         if core_faces.size == 0:
             entry.update(file=None, vertices=0, faces=0, world_bbox_min=None, world_bbox_max=None,
                          note='No triangles inside the chunk core region')
@@ -274,12 +343,15 @@ def extract_and_save_chunks(fields, centers, rotations, settings, scale, chunks_
     manifest = dict(version=1, coordinate_system='GLIM_world', units='meters',
                     output_mode=settings.mesh_output_mode,
                     target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M, coordinate_scale=scale,
-                    nksr_chunk_size_scaled=settings.chunk_size * scale if settings.chunk_size else None,
+                    chunk_size_m=chunk_size_m, nksr_chunk_size_scaled=chunk_size_scaled,
+                    chunk_stride_scaled=stride_scaled, chunk_stride_source=stride_source,
                     overlap_ratio=settings.overlap_ratio,
                     total_chunks=total, total_vertices=total_vertices, total_faces=total_faces,
-                    chunk_stride_scaled=[None if not np.isfinite(s) else float(s) for s in strides],
-                    ownership_rule='Half-open midpoint between adjacent chunk centers; '
-                                   'outer chunks keep their outer boundary; triangle-centroid ownership.',
+                    ownership_rule='Triangle centroid belongs to the active chunk whose nominal cube '
+                                   'contains it, nearest center first, lowest field index on a tie; a centroid '
+                                   'inside no active cube stays with its emitting chunk. core_bbox_* is the '
+                                   'nominal core cell from midpoints to genuinely adjacent active cells and is '
+                                   'unbounded (null) where no adjacent cell exists.',
                     chunks=entries)
     atomic_json(chunks_dir / 'chunks.json', manifest)
     union = None if not np.isfinite(union_min).all() else (union_min.tolist(), union_max.tolist())
@@ -295,16 +367,21 @@ def write_full_single_chunk(settings, vertices, faces, chunks_dir):
     chunks_dir.mkdir(parents=True, exist_ok=True)
     stats = write_mesh(chunks_dir / 'chunk_0000.ply', vertices, faces)
     entry = dict(index=0, grid_index=[0, 0, 0], field_origin_scaled=[0.0, 0.0, 0.0],
-                 core_bbox_min=None, core_bbox_max=None, file='chunk_0000.ply',
+                 core_bbox_min=stats['bounding_box_min'], core_bbox_max=stats['bounding_box_max'],
+                 core_bbox_min_scaled=stats['bounding_box_min'], core_bbox_max_scaled=stats['bounding_box_max'],
+                 file='chunk_0000.ply',
                  vertices=int(stats['vertex_count']), faces=int(stats['face_count']),
                  world_bbox_min=stats['bounding_box_min'], world_bbox_max=stats['bounding_box_max'],
-                 note='Full (non-chunked) reconstruction exported as a single chunk')
+                 note='Full (non-chunked) reconstruction exported as a single chunk that owns the whole field')
     manifest = dict(version=1, coordinate_system='GLIM_world', units='meters',
                     output_mode=settings.mesh_output_mode,
                     target_voxel_m=DEFAULT_NKSR_TARGET_VOXEL_M, coordinate_scale=1.0,
-                    nksr_chunk_size_scaled=None, overlap_ratio=None,
+                    chunk_size_m=None, nksr_chunk_size_scaled=None, chunk_stride_scaled=None,
+                    chunk_stride_source=None, overlap_ratio=None,
                     total_chunks=1, total_vertices=int(stats['vertex_count']),
-                    total_faces=int(stats['face_count']), chunks=[entry])
+                    total_faces=int(stats['face_count']),
+                    ownership_rule='Full reconstruction owns the whole field; no NKSR chunk grid exists.',
+                    chunks=[entry])
     atomic_json(chunks_dir / 'chunks.json', manifest)
     return manifest, dict(total_vertices=int(stats['vertex_count']), total_faces=int(stats['face_count']),
                           union_bounds=(stats['bounding_box_min'], stats['bounding_box_max']))
@@ -367,7 +444,8 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
                 chunks_dir = settings.output.parent / CHUNKS_DIR_NAME
                 chunk_started = time.monotonic()
                 manifest, chunk_totals = extract_and_save_chunks(
-                    fields, centers, rotations, settings, scale, chunks_dir, event, torch, device)
+                    fields, centers, rotations, settings, scale, chunk_size,
+                    chunks_dir, event, torch, device)
                 chunk_seconds = time.monotonic() - chunk_started
                 if output_mode == 'chunks':
                     del field, fields, transforms, centers, rotations
@@ -426,6 +504,9 @@ def execute(points, sensors, settings, event, torch, nksr, device, reconstructor
                       chunk_vertices_total=chunk_totals['total_vertices'],
                       chunk_faces_total=chunk_totals['total_faces'],
                       chunk_union_bounds=chunk_totals['union_bounds'],
+                      chunk_size_m=manifest['chunk_size_m'],
+                      nksr_chunk_size_scaled=manifest['nksr_chunk_size_scaled'],
+                      chunk_stride_scaled=manifest['chunk_stride_scaled'],
                       chunk_extraction_seconds=chunk_seconds)
     return vertices, faces, result
 
@@ -457,6 +538,7 @@ def main():
             0 < settings.normal_drop_angle_deg <= 90 and settings.normal_knn > 0 and
             0 <= settings.mise_iter <= 4 and np.isfinite(settings.tile_size) and settings.tile_size > 0 and
             (not settings.tile_worker or settings.mode=='full') and
+            (settings.mode != 'low_ram' or settings.mesh_output_mode == 'merged') and
             (settings.chunk_size is None or np.isfinite(settings.chunk_size) and settings.chunk_size > 0)):
         raise SystemExit('Invalid reconstruction settings')
     stage = 'LOADING_INPUT'; metadata = {'python':sys.executable}; started=time.monotonic()
@@ -505,7 +587,10 @@ def main():
             metadata.update(chunk_manifest_path=str(chunks_dir/'chunks.json'),
                             chunk_count=manifest['total_chunks'],
                             chunk_vertices_total=chunk_totals['total_vertices'],
-                            chunk_faces_total=chunk_totals['total_faces'])
+                            chunk_faces_total=chunk_totals['total_faces'],
+                            chunk_size_m=manifest['chunk_size_m'],
+                            nksr_chunk_size_scaled=manifest['nksr_chunk_size_scaled'],
+                            chunk_stride_scaled=manifest['chunk_stride_scaled'])
             metadata['chunk_manifest'] = manifest
         elif result.get('chunk_manifest') is not None:
             metadata['chunk_manifest_path'] = str(chunks_dir/'chunks.json')

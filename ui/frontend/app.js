@@ -125,6 +125,8 @@ function renderReconstruction(){
  $('nksr-detail').disabled=lowRam||$('nksr-mode').value==='chunked';
  $('nksr-chunk-label').hidden=lowRam;$('nksr-chunk').disabled=lowRam;
  $('nksr-tile-label').hidden=!lowRam;$('nksr-tile').disabled=!lowRam;
+ $('nksr-output-mode').disabled=lowRam;
+ $('nksr-output-note').hidden=!lowRam;
  if(lowRam&&!$('nksr-tile').checkValidity())$('reconstruct-mesh').disabled=true;
  $('nksr-mode-note').textContent=lowRam?'Independent tile boundaries may contain gaps or overlaps. No boundary stitching.':
   'Auto selects full or chunked inference from point count and available GPU memory. Detail level applies only to full mode. Chunked extraction uses CPU. CPU inference can be very slow.';
