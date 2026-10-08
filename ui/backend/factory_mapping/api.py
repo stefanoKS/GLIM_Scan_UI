@@ -15,15 +15,37 @@ from .storage import atomic_json, read_json
 from .preview import encode
 from .quality import quality, ply_stats, ply_to_pcd
 from .reconstruction import DEFAULT_VOXEL_SIZE_M
+from .vdbfusion import MAX_BATCH_POINTS, MIN_BATCH_POINTS
+
+class VDBFusionSettings(BaseModel):
+    """TSDF controls for the VDBFusion engine only. Distinct from preparation sampling."""
+    model_config=ConfigDict(extra='forbid')
+    preset: Literal['fast','detailed','experimental'] | None=None
+    voxel_size_m: float | None=Field(default=None, gt=0, allow_inf_nan=False)
+    sdf_trunc_m: float | None=Field(default=None, gt=0, allow_inf_nan=False)
+    space_carving: bool=False
+    origin_error_budget_m: float | None=Field(default=None, gt=0, allow_inf_nan=False)
+    batch_points: int | None=Field(default=None, ge=MIN_BATCH_POINTS, le=MAX_BATCH_POINTS)
+    roi_min_m: list[float] | None=None
+    roi_max_m: list[float] | None=None
+    association_spacing_multiplier: float | None=Field(default=None, gt=0, allow_inf_nan=False)
+    boundary_margin_m: float | None=Field(default=None, ge=0, allow_inf_nan=False)
+    unsupported_observations: Literal['exclude','include']='exclude'
+    mask_deleted_triangles: bool=True
+    memory_budget_gib: float | None=Field(default=None, gt=0, allow_inf_nan=False)
 
 class ReconstructionRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
     trajectory: str
+    algorithm: Literal['vdbfusion','nksr']='nksr'
     voxel_size_m: float=Field(default=DEFAULT_VOXEL_SIZE_M, ge=0, allow_inf_nan=False)
     save_full_density: bool=False
     filter_edited_geometry: bool=False
     edit_id: str | None=None
     filter_tolerance_m: float | None=Field(default=None, gt=0, allow_inf_nan=False)
+    # VDBFusion TSDF settings. Ignored for NKSR requests, which keep their own controls.
+    vdbfusion: VDBFusionSettings | None=None
+
 
 class MeshRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', allow_inf_nan=False)
@@ -39,6 +61,9 @@ class MeshRequest(BaseModel):
     normal_knn: int=Field(default=64, ge=1, le=1024)
     normal_drop_angle_deg: float=Field(default=85, gt=0, le=90)
     mise_iter: int=Field(default=1, ge=0, le=4)
+    # VDBFusion TSDF overrides. The engine always comes from the prepared run, so a
+    # request can never silently switch a job from one algorithm to the other.
+    vdbfusion: VDBFusionSettings | None=None
 
 class NKSRCheck(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -284,17 +309,45 @@ def make_app(root=ROOT,mock=None):
         s=app.state.service
         async with s.lock: return await check(s,body.device)
 
+    @app.get('/api/vdbfusion')
+    async def vdbfusion_health():
+        from .vdbfusion_jobs import health
+        return health(app.state.service)
+
+    @app.post('/api/vdbfusion/check', status_code=202)
+    async def check_vdbfusion():
+        from .vdbfusion_jobs import check
+        s=app.state.service
+        async with s.lock: return await check(s)
+
     @app.post('/api/sessions/{sid}/reconstruction/{rid}/mesh', status_code=202)
     async def reconstruct_mesh(sid:str,rid:str,body:MeshRequest):
-        from .nksr_jobs import reconstruct
         s=app.state.service
-        async with s.lock: return await reconstruct(s,sid,rid,body.model_dump())
+        request=body.model_dump()
+        async with s.lock:
+            # The engine comes from the prepared run so a request can never switch it.
+            from .vdbfusion_jobs import run_algorithm
+            from .engines import VDBFUSION
+            if run_algorithm(s,sid,rid)==VDBFUSION:
+                from .vdbfusion_jobs import reconstruct as vdbfusion_reconstruct
+                settings=request.pop('vdbfusion') or {}
+                settings.update(mesh_output_mode=request['mesh_output_mode'], chunk_size=request['chunk_size'])
+                return await vdbfusion_reconstruct(s,sid,rid,settings)
+            from .nksr_jobs import reconstruct
+            request.pop('vdbfusion',None)
+            return await reconstruct(s,sid,rid,request)
 
     @app.post('/api/sessions/{sid}/reconstruction/{rid}/cancel')
     async def cancel_mesh(sid:str,rid:str):
-        from .nksr_jobs import cancel
         s=app.state.service
-        async with s.lock: return await cancel(s,sid,rid)
+        async with s.lock:
+            from .vdbfusion_jobs import run_algorithm
+            from .engines import VDBFUSION
+            if run_algorithm(s,sid,rid)==VDBFUSION:
+                from .vdbfusion_jobs import cancel as vdbfusion_cancel
+                return await vdbfusion_cancel(s,sid,rid)
+            from .nksr_jobs import cancel
+            return await cancel(s,sid,rid)
 
     @app.get('/api/sessions/{sid}/reconstruction')
     async def reconstruction_status(sid:str):
@@ -307,9 +360,12 @@ def make_app(root=ROOT,mock=None):
         s=app.state.service
         async with s.lock:
             if not body.filter_edited_geometry:
-                return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density)
+                return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density,
+                                   algorithm=body.algorithm,
+                                   vdbfusion=body.vdbfusion.model_dump() if body.vdbfusion else None)
             return await start(s, sid, body.trajectory, body.voxel_size_m, body.save_full_density,
-                               True, body.edit_id, body.filter_tolerance_m)
+                               True, body.edit_id, body.filter_tolerance_m, algorithm=body.algorithm,
+                               vdbfusion=body.vdbfusion.model_dump() if body.vdbfusion else None)
 
     @app.get('/api/sessions/{sid}/colorization')
     async def colorization_status(sid:str):
@@ -331,7 +387,7 @@ def make_app(root=ROOT,mock=None):
     @app.get('/api/sessions')
     async def sessions(): return await asyncio.to_thread(app.state.service.sessions.list)
     def project_transfer_ready(service):
-        if service.capture.busy or service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool','reconstruction','nksr','nksr_check')):
+        if service.capture.busy or service.active or any(service.pm.active(key) for key in ('recording','glim','offline','export','tool','calibration_record','calibration_tool','reconstruction','nksr','nksr_check','vdbfusion','vdbfusion_check')):
             raise ValueError('Stop recording and processing before transferring a project')
     @app.get('/api/sessions/{sid}/project')
     async def export_project(sid:str):

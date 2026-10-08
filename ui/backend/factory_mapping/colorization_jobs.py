@@ -51,7 +51,7 @@ async def start(service, sid, settings):
         raise ValueError('Colorization requires a real recorded session')
     if service.capture.busy or service.active or any(service.pm.active(key) for key in
             ('recording', 'glim', 'offline', 'export', 'tool', 'calibration_record',
-             'calibration_tool', 'reconstruction', 'nksr', 'nksr_check', 'colorization')):
+             'calibration_tool', 'reconstruction', 'nksr', 'nksr_check', 'vdbfusion', 'vdbfusion_check', 'colorization')):
         raise ValueError('Finish capture and processing before colorizing')
     if not (session / 'raw_bag/metadata.yaml').is_file():
         raise ValueError('Raw bag metadata is missing')

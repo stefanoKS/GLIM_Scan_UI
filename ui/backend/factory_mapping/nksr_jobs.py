@@ -8,6 +8,10 @@ import uuid
 import time
 from .storage import atomic_json, read_json, now
 from .nksr_mesh import inspect_mesh
+from .engines import ENGINE_PROCESS_KEYS
+
+# Worker progress file per engine; NKSR keeps its historical name.
+PROGRESS_FILES = {'nksr': 'nksr_progress.json', 'vdbfusion': 'vdbfusion_progress.json'}
 
 
 def interpreter(root):
@@ -44,7 +48,7 @@ async def check(service, device='auto'):
     service.require_processing()
     python=interpreter(service.root)
     if not python.is_file(): raise ValueError('NKSR_NOT_INSTALLED: run scripts/setup_nksr.sh')
-    if service.capture.busy or service.active or any(service.pm.active(k) for k in ('nksr','nksr_check','reconstruction','offline','glim','tool')):
+    if service.capture.busy or service.active or any(service.pm.active(k) for k in (*ENGINE_PROCESS_KEYS,'reconstruction','offline','glim','tool')):
         raise ValueError('Wait for active capture or processing before checking NKSR')
     target=service.root/'.state/nksr_health.json'
     atomic_json(target,dict(status='CHECKING',python=str(python),checked_at=time.time()))
@@ -63,9 +67,9 @@ def get_run(service,sid,rid):
     return run
 
 
-def mesh_state(run):
+def mesh_state(run, algorithm='nksr'):
     result=read_json(run/'mesh_job.json',{'state':'NOT_RECONSTRUCTED'})
-    progress=read_json(run/'nksr_progress.json',{})
+    progress=read_json(run/(PROGRESS_FILES.get(algorithm) or 'nksr_progress.json'),{})
     if result['state']=='RUNNING':
         result['stage']=progress.get('stage','LOADING_MODEL')
         if result['stage']=='COMPLETED': result['stage']='VALIDATING_MESH'
@@ -229,7 +233,7 @@ async def reconstruct(service,sid,rid,settings):
             raise ValueError('Prepared input is stale because the saved cleanup source changed; prepare again')
     if service.mock: raise ValueError('Real NKSR requires real prepared input')
     if service.capture.busy or service.active or any(service.pm.active(k) for k in
-            ('nksr','nksr_check','reconstruction','offline','export','tool','glim','recording')):
+            (*ENGINE_PROCESS_KEYS,'reconstruction','offline','export','tool','glim','recording')):
         raise ValueError('Finish capture and active processing first')
     python=interpreter(service.root)
     if not python.is_file(): raise ValueError('NKSR_NOT_INSTALLED: run scripts/setup_nksr.sh')

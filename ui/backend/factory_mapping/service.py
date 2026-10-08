@@ -101,7 +101,7 @@ class Service:
             elif self.active: await self.stop_session()
             if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
             # Recorders and consumers first, sensor publishers last.
-            order=('recording','calibration_record','glim','nksr','nksr_check','reconstruction',
+            order=('recording','calibration_record','glim','nksr','nksr_check','vdbfusion','vdbfusion_check','reconstruction',
                    'calibration_tool','offline','export','tool','validator',
                    'camera_preview','camera_monitor','camera','preview','monitor','driver')
             for key in dict.fromkeys((*order,*self.pm.items)):
@@ -420,7 +420,7 @@ class Service:
         await self.capture.close()
         if self.calibrations.active: await self.calibrations.capture_stop(self.calibrations.active[0].name)
         await self.stop_session()
-        for k in ('nksr','nksr_check','reconstruction','calibration_record','calibration_tool','offline','export','tool','validator','camera_preview','camera_monitor','camera','preview','monitor','driver'):
+        for k in ('nksr','nksr_check','vdbfusion','vdbfusion_check','reconstruction','calibration_record','calibration_tool','offline','export','tool','validator','camera_preview','camera_monitor','camera','preview','monitor','driver'):
             if self.pm.items.get(k,{}).get('state')!='orphaned': await self.pm.stop(k,self.config['system']['shutdown']['glim_timeout'] if k in ('offline','export','tool','calibration_tool') else 20,cancel=True)
 
     def camera_calibration(self):

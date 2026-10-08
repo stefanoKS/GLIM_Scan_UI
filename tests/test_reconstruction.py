@@ -181,13 +181,20 @@ def test_ui_units_and_advanced_scope():
     root=Path(__file__).resolve().parents[1]
     html=(root/'ui/frontend/index.html').read_text()
     section=html.split('id="surface-reconstruction"')[1].split('</section>')[0]
-    advanced=section.split('<details>')[1].split('</details>')[0]
+    # Preparation sampling stays NKSR's own control, in centimetres, in its own block.
+    advanced=section.split('id="nksr-advanced"')[1].split('</details>')[0]
     assert 'id="voxel-size-cm"' in advanced and 'value="1.0"' in advanced
     assert 'min="0.2"' in advanced and 'max="20"' in advanced
+    # VDBFusion TSDF resolution is a separate control in metres, never a shared one.
+    vdbfusion=section.split('id="vdbfusion-advanced"')[1].split('</details>')[0]
+    assert 'id="vdbfusion-voxel"' in vdbfusion and 'id="vdbfusion-trunc"' in vdbfusion
+    assert 'value="0.02"' in vdbfusion and 'value="0.06"' in vdbfusion
     app=(root/'ui/frontend/app.js').read_text()
     assert 'voxel_size_m:cm/100.0' in app
     assert 'filter_edited_geometry:filtering' in app and 'filter_tolerance_m:tolerance' in app
     assert 'id="filter-edited-geometry"' in section and 'id="edited-source"' in section
+    # The algorithm choice is the first control of the section.
+    assert section.index('name="reconstruction-algorithm"')<section.index('id="reconstruction-trajectory"')
 
 
 def test_api_preparation_default_and_overrides(root, monkeypatch):
@@ -195,8 +202,8 @@ def test_api_preparation_default_and_overrides(root, monkeypatch):
     from factory_mapping.api import make_app
     from factory_mapping import reconstruction_jobs
     calls=[]
-    async def start(service,sid,trajectory,size,save_full):
-        calls.append((sid,trajectory,size,save_full))
+    async def start(service,sid,trajectory,size,save_full,**kwargs):
+        calls.append((sid,trajectory,size,save_full,kwargs))
         return {'state':'running'}
     monkeypatch.setattr(reconstruction_jobs,'start',start)
     with TestClient(make_app(root,True)) as client:
@@ -204,7 +211,16 @@ def test_api_preparation_default_and_overrides(root, monkeypatch):
             response=client.post('/api/sessions/test/reconstruction',json={'trajectory':'traj_lidar.txt',**params})
             assert response.status_code==202
             assert calls[-1][2]==expected
+            # A request without an algorithm stays a legacy NKSR preparation.
+            assert calls[-1][4]['algorithm']=='nksr' and calls[-1][4].get('vdbfusion') is None
         assert client.post('/api/sessions/test/reconstruction',json={'trajectory':'x','voxel_size_m':-1}).status_code==422
+        # The engine is carried through explicitly when a client selects one.
+        assert client.post('/api/sessions/test/reconstruction',
+                           json={'trajectory':'traj_lidar.txt','algorithm':'vdbfusion',
+                                 'vdbfusion':{'preset':'detailed'}}).status_code==202
+        assert calls[-1][4]['algorithm']=='vdbfusion' and calls[-1][4]['vdbfusion']['preset']=='detailed'
+        assert client.post('/api/sessions/test/reconstruction',
+                           json={'trajectory':'traj_lidar.txt','algorithm':'poisson'}).status_code==422
 
 
 def test_glim_export_without_nksr(root, monkeypatch):

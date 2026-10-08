@@ -20,7 +20,7 @@ cd GLIM_Scan_UI
 
 Despite its name, `bootstrap_jetson.sh` supports both roles. Without a flag it selects recording-only on ARM64 and workstation on x86_64. Prefer the explicit commands above. Installation needs internet access and sudo for distribution packages; it builds native dependencies locally and does not upgrade JetPack or the OS.
 
-The role is saved in `.state/deployment.json`. Recording-only mode blocks live/automatic GLIM, map tools, reconstruction preparation and NKSR even if older processing binaries remain installed. Transferring a project does not change the receiving machine's role. Workstation bootstrap probes CUDA and can use CPU GLIM when CUDA is unavailable; it does not install NKSR automatically.
+The role is saved in `.state/deployment.json`. Recording-only mode blocks live/automatic GLIM, map tools, reconstruction preparation and both reconstruction engines even if older processing binaries remain installed. Neither engine is installed on a recording-only deployment. Transferring a project does not change the receiving machine's role. Workstation bootstrap probes CUDA and can use CPU GLIM when CUDA is unavailable; it does not install NKSR automatically.
 
 See [installation and upgrades](docs/installation_jetson.md) for prerequisites, build controls, network setup and source-only transfer.
 
@@ -82,7 +82,7 @@ scripts/process_bag.sh SESSION_ID --preset jetson_cpu
 
 `jetson_cpu` is the CPU GLIM preset's historical name; it does not enable processing on a recording-only Jetson. Each processing attempt creates a new `processing/run_NNN/`. Raw bags remain unchanged. Library also provides processing and the upstream native editing tools; native windows open on the workstation's desktop, not inside a remote browser.
 
-Optional [NKSR surface reconstruction](docs/nksr.md) uses a separate workstation environment. Preparing point input and reconstructing a mesh are separate steps from GLIM optimized PLY export.
+Surface reconstruction offers two engines on the workstation, selected as the first control under **Surface Reconstruction**: [VDBFusion](docs/vdbfusion.md) (fast TSDF, the default for new jobs when installed) and [NKSR](docs/nksr.md) (neural reconstruction). Both use their own isolated environment. Preparing point input and reconstructing a mesh are separate steps from GLIM optimized PLY export, and a run prepared for one engine is never reconstructed by the other.
 
 Optional [camera RGB colorization](docs/colorization.md) produces the master colored point cloud and can copy its color onto the GLIM PLY and the NKSR mesh. Automatic target selection is bound to the colorized processing run and refuses to guess when the lineage is ambiguous.
 
@@ -117,7 +117,8 @@ Run the [four camera hardware cases](docs/camera_auto_resolution.md#jetson-comma
 | [Camera setup](docs/camera_calibration.md) | D405/DFK installation, intrinsics and alignment datasets |
 | [Camera selection](docs/camera_auto_resolution.md) | State machine, performance tests and hardware commands |
 | [GLIM tools](docs/glim_tools.md) | Native editing, merging and cleanup on the workstation |
-| [Editing and surfacing](docs/editing_and_surfacing.md) | End-to-end saved-map cleanup, export, preparation and NKSR mesh workflow |
+| [Editing and surfacing](docs/editing_and_surfacing.md) | End-to-end saved-map cleanup, export, preparation and mesh workflow for either engine |
+| [VDBFusion](docs/vdbfusion.md) | Fast TSDF engine: isolated install, settings, streaming, edited-geometry association, measured results |
 | [NKSR](docs/nksr.md) | Workstation surface preparation, reconstruction and validation |
 | [Colorization](docs/colorization.md) | RGB point cloud, run lineage, bounded observations and color transfer |
 | [Architecture](docs/architecture.md) | Process ownership, snapshots, camera isolation and recovery |

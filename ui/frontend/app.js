@@ -89,6 +89,37 @@ $('open-viewer').onclick=()=>openTool('offline_viewer');$('open-editor').onclick
 let reconstructionPending=false,reconstructionData=null,reconstructionSession=null;
 // Individual mesh links stay bounded; the manifest lists every cell.
 const MESH_LINK_LIMIT=24,meshFileCache=new Map();
+// Stable engine identifiers shared with the API. VDBFusion is preferred when available.
+const VDBFUSION_PRESETS={fast:[0.02,0.06],detailed:[0.01,0.03],experimental:[0.005,0.015]};
+function algorithm(){return $('algorithm-nksr').checked?'nksr':'vdbfusion'}
+function vdbfusionAvailable(){const h=reconstructionData?.vdbfusion;return !!h&&h.status!=='VDBFUSION_NOT_INSTALLED'&&h.status!=='RECORD_ONLY'}
+function roiValues(){
+ const parse=value=>{const parts=String(value).trim().split(/[\s,]+/).filter(Boolean);if(!parts.length)return null;
+  if(parts.length!==3)throw Error('A region of interest needs exactly three world coordinates in meters');
+  const numbers=parts.map(Number);if(numbers.some(v=>!Number.isFinite(v)))throw Error('Region-of-interest coordinates must be finite meters');return numbers};
+ const min=parse($('vdbfusion-roi-min').value),max=parse($('vdbfusion-roi-max').value);
+ if((min&&!max)||(max&&!min))throw Error('Provide both a region-of-interest minimum and maximum corner');
+ return {roi_min_m:min,roi_max_m:max};
+}
+function vdbfusionSettings(){
+ const voxel=Number($('vdbfusion-voxel').value),trunc=Number($('vdbfusion-trunc').value);
+ if(!(voxel>0))throw Error('TSDF voxel size must be a positive size in meters');
+ if(!(trunc>0))throw Error('TSDF truncation distance must be a positive distance in meters');
+ if(trunc<voxel)throw Error('TSDF truncation distance must be at least the voxel size');
+ const optional=(id)=>{const raw=$(id).value.trim();if(!raw)return null;const value=Number(raw);if(!Number.isFinite(value))throw Error('Enter a finite number or leave the field empty');return value};
+ const preset=$('vdbfusion-preset').value;
+ return {preset:preset||null,voxel_size_m:voxel,sdf_trunc_m:trunc,space_carving:$('vdbfusion-space-carving').checked,
+  mesh_output_mode:$('vdbfusion-output-mode').value,...roiValues(),
+  origin_error_budget_m:optional('vdbfusion-origin-budget'),
+  association_spacing_multiplier:optional('vdbfusion-association-multiplier'),
+  boundary_margin_m:optional('vdbfusion-boundary-margin'),
+  unsupported_observations:$('vdbfusion-unsupported').value,
+  mask_deleted_triangles:$('vdbfusion-mask-triangles').checked,
+  memory_budget_gib:optional('vdbfusion-memory-budget')};
+}
+function presetLabel(){const preset=$('vdbfusion-preset').value;const note=VDBFUSION_PRESETS[preset];
+ return preset==='experimental'?'Experimental 5 mm TSDF: whole-factory scans can need very large memory and long runtimes.'
+  :(note?`${preset} preset: ${(note[0]*1000).toFixed(0)} mm voxel, ${(note[1]*1000).toFixed(0)} mm truncation.`:'Custom TSDF settings.')}
 function nksrSettings(){
  return {preparation_voxel_size_m:Number($('voxel-size-cm').value)/100.0,mode:$('nksr-mode').value,device:$('nksr-device').value,
   mesh_output_mode:$('nksr-output-mode').value,
@@ -97,16 +128,40 @@ function nksrSettings(){
 }
 function renderReconstruction(){
  const data=reconstructionData,job=data?.jobs.find(j=>j.id===$('nksr-input-run').value),meta=job?.metadata;
- const busy=reconstructionPending||['running','stopping','orphaned'].includes(latestStatus?.processes?.nksr?.state);
+ const engine=algorithm(),engineJob=meta?.algorithm||job?.algorithm||'nksr';
+ // Each engine owns its own managed process, so busy state is engine specific.
+ const engineBusy=['running','stopping','orphaned'].includes(latestStatus?.processes?.[engine]?.state);
+ const busy=reconstructionPending||engineBusy||
+  ['running','stopping','orphaned'].includes(latestStatus?.processes?.reconstruction?.state);
  const filter=$('filter-edited-geometry').checked,source=$('edited-source').value,tolerance=Number($('edited-tolerance').value);
- $('edited-source-label').hidden=!filter;$('edited-tolerance-label').hidden=!filter;$('edited-filter-note').hidden=!filter;
- $('reconstruction-trajectory').disabled=filter;$('edited-source').disabled=!filter;$('edited-tolerance').disabled=!filter;
+ const needsTolerance=filter&&engine==='nksr';
+ $('edited-source-label').hidden=!filter;$('edited-tolerance-label').hidden=!needsTolerance;$('edited-filter-note').hidden=!filter;
+ $('reconstruction-trajectory').disabled=filter;$('edited-source').disabled=!filter;$('edited-tolerance').disabled=!needsTolerance;
+ $('vdbfusion-advanced').hidden=engine!=='vdbfusion';$('nksr-advanced').hidden=engine!=='nksr';
+ $('vdbfusion-preset-note').textContent=presetLabel();
+ $('edited-filter-note').textContent=engine==='nksr'
+  ?'Approximate retained-geometry filtering. It does not prevent NKSR from bridging deleted regions.'
+  :'VDBFusion classifies every observation against the verified kept and removed submap geometry, then masks any triangle inside a removed region. It is an approximate spatial association, not an exact edit transfer.';
+ // Edit status (GATE 7E): verified saved edit, filtering strategy and retained share.
+ const editSource=data?.edited_sources.find(edit=>edit.id===source);
+ const editAccuracy=meta?.edit_filter_accuracy||job?.metadata?.edit_filter_accuracy||null;
+ $('edited-status').hidden=!filter||!selected;
+ if(filter)$('edited-status').textContent=
+  (editSource?`Saved edit verified${editSource.export_ready?'':' · export required'}`:'Select a saved cleanup')+
+  (meta?.edited_geometry?` · Filtering: ${editAccuracy==='validated_approximate'?'validated approximate':(editAccuracy||'unavailable')} · cleanup retains ${((meta.edited_geometry.retained_ratio||0)*100).toFixed(1)}% of submap samples`:'')+
+  (editAccuracy==='validated_approximate'?'':' · Warning: large areas may have insufficient coverage');
+ // Never silently substitute an engine: unavailable VDBFusion blocks VDBFusion jobs.
+ const vdb=data?.vdbfusion;
+ $('vdbfusion-availability').textContent=vdb?`VDBFusion: ${vdb.status}${vdb.vdbfusion_version?' · v'+vdb.vdbfusion_version:''}${vdb.message?' · '+vdb.message:''}`:'VDBFusion: select a scan to check availability';
  const sourceSettings=job?.edited_geometry_source||{},sourceStale=filter!==!!job?.filter_edited_geometry||
-  (filter&&(sourceSettings.edit_id!==source||Math.abs((sourceSettings.tolerance_m||0)-tolerance)>1e-12));
- const prepared=job?.state==='PREPARED',stale=prepared&&(Math.abs(meta.voxel_size_m-Number($('voxel-size-cm').value)/100)>1e-12||(!filter&&job.trajectory!==$('reconstruction-trajectory').value)||sourceStale);
+  (filter&&(sourceSettings.edit_id!==source||(engine==='nksr'&&Math.abs((sourceSettings.tolerance_m||0)-tolerance)>1e-12)));
+ const preparationVoxel=Number($('voxel-size-cm').value)/100;
+ const prepared=job?.state==='PREPARED',stale=prepared&&(engine!==engineJob||
+  (engine==='nksr'&&Math.abs((meta.voxel_size_m||0)-preparationVoxel)>1e-12)||
+  (!filter&&job.trajectory!==$('reconstruction-trajectory').value)||sourceStale);
  $('reconstruction-results').replaceChildren();$('nksr-mesh-results').replaceChildren();
  const preparing=data?.jobs.find(j=>j.state==='PREPARING');
- $('reconstruction-status').textContent=preparing?`PREPARING · ${preparing.progress}`:stale?'Prepared input is stale. Prepare again with the selected trajectory and voxel size.':prepared?'PREPARED · ready for mesh reconstruction.':data?.jobs.at(-1)?.state||'NOT_PREPARED';
+ $('reconstruction-status').textContent=preparing?`PREPARING · ${preparing.progress}`:stale?'Prepared input is stale. Prepare again with the selected algorithm, trajectory and settings.':prepared?`PREPARED · ${engineJob} · ready for mesh reconstruction.`:data?.jobs.at(-1)?.state||'NOT_PREPARED';
  $('reconstruction-status').dataset.state=preparing?'preparing':stale?'stale':prepared?'prepared':String(data?.jobs.at(-1)?.state||'').toLowerCase();
  if(prepared&&meta?.points_after_voxel!==undefined){
   const label=meta.voxel_size_m===0?'sampling disabled':`after ${(meta.voxel_size_m*100).toFixed(1)} cm voxel sampling`;
@@ -117,10 +172,28 @@ function renderReconstruction(){
    button.onclick=()=>name==='Preview input'?showCloud(path):download(path);$('reconstruction-results').append(button);
   }
  }
+ if(prepared&&engineJob==='vdbfusion'&&meta?.settings){
+  const scan=meta.preflight||{},settings=meta.settings;
+  $('reconstruction-results').append(el('p',`VDBFusion source validation: ${(meta.lidar_frames||0).toLocaleString()} LiDAR frames, about ${(meta.points_before_voxel||0).toLocaleString()} raw observations (sampled estimate). No prepared point cloud is written; the raw bag is streamed during reconstruction.`));
+  $('reconstruction-results').append(el('p',`TSDF: ${(settings.voxel_size_m*1000).toFixed(0)} mm voxel, ${(settings.sdf_trunc_m*1000).toFixed(0)} mm truncation, space carving ${settings.space_carving?'on':'off'}.`));
+  if(scan.observed_extent_m)$('reconstruction-results').append(el('p',`Sampled extent: ${scan.observed_extent_m.map(v=>v.toFixed(1)).join(' × ')} m · free RAM ${(scan.free_ram_bytes/1073741824).toFixed(1)} GiB · free disk ${(scan.free_disk_bytes/1073741824).toFixed(1)} GiB`));
+  for(const warning of scan.warnings||[])$('reconstruction-results').append(el('p',`Warning: ${warning}`));
+  if(meta.edit_filter_accuracy){
+   const edit=meta.edited_geometry||{};
+   $('reconstruction-results').append(el('p',`Filtering: ${meta.edit_filter_accuracy==='validated_approximate'?'validated approximate':'exact'} · saved cleanup keeps ${((edit.retained_ratio||0)*100).toFixed(1)}% of ${(edit.reference_points||0).toLocaleString()} submap samples · association radius ${(edit.association_radius_m||0).toFixed(3)} m`));
+  }
+  for(const [name,file] of [['Download preparation metadata','input/vdbfusion_prepare.json']]){
+   const button=el('button',name);button.onclick=()=>download(`reconstruction/${job.id}/${file}`);$('reconstruction-results').append(button);
+  }
+ }
  const h=data?.nksr;
  $('nksr-health').textContent=h?`NKSR: ${h.status}${h.gpu_name?' · GPU: '+h.gpu_name:''}${h.message?' · '+h.message:''}`:'NKSR: select a scan to check availability';
  $('nksr-check').disabled=!h||h.status==='NKSR_NOT_INSTALLED'||h.status==='CHECKING'||busy;
- const ready=h?.smoke_passed&&(h.status==='READY'||(h.cpu_ready&&$('nksr-device').value!=='cuda'));
+ $('vdbfusion-check').disabled=!vdb||vdb.status==='VDBFUSION_NOT_INSTALLED'||vdb.status==='CHECKING'||busy;
+ $('vdbfusion-health').hidden=engine!=='vdbfusion';$('vdbfusion-check').hidden=engine!=='vdbfusion';
+ $('nksr-health').hidden=engine!=='nksr';$('nksr-check').hidden=engine!=='nksr';
+ const nksrReady=h?.smoke_passed&&(h.status==='READY'||(h.cpu_ready&&$('nksr-device').value!=='cuda'));
+ const ready=engine==='vdbfusion'?(!!vdb&&vdb.smoke_passed&&vdb.status==='READY'):!!nksrReady;
  $('reconstruct-mesh').disabled=!prepared||stale||!ready||busy||!!preparing||!!latestStatus?.capture?.busy;
  const lowRam=$('nksr-mode').value==='low_ram';
  $('nksr-detail').disabled=lowRam||$('nksr-mode').value==='chunked';
@@ -129,8 +202,32 @@ function renderReconstruction(){
   'Auto selects full or chunked inference from point count and available GPU memory. Detail level applies only to full mode. Chunked extraction uses CPU. CPU inference can be very slow.';
  const mesh=job?.mesh;
  $('cancel-mesh').hidden=mesh?.state!=='RUNNING';
- $('nksr-mesh-status').textContent=mesh?`${mesh.stage||mesh.state}${mesh.message?' · '+mesh.message:''}${mesh.progress?.message?' · '+mesh.progress.message:''}`:'NOT_RECONSTRUCTED';
+ // The progress file and the job record can carry the same sentence; show it once.
+ const meshDetail=[mesh?.message,mesh?.progress?.message].filter((t,i,a)=>t&&a.indexOf(t)===i).join(' · ');
+ $('nksr-mesh-status').textContent=mesh?`${mesh.stage||mesh.state}${meshDetail?' · '+meshDetail:''}`:'NOT_RECONSTRUCTED';
  $('nksr-mesh-status').dataset.state=mesh?String(mesh.state||'').toLowerCase():'';
+ if(mesh?.state==='COMPLETED'&&(mesh.metadata?.engine==='vdbfusion'||engineJob==='vdbfusion')){
+  const m=mesh.metadata||{},integration=m.integration||{},preflight=m.preflight||{};
+  $('nksr-mesh-results').append(el('p',`VDBFusion mesh · one fused TSDF · ${(m.face_count||0).toLocaleString()} triangles · ${(m.vertex_count||0).toLocaleString()} vertices${m.output_bytes!=null?` · ${(m.output_bytes/1048576).toFixed(1)} MiB on disk`:''}`));
+  if(m.bounding_box_min)$('nksr-mesh-results').append(el('p',`Bounds: ${m.bounding_box_min.map(v=>v.toFixed(2)).join(', ')} → ${m.bounding_box_max.map(v=>v.toFixed(2)).join(', ')} m · world meters, no local origin shift`));
+  $('nksr-mesh-results').append(el('p',`Integrated ${(integration.integrated_observations||0).toLocaleString()} of ${(integration.raw_observations||0).toLocaleString()} raw observations in ${(integration.origin_groups||0).toLocaleString()} motion-aware origin groups · max origin approximation error ${((integration.max_origin_error_m||0)*1000).toFixed(1)} mm of the ${((integration.origin_error_budget_m||0)*1000).toFixed(1)} mm budget`));
+  if(integration.edit_filter_enabled){
+   $('nksr-mesh-results').append(el('p',`Filtering: ${integration.edit_filter_accuracy==='validated_approximate'?'validated approximate':'exact'} · retained ${(integration.points_retained||0).toLocaleString()} of ${(integration.points_before_filter||0).toLocaleString()} observations (${((integration.filter_retention_ratio||0)*100).toFixed(2)}%) · removed-support dominated ${(integration.points_dropped_removed_support||0).toLocaleString()} · unsupported ${(integration.points_dropped_unsupported||0).toLocaleString()} (${integration.unsupported_observations}) · masked triangles ${(m.extraction?.masked_triangles||0).toLocaleString()}`));
+   $('nksr-mesh-results').append(el('p',`Filtering limitation: ${integration.edit_reference?.limitation||''}`));
+  }
+  $('nksr-mesh-results').append(el('p',`Elapsed ${(m.elapsed_seconds||0).toFixed(1)} s · peak worker RSS ${((integration.peak_rss_bytes||0)/1048576).toFixed(0)} MiB · estimated TSDF footprint ${(preflight.estimated_tsdf_bytes/1073741824).toFixed(1)} GiB`));
+  if(m.validation_note)$('nksr-mesh-results').append(el('p',m.validation_note));
+  if(m.mesh_output_mode!=='chunks'){
+   const button=el('button','Download merged mesh');button.onclick=()=>download(`reconstruction/${job.id}/output/mesh.ply`);$('nksr-mesh-results').append(button);
+  }
+  const metadata=el('button','Download VDBFusion metadata');metadata.onclick=()=>download(`reconstruction/${job.id}/output/vdbfusion_metadata.json`);$('nksr-mesh-results').append(metadata);
+  if(m.mesh_output_mode!=='merged'&&m.chunk_count!=null){
+   $('nksr-mesh-results').append(el('p',`${m.chunk_count} export cells at ${m.chunk_size_m} m (${m.chunk_size_source})`));
+   const manifest=el('button','Download cells manifest');manifest.onclick=()=>download(`reconstruction/${job.id}/output/mesh_chunks/chunks.json`);$('nksr-mesh-results').append(manifest);
+  }
+  if(job){const log=el('button','Preparation / reconstruction log');log.onclick=()=>download(`reconstruction/${job.id}/job.log`);$('reconstruction-results').append(log)}
+  return;
+ }
  if(mesh?.state==='COMPLETED'){
   const m=mesh.metadata,lowRamResult=m.actual_mode==='low_ram';
   const modeLabel=lowRamResult?`Low RAM · ${m.completed_tiles}/${m.tile_count} independent tiles`:m.actual_mode;
@@ -193,23 +290,43 @@ async function reconstructionPanel(){
  if(data.edited_sources.some(edit=>edit.id===previousEdit&&edit.export_ready))editSelect.value=previousEdit;
  $('prepare-reconstruction').disabled ||= !data.trajectories.length||!data.raw_bag;
  const runs=$('nksr-input-run'),previous=reconstructionSession===sid?runs.value:'';runs.replaceChildren();
- for(const job of data.jobs){const option=el('option',`${job.id} · ${job.state}`);option.value=job.id;runs.append(option)}
+ // The engine is part of the label because a prepared run is bound to one algorithm.
+ for(const job of data.jobs){const option=el('option',`${job.id} · ${job.algorithm==='vdbfusion'?'VDBFusion':'NKSR'} · ${job.state}`);option.value=job.id;runs.append(option)}
  if(data.jobs.some(j=>j.id===previous))runs.value=previous;else if(runs.options.length)runs.selectedIndex=runs.options.length-1;
  reconstructionSession=sid;renderReconstruction();
 }
 $('reconstruction-form').onsubmit=async event=>{
  event.preventDefault();if(reconstructionPending||!selected)return;
- const cm=Number($('voxel-size-cm').value);if(!Number.isFinite(cm)||cm<0.2||cm>20){error(Error('Voxel size must be between 0.2 and 20 cm'));return}
+ const engine=algorithm(),cm=Number($('voxel-size-cm').value);
+ if(engine==='nksr'&&(!Number.isFinite(cm)||cm<0.2||cm>20)){error(Error('Preparation voxel must be between 0.2 and 20 cm'));return}
  const filtering=$('filter-edited-geometry').checked,tolerance=Number($('edited-tolerance').value);
- if(filtering&&(!$('edited-source').value||!Number.isFinite(tolerance)||tolerance<=0)){error(Error('Select an exported saved cleanup and a positive tolerance'));return}
+ if(filtering&&!$('edited-source').value){error(Error('Select an exported saved cleanup'));return}
+ // Only NKSR needs a proximity tolerance; VDBFusion measures its own association radius.
+ if(engine==='nksr'&&filtering&&(!Number.isFinite(tolerance)||tolerance<=0)){error(Error('Select an exported saved cleanup and a positive tolerance'));return}
+ if(engine==='vdbfusion'&&!vdbfusionAvailable()){error(Error(`VDBFusion is not available: ${reconstructionData?.vdbfusion?.status||'check the installation'}. Install it with scripts/setup_vdbfusion.sh. NKSR is never substituted automatically.`));return}
+ let vdbfusion=null;
+ try{vdbfusion=engine==='vdbfusion'?vdbfusionSettings():null}catch(e){error(e);return}
  reconstructionPending=true;$('prepare-reconstruction').disabled=true;
- try{await json(`sessions/${selected}/reconstruction`,{trajectory:$('reconstruction-trajectory').value,voxel_size_m:cm/100.0,filter_edited_geometry:filtering,...(filtering?{edit_id:$('edited-source').value,filter_tolerance_m:tolerance}:{})});reconstructionSession=null;await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
+ const body={trajectory:$('reconstruction-trajectory').value,algorithm:engine,voxel_size_m:cm/100.0,
+  filter_edited_geometry:filtering,...(filtering?{edit_id:$('edited-source').value,filter_tolerance_m:tolerance}:{}),
+  ...(vdbfusion?{vdbfusion}:{})};
+ try{await json(`sessions/${selected}/reconstruction`,body);reconstructionSession=null;await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };
-for(const id of ['voxel-size-cm','reconstruction-trajectory','filter-edited-geometry','edited-source','edited-tolerance','nksr-input-run','nksr-mode','nksr-device','nksr-output-mode','nksr-detail','nksr-chunk','nksr-knn','nksr-angle','nksr-mise'])$(id).addEventListener('input',renderReconstruction);
+for(const id of ['voxel-size-cm','reconstruction-trajectory','filter-edited-geometry','edited-source','edited-tolerance','nksr-input-run','nksr-mode','nksr-device','nksr-output-mode','nksr-detail','nksr-chunk','nksr-knn','nksr-angle','nksr-mise','vdbfusion-voxel','vdbfusion-trunc','vdbfusion-space-carving','vdbfusion-output-mode','vdbfusion-roi-min','vdbfusion-roi-max','vdbfusion-origin-budget','vdbfusion-association-multiplier','vdbfusion-boundary-margin','vdbfusion-unsupported','vdbfusion-mask-triangles','vdbfusion-memory-budget'])$(id).addEventListener('input',()=>{if(id.startsWith('vdbfusion-voxel')||id==='vdbfusion-trunc')$('vdbfusion-preset').value='';renderReconstruction()});
+for(const id of ['algorithm-vdbfusion','algorithm-nksr'])$(id).addEventListener('change',renderReconstruction);
+$('vdbfusion-preset').onchange=()=>{const preset=VDBFUSION_PRESETS[$('vdbfusion-preset').value];
+ if(preset){$('vdbfusion-voxel').value=preset[0];$('vdbfusion-trunc').value=preset[1]}renderReconstruction()};
 $('nksr-check').onclick=async()=>{try{await json('nksr/check',{device:$('nksr-device').value});await refresh()}catch(e){error(e)}};
+$('vdbfusion-check').onclick=async()=>{try{await json('vdbfusion/check',{});await refresh()}catch(e){error(e)}};
 $('reconstruct-mesh').onclick=async()=>{
- if(reconstructionPending)return;reconstructionPending=true;renderReconstruction();
- try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/mesh`,nksrSettings());await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
+ if(reconstructionPending)return;
+ const job=reconstructionData?.jobs.find(j=>j.id===$('nksr-input-run').value);
+ const engine=job?.algorithm||job?.metadata?.algorithm||'nksr';
+ let body;
+ try{body=engine==='vdbfusion'?{mesh_output_mode:$('vdbfusion-output-mode').value,vdbfusion:vdbfusionSettings()}:nksrSettings()}
+ catch(e){error(e);return}
+ reconstructionPending=true;renderReconstruction();
+ try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/mesh`,body);await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };
 $('cancel-mesh').onclick=async()=>{try{await json(`sessions/${selected}/reconstruction/${$('nksr-input-run').value}/cancel`,{});await refresh()}catch(e){error(e)}};
 

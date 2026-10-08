@@ -5,12 +5,36 @@
 <div class="capture-bar"><div><h2 aria-live="polite" id="capture-state">Ready</h2><p id="capture-message" role="status">Press Start Scan to begin.</p><p id="previous-capture"></p><button id="recover-sensors" data-recovery="processes_restart" hidden>Recover &amp; restart sensors</button><p id="capture-recovery-status" role="status"></p></div><output aria-label="Elapsed recording time" id="capture-elapsed">00:00</output></div>
 <p id="rgb-recording-warning" class="capture-warning" role="status" hidden>Warning: RGB recording is disabled. Start Scan will save LiDAR and IMU only, without camera images for colorization. Enable RGB in Settings to include images.</p><div class="capture-buttons"><button class="primary" data-capture="start_scan" id="start-scan">START SCAN</button><button class="stop" data-capture="stop_scan" hidden="" id="stop-scan">STOP SCAN</button><button data-capture="start_camera_recording" id="record-camera">RECORD CAMERA</button><button class="stop" data-capture="stop_camera_recording" hidden="" id="stop-camera-recording">STOP CAMERA</button></div></section><article class="viewer"><div class="bar"><h2 id="preview-label">LiDAR view</h2><button id="live-preview">Live</button><button id="reset">Reset view</button><label>Point size <input id="point-size" max="6" min="1" type="range" value="2"/></label></div><div id="canvas"></div><div aria-label="Camera preview" class="camera-pip"><div class="camera-image-frame"><img alt="Low-rate RGB camera preview" hidden="" id="camera-preview"/></div><span id="pip-empty">Camera preview appears when capturing</span><p hidden="" id="camera-preview-note">Preview is separate from raw recording.</p></div><p hidden="" id="viewer-note">Drag to orbit · Right-drag to pan · Scroll to zoom · Preview only, original data is preserved.</p></article></div><div class="app-page" data-page-panel="library" hidden="" id="library-page"><div class="bar"><h2>Scan library</h2><p id="library-capability"></p></div><section><div class="bar"><h2>Sessions</h2><button id="refresh">Refresh</button><button disabled="" id="project-export">Export selected</button><label class="project-file">Project ZIP<input accept=".zip,.fmproject.zip,application/zip" id="project-file" type="file"/></label><button id="project-import">Import project</button><span id="project-transfer-status" role="status"></span></div><div class="table-wrap"><table><thead><tr><th>Session / date</th><th>Duration</th><th>Raw bag</th><th>State</th><th>Notes</th></tr></thead><tbody id="sessions"></tbody></table></div></section><section><h2>Selected scan</h2><form class="fields" id="session-edit"><label>Name<input id="session-rename" maxlength="100" required=""/></label><label>Notes<textarea id="session-notes" maxlength="4000"></textarea></label><button type="submit">Save name &amp; notes</button></form></section><section class="workspace"><article><h2>Process &amp; inspect</h2><p>Selected session: <span id="selected-job">None</span></p><button data-action="process">Process / Reprocess with GLIM</button><button data-action="cancel">Cancel Processing</button><label>Processing run<select id="runs"></select></label><button data-action="export">Export optimized PLY</button><button id="quality">Map quality</button><button id="delete-derived">Delete derived run</button><h3>Exports</h3><div id="exports">No session selected</div><pre id="quality-result"></pre></article><article><div class="bar"><h2>Processing log</h2><button id="download-log">Download full log</button></div><pre class="logs" id="logs">Select a processing run to stream its log.</pre></article></section><section id="surface-reconstruction"><h2>Surface Reconstruction</h2>
 <p id="reconstruction-input-status">Select a scan with a raw bag and GLIM trajectory.</p>
-<form id="reconstruction-form"><label>Trajectory<select id="reconstruction-trajectory" required></select></label>
+<form id="reconstruction-form">
+<fieldset class="algorithm-choice"><legend>Reconstruction algorithm</legend>
+<label><input checked id="algorithm-vdbfusion" name="reconstruction-algorithm" type="radio" value="vdbfusion"/> VDBFusion — Fast TSDF</label>
+<label><input id="algorithm-nksr" name="reconstruction-algorithm" type="radio" value="nksr"/> NKSR — Neural Reconstruction</label>
+<p id="vdbfusion-availability" role="status"></p></fieldset>
+<label>Trajectory<select id="reconstruction-trajectory" required></select></label>
 <label><input id="filter-edited-geometry" type="checkbox"/> Use saved edited geometry</label>
 <label id="edited-source-label" hidden>Saved cleanup export<select id="edited-source"></select></label>
-<label id="edited-tolerance-label" hidden>Retained geometry tolerance (meters)<input id="edited-tolerance" type="number" value="0.05" min="0.001" step="0.001"/></label>
-<p id="edited-filter-note" hidden>Approximate retained-geometry filtering. It does not prevent NKSR from bridging deleted regions.</p>
-<details><summary>Advanced</summary>
+<label id="edited-tolerance-label" hidden>NKSR retained geometry tolerance (meters)<input id="edited-tolerance" type="number" value="0.05" min="0.001" step="0.001"/></label>
+<p id="edited-filter-note" hidden></p>
+<p id="edited-status" role="status" hidden></p>
+<details id="vdbfusion-advanced" open><summary>VDBFusion settings</summary>
+<label>Quality<select id="vdbfusion-preset"><option value="fast">Fast · 20 mm voxel</option><option value="detailed">Detailed · 10 mm voxel</option><option value="experimental">Experimental · 5 mm voxel</option><option value="">Custom</option></select></label>
+<label>TSDF voxel size (meters)<input id="vdbfusion-voxel" type="number" value="0.02" min="0.001" max="1" step="0.001"/></label>
+<label>TSDF truncation distance (meters)<input id="vdbfusion-trunc" type="number" value="0.06" min="0.001" max="5" step="0.001"/></label>
+<label><input id="vdbfusion-space-carving" type="checkbox"/> Space carving (off by default)</label>
+<p id="vdbfusion-preset-note" role="status"></p>
+<label>Mesh output<select id="vdbfusion-output-mode"><option value="merged">Single mesh</option><option value="chunks">Separate meshes</option><option value="both">Both</option></select></label>
+<p>Separate meshes are spatial sections of the one fused TSDF surface, so no tile seam is added.</p>
+<label>Region of interest (optional, world meters)<span class="roi-row"><input id="vdbfusion-roi-min" type="text" placeholder="min x y z" value=""/> <input id="vdbfusion-roi-max" type="text" placeholder="max x y z" value=""/></span></label>
+<details><summary>VDBFusion expert settings</summary>
+<label>Motion-aware origin budget (meters)<input id="vdbfusion-origin-budget" type="number" min="0.0001" step="0.001" placeholder="One voxel"/></label>
+<label>Edit association radius multiplier<input id="vdbfusion-association-multiplier" type="number" min="0.1" step="0.5" placeholder="4"/></label>
+<label>Edit boundary margin (meters)<input id="vdbfusion-boundary-margin" type="number" min="0" step="0.01" placeholder="0"/></label>
+<label>Unsupported observations<select id="vdbfusion-unsupported"><option value="exclude">Exclude (conservative)</option><option value="include">Include (may recreate removed geometry)</option></select></label>
+<label><input id="vdbfusion-mask-triangles" type="checkbox" checked/> Mask triangles inside removed regions</label>
+<label>Memory budget (GiB)<input id="vdbfusion-memory-budget" type="number" min="0.5" step="0.5" placeholder="24"/></label>
+</details>
+</details>
+<details id="nksr-advanced"><summary>Advanced</summary>
 <label>Preparation voxel: <input id="voxel-size-cm" type="number" value="1.0" min="0.2" max="20" step="0.1" required/> cm</label>
 <label>Mode<select id="nksr-mode"><option value="auto">Auto</option><option value="full">Full</option><option value="chunked">Chunked</option><option value="low_ram">Low RAM · independent tiles</option></select></label>
 <label>Mesh output<select id="nksr-output-mode"><option value="merged">Single mesh</option><option value="chunks">Separate meshes</option><option value="both">Both</option></select></label>
@@ -27,6 +51,7 @@
 <h3>Point preparation</h3><button id="prepare-reconstruction" type="submit">Prepare Reconstruction</button></form>
 <p id="reconstruction-status" role="status"></p><div id="reconstruction-results"></div>
 <h3>Mesh reconstruction</h3><p id="nksr-health" role="status"></p><button id="nksr-check">Check NKSR</button>
+<p id="vdbfusion-health" role="status"></p><button id="vdbfusion-check">Check VDBFusion</button>
 <label>Prepared input<select id="nksr-input-run"></select></label>
 <button id="reconstruct-mesh" disabled>Reconstruct Mesh</button><button id="cancel-mesh" hidden>Cancel Reconstruction</button>
 <p id="nksr-mesh-status" role="status"></p><div id="nksr-mesh-results"></div>

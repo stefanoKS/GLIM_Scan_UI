@@ -3,6 +3,22 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'ui/backend'))
 import pytest, shutil
+from factory_mapping import vdbfusion_jobs
+
+
+@pytest.fixture(scope='session')
+def vdbfusion_python():
+    """Isolated VDBFusion interpreter, or skip the test when it is not installed.
+
+    The native library lives only in that environment, so tests that need it must
+    skip rather than silently pass.
+    """
+    python = vdbfusion_jobs.interpreter(ROOT)
+    if not python.is_file():
+        pytest.skip('VDBFusion is not installed; run scripts/setup_vdbfusion.sh')
+    return python
+
+
 @pytest.fixture
 def root(tmp_path):
     shutil.copytree(ROOT/'config',tmp_path/'config')

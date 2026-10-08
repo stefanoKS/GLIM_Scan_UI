@@ -1,8 +1,10 @@
 # Map editing and surface reconstruction workflow
 
 This guide covers the normal workstation workflow from a completed GLIM map to an
-edited point-cloud export and an NKSR triangle mesh. The recording Jetson does not
-run native map tools, reconstruction preparation, or NKSR.
+edited point-cloud export and a triangle mesh. Two surface reconstruction engines are
+available: **VDBFusion** (fast TSDF, the default for new jobs when installed) and
+**NKSR** (neural reconstruction). The recording Jetson does not run native map tools,
+reconstruction preparation, either engine, or their isolated environments.
 
 ## Workflow overview
 
@@ -12,8 +14,9 @@ Completed GLIM processing run
   -> save explicitly as edits/edit_ID/saved_map/
   -> close the native editor
   -> Export saved edited map
+  -> choose the reconstruction algorithm
   -> Prepare Reconstruction
-  -> Check NKSR
+  -> Check the selected engine
   -> Reconstruct Mesh
   -> inspect or download output/mesh.ply or the separate mesh cells
 ```
@@ -124,24 +127,41 @@ If the UI still reports **export required**:
 
 Under **Surface Reconstruction**:
 
-1. Select the trajectory under the same `edits/edit_ID/saved_map/`.
-2. Enable **Use saved edited geometry**.
-3. Select the corresponding **export ready** cleanup.
-4. Set the retained-geometry tolerance. The default is `0.05` meters.
-5. Choose the preparation voxel size under **Advanced**. The default is `1.0` cm.
-6. Click **Prepare Reconstruction**.
+1. Choose the **Reconstruction algorithm** (the first control). **VDBFusion** is the
+   default for new jobs when it is installed; an unavailable VDBFusion shows its
+   installation status and is never silently replaced by NKSR. Requests and jobs
+   without an algorithm stay NKSR.
+2. Select the trajectory under the same `edits/edit_ID/saved_map/`.
+3. Enable **Use saved edited geometry**.
+4. Select the corresponding **export ready** cleanup.
+5. For NKSR, set the retained-geometry tolerance. The default is `0.05` meters.
+   VDBFusion derives its own association radius from the measured cleanup geometry and
+   does not use this field.
+6. For NKSR, choose the preparation voxel size under **Advanced**. The default is
+   `1.0` cm. VDBFusion needs no prepared point cloud and reports a source-validation
+   and preflight summary instead.
+7. Click **Prepare Reconstruction**.
 
-Preparation reads the original raw bag, interpolates the selected saved trajectory,
-transforms observations into world coordinates, filters them against the retained
-edited geometry, and then performs deterministic voxel selection. The edited PLY
-is a spatial reference; the prepared points still come from the original sensor
+The algorithm chosen here is stored in the run's `job.json`, and every later mesh
+request for that run uses that engine. A run prepared for one engine is never
+reconstructed by the other.
+
+NKSR preparation reads the original raw bag, interpolates the selected saved
+trajectory, transforms observations into world coordinates, filters them against the
+retained edited geometry, and then performs deterministic voxel selection. The edited
+PLY is a spatial reference; the prepared points still come from the original sensor
 observations and preserve their paired sensor origins.
+
+VDBFusion preparation validates the same sources and reports free RAM, free disk, the
+requested TSDF resolution, the sampled scan extent and an estimated TSDF footprint.
+It writes no prepared point cloud: the raw bag is streamed later, during mesh
+reconstruction.
 
 The edited-geometry spatial index has a 5 GiB estimated-memory limit. The final
 voxel size does not reduce this reference index because filtering happens before
 voxel sampling.
 
-A successful run shows **PREPARED** and creates:
+A successful NKSR preparation shows **PREPARED** and creates:
 
 ```text
 reconstruction/run_ID/
@@ -152,7 +172,16 @@ reconstruction/run_ID/
   validation/comparison.json
 ```
 
-Preparation does not create a mesh and does not require NKSR.
+A successful VDBFusion preparation creates:
+
+```text
+reconstruction/run_ID/
+  job.json
+  job.log
+  input/vdbfusion_prepare.json
+```
+
+Neither preparation step creates a mesh, and neither requires the other engine.
 
 ### Which trajectory to select
 
@@ -182,21 +211,32 @@ substituted for the verified trajectory of a different Clean Map export.
 
 ## 5. Reconstruct the surface
 
-1. Click **Check NKSR** and wait for **READY**.
-2. Select a **PREPARED** input.
-3. Choose the reconstruction settings.
+1. Click **Check NKSR** or **Check VDBFusion** for the selected engine and wait for
+   **READY**.
+2. Select a **PREPARED** input run. Each entry is labelled with the engine it was
+   prepared for.
+3. Choose the reconstruction settings for that engine.
 4. Click **Reconstruct Mesh**.
 5. Follow the reported stage and inspect the reconstruction log if it fails.
 
 NKSR loads the prepared points and sensor origins, evaluates the pretrained model,
 extracts a triangle mesh, and validates that the output contains finite vertices
-and valid faces. Successful output is stored at:
+and valid faces. VDBFusion streams the raw bag into one fused TSDF and extracts one
+world-space triangle mesh, then optionally masks triangles inside removed regions.
+Successful output is stored at:
 
 ```text
-reconstruction/run_ID/output/mesh.ply           # Single mesh / Both
-reconstruction/run_ID/output/mesh_chunks/        # Separate meshes / Both
-reconstruction/run_ID/output/tiles/               # Low RAM independent tiles
+reconstruction/run_ID/output/mesh.ply                # Single mesh / Both
+reconstruction/run_ID/output/mesh_chunks/            # Separate meshes / Both
+reconstruction/run_ID/output/tiles/                  # NKSR Low RAM independent tiles
+reconstruction/run_ID/output/nksr_metadata.json      # NKSR only
+reconstruction/run_ID/output/vdbfusion_metadata.json # VDBFusion only
 ```
+
+VDBFusion never writes NKSR metadata and never creates independent TSDF tiles. Its
+separate meshes are spatial cells of the same single fused mesh. See
+[VDBFusion](vdbfusion.md) for its settings, memory behaviour, measured edit results
+and its approximate edited-geometry association.
 
 **PREPARED** means only that point input exists. **COMPLETED** means the independent
 NKSR worker exited successfully and every saved mesh passed validation. A worker exit
@@ -282,5 +322,7 @@ their boundaries may show seams.
 - [Operation](operation.md) describes capture, transfer, and workstation processing.
 - [NKSR](nksr.md) documents installation, reconstruction modes, resource controls,
   output validation, and detailed diagnostics.
+- [VDBFusion](vdbfusion.md) documents its isolated installation, TSDF settings,
+  streaming and memory behaviour, edited-geometry association and measured results.
 - [Troubleshooting](troubleshooting.md) covers process recovery and display/OpenGL
   failures.
