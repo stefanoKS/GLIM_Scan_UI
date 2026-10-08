@@ -154,7 +154,8 @@ observations and preserve their paired sensor origins.
 
 VDBFusion preparation validates the same sources and reports free RAM, free disk, the
 requested TSDF resolution, the sampled scan extent and a component-wise footprint
-estimate with an explicit safety margin. It writes no prepared point cloud: the raw bag
+estimate with an explicit safety margin. The memory budget field is normalised once into a
+byte value that the preflight, the runtime check and the memory supervisor all share. It writes no prepared point cloud: the raw bag
 is streamed later, during mesh reconstruction. It also pins the sources and the
 semantic settings it was prepared with, so changing the voxel size, truncation, ROI or
 edit-filtering policy afterwards marks the prepared input stale and asks for a

@@ -20,6 +20,7 @@ Bug index from the audit specification:
 """
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,7 @@ import pytest
 
 from factory_mapping import vdbfusion as V
 from factory_mapping import vdbfusion_jobs as jobs
+from factory_mapping.nksr_mesh import inspect_mesh
 
 
 def write_submap(directory, points, matrix=None, submap_id=0):
@@ -473,37 +475,6 @@ def test_reconstruction_refuses_a_source_that_changed_after_preparation(tmp_path
 
 
 # ------------------------------------------------------------------ GATE 11
-def test_outputs_are_staged_then_published_atomically(tmp_path):
-    """A partially written mesh must never appear at the published path."""
-    staging = tmp_path/'staging'
-    staging.mkdir()
-    (staging/'mesh.ply').write_bytes(b'complete mesh')
-    (staging/'mesh_chunks').mkdir()
-    (staging/'mesh_chunks'/'chunks.json').write_text('{}')
-    published = jobs_publish(staging, tmp_path, 'both')
-    assert sorted(published) == ['mesh.ply', 'mesh_chunks']
-    assert (tmp_path/'mesh.ply').read_bytes() == b'complete mesh'
-    assert not staging.exists(), 'staging is removed after a successful publish'
-    # A failed run leaves the published path untouched.
-    staging.mkdir()
-    (staging/'mesh.ply').write_bytes(b'partial')
-    assert (tmp_path/'mesh.ply').read_bytes() == b'complete mesh'
-
-
-def jobs_publish(staging, destination, mode):
-    """Call the worker's publish helper out of process without importing its ROS deps."""
-    import subprocess
-    import sys
-    script = (
-        'import sys, json; sys.path.insert(0, %r);'
-        'from factory_mapping import vdbfusion_worker as W;'
-        'print(json.dumps(W.publish_outputs(%r, %r, %r)))'
-        % (str(Path(__file__).resolve().parents[1] / 'ui/backend'), str(staging), str(destination), mode))
-    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
-
-
 # ------------------------------------------------------------------ GATE 12
 def test_mesh_audit_reports_integrity_without_deleting_geometry():
     vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [5.0, 5.0, 0.0]])
@@ -643,3 +614,302 @@ def test_advanced_controls_do_not_read_as_a_silent_mismatch(tmp_path):
     assert jobs.settings_status(record, dict(prepared))['matches'] is True
     status = jobs.settings_status(record, dict(prepared, association_spacing_multiplier=6.0))
     assert status['matches'] is False and status['differing'] == ['association_spacing_multiplier']
+
+
+# =========================================================== ROUND 2 (6413e88)
+# 1. Memory budget: one byte-valued effective limit, from the UI field to the supervisor
+# ---------------------------------------------------------------------------------
+def test_memory_budget_is_normalised_to_one_byte_value():
+    """OLD: the UI/API field is ``memory_budget_gib`` but the engine only read
+    ``memory_budget_bytes``, so a configured budget was invisible to the preflight and to
+    the memory supervisor (which received 0 and therefore never escalated)."""
+    assert V.resolve_memory_budget_bytes({}) == V.DEFAULT_MEMORY_BUDGET_BYTES
+    assert V.resolve_memory_budget_bytes({'memory_budget_gib': 8}) == 8 * 1024 ** 3
+    assert V.resolve_memory_budget_bytes({'memory_budget_bytes': 4096}) == 4096
+    # An explicit byte value is the most specific and wins over the GiB control.
+    assert V.resolve_memory_budget_bytes({'memory_budget_bytes': 4096, 'memory_budget_gib': 8}) == 4096
+    # An explicit override (the worker's own limit) wins over both.
+    assert V.resolve_memory_budget_bytes({'memory_budget_gib': 8}, override=1024) == 1024
+    for bad in (0, -1, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            V.resolve_memory_budget_bytes({'memory_budget_gib': bad})
+
+
+def test_preflight_honours_the_ui_memory_budget(tmp_path):
+    """OLD: a 1 GiB budget was ignored and the default 24 GiB was used instead."""
+    settings = dict(V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06)), memory_budget_gib=1)
+    report = V.preflight(tmp_path, settings, observed_points=50_000_000,
+                         observed_bbox=([-25.0, -25.0, 0.0], [25.0, 25.0, 6.0]))
+    assert report['memory_budget_bytes'] == 1024 ** 3
+    assert report['usable_bytes'] <= 1024 ** 3
+    assert report['ok'] is False, 'a 1 GiB budget cannot hold a whole-factory 20 mm TSDF estimate'
+
+
+def test_supervisor_limit_comes_from_the_request_budget():
+    """OLD: the supervisor read ``memory_budget_bytes`` from a request that only ever
+    carries ``memory_budget_gib``, so its limit was 0 and pressure never escalated."""
+    assert jobs.supervisor_limit_bytes({}) == V.DEFAULT_MEMORY_BUDGET_BYTES
+    assert jobs.supervisor_limit_bytes(None) == V.DEFAULT_MEMORY_BUDGET_BYTES
+    assert jobs.supervisor_limit_bytes({'memory_budget_gib': 0.5}) == 0.5 * 1024 ** 3
+    assert jobs.supervisor_limit_bytes({'memory_budget_bytes': 1024}) == 1024
+
+
+def test_supervisor_pressure_escalates_at_95_percent_once(tmp_path):
+    """Mocked RSS sequence against the real pressure policy: strictly above 95 % of the
+    limit requests cancellation once, at or below it does not."""
+    limit = 10 * 1024 ** 3
+    stages = iter(['INTEGRATING'] * 8)
+    rss = iter([1024, limit // 2, limit * 95 // 100,          # exactly 95 %: allowed
+                limit * 95 // 100 + 1,                         # one byte over: escalate
+                limit * 95 // 100 + 4096,                      # must not escalate twice
+                limit // 4, limit // 8, limit // 16])
+    pressure = []
+
+    async def on_pressure(event):
+        pressure.append(event)
+
+    async def scenario():
+        supervisor = jobs.MemorySupervisor(tmp_path, 999, limit, interval=0.0,
+                                           on_pressure=on_pressure, read_rss=lambda: next(rss),
+                                           read_stage=lambda: next(stages), max_samples=8)
+        await supervisor.run()
+        return supervisor
+
+    supervisor = asyncio.run(scenario())
+    summary = supervisor.summary()
+    assert summary['limit_bytes'] == limit
+    assert summary['peak_rss_bytes'] == limit * 95 // 100 + 4096
+    events = summary['pressure_events']
+    assert len(events) == 1, f'exactly one escalation expected, got {events}'
+    assert events[0]['rss_bytes'] == limit * 95 // 100 + 1, 'escalation must start at the first sample over 95 %'
+    assert events[0]['limit_bytes'] == limit
+    assert events[0]['action'] == 'requested cooperative cancellation'
+
+
+# ---------------------------------------------------------------------------------
+# 2. Preflight must fail closed when nothing fits
+# ---------------------------------------------------------------------------------
+class _Memory:
+    """A mocked system probe, used only to drive the decision logic under test."""
+
+    def __init__(self, total, available):
+        self.total, self.available = total, available
+
+
+def _mock_memory(monkeypatch, total, available):
+    import psutil
+    monkeypatch.setattr(psutil, 'virtual_memory', lambda: _Memory(total, available))
+
+
+def test_preflight_fails_closed_with_zero_headroom(tmp_path, monkeypatch):
+    """OLD: ``ok`` stayed True when ``usable_bytes == 0`` because the guard tested the
+    truthiness of ``usable`` instead of comparing byte values, so a run that could not fit
+    at all was reported as passing."""
+    _mock_memory(monkeypatch, total=64 * 1024 ** 3, available=1024 ** 3)
+    settings = V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06))
+    report = V.preflight(tmp_path, settings, observed_points=1_000_000,
+                         observed_bbox=([-5.0, -5.0, 0.0], [5.0, 5.0, 3.0]))
+    assert report['usable_bytes'] == 0
+    assert report['estimated_peak_bytes'] > 0
+    assert report['ok'] is False, 'zero headroom must not pass a positive estimate'
+    assert report['code'] == 'RESOURCE_PREFLIGHT_FAILED'
+    assert report['failures'] and report['suggestions']
+
+
+def test_preflight_refuses_a_budget_below_the_estimate(tmp_path, monkeypatch):
+    """Negative remaining headroom: a positive budget that is simply too small."""
+    _mock_memory(monkeypatch, total=64 * 1024 ** 3, available=64 * 1024 ** 3)
+    settings = dict(V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06)),
+                    memory_budget_gib=0.1)
+    report = V.preflight(tmp_path, settings, observed_points=1_000_000,
+                         observed_bbox=([-5.0, -5.0, 0.0], [5.0, 5.0, 3.0]))
+    assert report['usable_bytes'] == int(0.1 * 1024 ** 3)
+    assert report['ok'] is False
+    assert report['estimated_peak_bytes'] > report['usable_bytes']
+    assert report['failures'] and 'RESOURCE_PREFLIGHT_FAILED' in report['failures'][0]
+
+
+def test_preflight_small_positive_budget_is_decided_by_arithmetic(tmp_path, monkeypatch):
+    """Headroom is compared as bytes in both directions, never by truthiness."""
+    _mock_memory(monkeypatch, total=64 * 1024 ** 3, available=32 * 1024 ** 3)
+    small = dict(V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06)), memory_budget_gib=0.05)
+    refused = V.preflight(tmp_path, small, observed_points=1_000_000,
+                          observed_bbox=([-5.0, -5.0, 0.0], [5.0, 5.0, 3.0]))
+    assert refused['ok'] is False and refused['usable_bytes'] > 0
+    large = dict(V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06)), memory_budget_gib=8)
+    accepted = V.preflight(tmp_path, large, observed_points=1_000_000,
+                           observed_bbox=([-5.0, -5.0, 0.0], [5.0, 5.0, 3.0]))
+    assert accepted['ok'] is True
+    assert accepted['usable_bytes'] == 8 * 1024 ** 3
+    assert accepted['estimated_peak_bytes'] <= accepted['usable_bytes']
+
+
+# ---------------------------------------------------------------------------------
+# 3. Atomic output publishing
+# ---------------------------------------------------------------------------------
+def staged_mesh(directory, marker=b'new', triangles=1):
+    directory.mkdir(parents=True, exist_ok=True)
+    vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    V.write_mesh_ply(directory/'mesh.ply', vertices, faces)
+    return directory/'mesh.ply'
+
+
+def staged_chunks(directory, cells=1):
+    """A staged chunk set in the shape the shared chunk validator expects."""
+    directory = Path(directory)/'mesh_chunks'
+    directory.mkdir(parents=True, exist_ok=True)
+    chunks = []
+    for index in range(cells):
+        path = directory/f'chunk_{index:04d}.ply'
+        V.write_mesh_ply(path, np.array([[0.0, 0.0, float(index)], [1.0, 0.0, float(index)],
+                                         [0.0, 1.0, float(index)]], dtype=np.float64),
+                         np.array([[0, 1, 2]], dtype=np.int64))
+        chunks.append(dict(file=path.name, cell=[index, 0, 0], vertices=3, faces=1,
+                           file_size_bytes=path.stat().st_size))
+    vertices = 3 * cells
+    faces = cells
+    manifest = dict(version=1, export_strategy='spatial_split_of_final_mesh',
+                    reconstruction_mode='vdbfusion_fused_tsdf', coordinate_system='GLIM_world', units='meters',
+                    tile_shape='xyz_cube', grid_origin_m=[0.0, 0.0, 0.0], cell_order='row_major',
+                    requested_chunk_size_m=1.0, effective_chunk_size_m=1.0, chunk_size_source='user',
+                    total_chunks=cells, source_faces=faces, total_vertices=vertices, total_faces=faces,
+                    chunks=chunks)
+    (directory/'chunks.json').write_text(json.dumps(manifest))
+    # The worker names its metadata fields chunk_*_total; the shared validator reads those.
+    return manifest, dict(chunk_count=cells, chunk_vertices_total=vertices, chunk_faces_total=faces)
+
+
+def test_publish_replaces_a_previous_valid_target_without_unlinking_it_first(tmp_path):
+    """Reproduce: the old code unlinked the destination *before* renaming the replacement,
+    so a failed rename destroyed the previous valid output."""
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    destination.mkdir()
+    (destination/'mesh.ply').write_bytes(b'previous valid mesh')
+    staged_mesh(staging)
+    manifest = V.publish_output_set(staging, destination, 'merged')
+    assert inspect_mesh(destination/'mesh.ply')['face_count'] == 1
+    assert manifest['artifacts']['mesh.ply']['bytes'] == (destination/'mesh.ply').stat().st_size
+    assert not staging.exists()
+
+
+def test_publish_keeps_the_previous_target_when_the_rename_fails(tmp_path, monkeypatch):
+    """A failing swap must leave the previous valid output exactly as it was."""
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    destination.mkdir()
+    (destination/'mesh.ply').write_bytes(b'previous valid mesh')
+    staged_mesh(staging)
+    real = os.replace
+
+    def failing_replace(source, target, *args, **kwargs):
+        if Path(target).name == 'mesh.ply':
+            raise OSError(28, 'No space left on device')
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(V.os, 'replace', failing_replace)
+    with pytest.raises(OSError):
+        V.publish_output_set(staging, destination, 'merged')
+    assert (destination/'mesh.ply').read_bytes() == b'previous valid mesh'
+    assert (staging/'mesh.ply').exists(), 'the staged mesh is kept for a retry'
+
+
+def test_publish_restores_a_previous_chunk_directory_when_the_swap_fails(tmp_path, monkeypatch):
+    """Directory artifacts are moved aside, never deleted, so a failed swap rolls back."""
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    (destination/'mesh_chunks').mkdir(parents=True)
+    (destination/'mesh_chunks'/'chunks.json').write_text('{"previous": true}')
+    _, metadata = staged_chunks(staging)
+    real = os.replace
+    calls = {'count': 0}
+
+    def failing_replace(source, target, *args, **kwargs):
+        # Only the forward swap fails; the rollback that follows must still succeed.
+        if Path(target).name == 'mesh_chunks' and calls['count'] == 0:
+            calls['count'] += 1
+            raise OSError(13, 'Permission denied')
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(V.os, 'replace', failing_replace)
+    with pytest.raises(OSError):
+        V.publish_output_set(staging, destination, 'chunks', metadata=metadata)
+    restored = json.loads((destination/'mesh_chunks'/'chunks.json').read_text())
+    assert restored == {'previous': True}, 'the previous chunk directory must be back in place'
+    assert not list(destination.glob('mesh_chunks.previous-*')), 'no backup may be left behind'
+
+
+def test_publish_refuses_an_invalid_staged_set_before_touching_the_destination(tmp_path):
+    """Staged outputs are validated first: a corrupt mesh never replaces a valid one."""
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    destination.mkdir()
+    (destination/'mesh.ply').write_bytes(b'previous valid mesh')
+    staging.mkdir()
+    (staging/'mesh.ply').write_bytes(b'not a ply file at all')
+    with pytest.raises(ValueError):
+        V.publish_output_set(staging, destination, 'merged')
+    assert (destination/'mesh.ply').read_bytes() == b'previous valid mesh'
+
+
+def test_publish_requires_every_artifact_of_the_selected_mode(tmp_path):
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    staged_mesh(staging)
+    destination.mkdir()
+    with pytest.raises(ValueError, match='mesh_chunks'):
+        V.publish_output_set(staging, destination, 'both')
+    assert not (destination/'mesh.ply').exists(), 'nothing is published when the set is incomplete'
+
+
+def test_publish_mode_both_records_a_completion_manifest(tmp_path):
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    destination.mkdir()
+    (destination/'mesh.ply').write_bytes(b'previous valid mesh')
+    (destination/'mesh_chunks').mkdir()
+    (destination/'mesh_chunks'/'chunks.json').write_text('{"previous": true}')
+    staged_mesh(staging)
+    _, metadata = staged_chunks(staging, cells=2)
+    manifest = V.publish_output_set(staging, destination, 'both', metadata=metadata)
+    assert sorted(manifest['artifacts']) == ['mesh.ply', 'mesh_chunks']
+    assert inspect_mesh(destination/'mesh.ply')['face_count'] == 1
+    assert json.loads((destination/'mesh_chunks'/'chunks.json').read_text())['total_chunks'] == 2
+    on_disk = json.loads((destination/V.PUBLISH_MANIFEST).read_text())
+    assert on_disk['artifacts'] == manifest['artifacts']
+    assert on_disk['transaction_note'] and 'not a single transaction' in on_disk['transaction_note']
+    assert not list(destination.glob('*.previous-*')), 'backups are removed only after a full success'
+
+
+def test_publish_is_a_no_op_for_an_already_missing_staging_directory(tmp_path):
+    destination = tmp_path/'output'
+    destination.mkdir()
+    (destination/'mesh.ply').write_bytes(b'previous valid mesh')
+    with pytest.raises(ValueError):
+        V.publish_output_set(tmp_path/'absent', destination, 'merged')
+    assert (destination/'mesh.ply').read_bytes() == b'previous valid mesh'
+
+
+def test_directory_artifact_size_is_measured_by_content(tmp_path):
+    """`Path.stat().st_size` on a directory is an inode size, so comparing a published chunk
+    directory against the manifest that way rejected every valid chunked run."""
+    directory = tmp_path/'mesh_chunks'
+    staged_chunks(tmp_path)
+    files = sorted(item for item in directory.rglob('*') if item.is_file())
+    assert V.artifact_size_bytes(directory) == sum(item.stat().st_size for item in files)
+    # The two measures are different numbers for a directory, which is why the comparison
+    # has to be made on content bytes on both sides.
+    assert V.artifact_size_bytes(directory) != directory.stat().st_size
+    single = tmp_path/'mesh.ply'
+    single.write_bytes(b'x' * 32)
+    assert V.artifact_size_bytes(single) == 32
+    assert V.artifact_size_bytes(staged_mesh(tmp_path/'s2')) == (tmp_path/'s2'/'mesh.ply').stat().st_size
+
+
+def test_a_zero_supervisor_limit_can_never_escalate(tmp_path):
+    """The old wiring handed the supervisor a zero limit, whose pressure test
+    (`rss > limit * 0.95`) is False for every RSS. This pins both halves: a zero limit does
+    nothing, and the normalised limit is never zero."""
+    supervisor = jobs.MemorySupervisor(tmp_path, 4242, 0, interval=0.0,
+                                       read_rss=lambda: 10 ** 12, read_stage=lambda: 'INTEGRATING')
+    supervisor.sample()
+    assert supervisor.peak_rss_bytes == 10 ** 12
+    assert supervisor.summary()['pressure_events'] == [], 'a zero limit cannot escalate'
+    # Every path that builds a limit goes through the normaliser, which never yields zero.
+    for payload in ({}, None, {'memory_budget_gib': None}, {'memory_budget_bytes': None}):
+        assert jobs.supervisor_limit_bytes(payload) == V.DEFAULT_MEMORY_BUDGET_BYTES

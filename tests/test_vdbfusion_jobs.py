@@ -437,3 +437,83 @@ def test_isolated_interpreter_resolution(root, monkeypatch):
     assert jobs.interpreter(root) == expected
     assert 'vdbfusion-env' in str(jobs.worker_path().parent.parent/'x') or True
     assert jobs.worker_path().name == 'vdbfusion_worker.py'
+
+
+# --------------------------------------------------------------------------- #
+def test_pressure_cancellation_reaches_the_managed_worker_and_the_job_state(prepared, monkeypatch):
+    """End-to-end: a request with ``memory_budget_gib`` reaches the worker CLI and the
+    supervisor, pressure requests a real cooperative cancellation, and the job is recorded
+    as CANCELLED rather than failed. RSS is mocked; nothing here claims physical memory."""
+    service, sid, session, vdb, nksr, python = prepared
+    captured = {}
+    created = []
+    stops = []
+
+    class Recording(jobs.MemorySupervisor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    async def start(key, args, log, env, done):
+        captured.update(key=key, args=[str(value) for value in args], done=done)
+        return dict(state='running', pid=4242)
+
+    async def stop(key, timeout=60, cancel=False):
+        stops.append(dict(key=key, timeout=timeout, cancel=cancel))
+        return dict(state='cancelled')
+
+    monkeypatch.setattr(jobs, 'MemorySupervisor', Recording)
+    monkeypatch.setattr(service.pm, 'start', start)
+    monkeypatch.setattr(service.pm, 'stop', stop)
+    request = dict(voxel_size_m=0.02, sdf_trunc_m=0.06, space_carving=False, memory_budget_gib=0.5,
+                   mesh_output_mode='merged', mask_deleted_triangles=True,
+                   unsupported_observations='exclude')
+    asyncio.run(jobs.reconstruct(service, sid, vdb.name, request))
+    assert captured['args'][captured['args'].index('--memory-budget-gib') + 1] == '0.5'
+    assert created, 'the supervisor must be created for a running worker'
+    supervisor = created[0]
+    assert supervisor.limit_bytes == 0.5 * 1024 ** 3, 'the supervisor must see the configured budget'
+
+    async def escalate():
+        supervisor.read_rss = lambda: int(0.6 * 1024 ** 3)
+        supervisor.read_stage = lambda: 'INTEGRATING'
+        supervisor.sample()
+        await asyncio.sleep(0)      # let the fire-and-forget cancellation task run
+        await asyncio.sleep(0)
+
+    asyncio.run(escalate())
+    assert stops == [dict(key='vdbfusion', timeout=60, cancel=True)], stops
+    asyncio.run(captured['done'](dict(state='cancelled', returncode=None)))
+    state = read_json(vdb/'mesh_job.json')
+    assert state['state'] == 'CANCELLED' and state['error_type'] == 'CANCELLED'
+    assert state['memory']['sampled'] is True
+
+
+def test_publish_manifest_mismatch_is_reported_not_ignored(prepared, monkeypatch):
+    """A partially published output set must be detectable from the completion manifest."""
+    service, sid, session, vdb, nksr, python = prepared
+    vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    out = vdb/'output'
+    out.mkdir(parents=True, exist_ok=True)
+    from factory_mapping import vdbfusion as V
+    V.write_mesh_ply(out/'mesh.ply', vertices, faces)
+    atomic_json(out/'vdbfusion_metadata.json', dict(engine='vdbfusion', mesh_output_mode='merged',
+                                                    validation_status='PASS', vertex_count=3, face_count=1,
+                                                    publish_manifest='publish_manifest.json'))
+    atomic_json(out/V.PUBLISH_MANIFEST, dict(mode='merged', published=['mesh.ply'],
+                                             artifacts={'mesh.ply': dict(bytes=(out/'mesh.ply').stat().st_size)}))
+    metadata = jobs.validate_completed(out, 0)
+    assert metadata['engine'] == 'vdbfusion'
+    # A manifest that lists a chunk set which is not there is a partial publish.
+    atomic_json(out/V.PUBLISH_MANIFEST, dict(mode='both', published=['mesh.ply', 'mesh_chunks'],
+                                             artifacts={'mesh.ply': dict(bytes=1),
+                                                        'mesh_chunks': dict(bytes=1)}))
+    with pytest.raises(ValueError, match='Publish manifest'):
+        jobs.validate_completed(out, 0)
+    # A recording of a manifest that was never written is a partial publish too.
+    atomic_json(out/V.PUBLISH_MANIFEST, dict(mode='merged', published=['mesh.ply'],
+                                             artifacts={'mesh.ply': dict(bytes=(out/'mesh.ply').stat().st_size)}))
+    (out/V.PUBLISH_MANIFEST).unlink()
+    with pytest.raises(ValueError, match='manifest'):
+        jobs.validate_completed(out, 0)

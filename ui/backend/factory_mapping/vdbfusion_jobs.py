@@ -279,6 +279,17 @@ class MemorySupervisor:
             self.close()
 
 
+def supervisor_limit_bytes(settings):
+    """The byte-valued limit the memory supervisor samples against.
+
+    Derived from the same normaliser the engine and the worker use, so a budget set in the
+    UI (``memory_budget_gib``) is honoured instead of leaving the supervisor with a zero
+    limit that can never escalate.
+    """
+    from .vdbfusion import DEFAULT_MEMORY_BUDGET_BYTES, resolve_memory_budget_bytes
+    return resolve_memory_budget_bytes(settings or {}) or DEFAULT_MEMORY_BUDGET_BYTES
+
+
 def settings_status(record, current, key='settings'):
     """Compare a prepared VDBFusion record against the settings a mesh request asks for.
 
@@ -329,7 +340,7 @@ def enforce_resources(record, settings, run):
                        if scan.get('observed_bbox_min_m') else None,
                        bag_bytes=record.get('bag_bytes'), occupancy=scan.get('occupancy'),
                        batch_points=settings.get('batch_points'),
-                       memory_budget_bytes=settings.get('memory_budget_bytes'),
+                       memory_budget_bytes=supervisor_limit_bytes(settings),
                        reference_points=geometry.get('reference_points'))
     if not report['ok']:
         raise ValueError('; '.join(report['failures'] + report['suggestions']))
@@ -356,6 +367,23 @@ def validate_completed(output, returncode):
             raise ValueError('Mesh counts do not match worker metadata')
     if mode != 'merged':
         validate_chunks_completed(output, metadata)
+    # When the worker recorded a publish manifest, the artifacts it lists must be the ones on
+    # disk: that is what makes a partially published output set detectable.
+    if metadata.get('publish_manifest'):
+        from .vdbfusion import PUBLISH_MANIFEST, artifact_size_bytes, output_artifact_names
+        manifest = read_json(output/PUBLISH_MANIFEST, None)
+        if not manifest:
+            raise ValueError('Worker reported a publish manifest but it is missing')
+        expected_artifacts = sorted(output_artifact_names(mode))
+        recorded = sorted(manifest.get('artifacts') or {})
+        if recorded != expected_artifacts or sorted(manifest.get('published') or []) != expected_artifacts:
+            raise ValueError(f'Publish manifest records {recorded}, expected {expected_artifacts}')
+        for name, entry in (manifest.get('artifacts') or {}).items():
+            path = output/name
+            if not path.exists():
+                raise ValueError(f'Publish manifest lists {name} but it is not on disk')
+            if entry.get('bytes') is not None and entry['bytes'] != artifact_size_bytes(path):
+                raise ValueError(f'Published artifact {name} does not match the manifest size')
     if metadata.get('validation_status') != 'PASS':
         raise ValueError('Worker did not report a passed mesh validation')
     return metadata
@@ -457,7 +485,9 @@ async def reconstruct(service, sid, rid, request):
     supervisor_task = None
     try:
         item = await service.pm.start('vdbfusion', args, run/'job.log', worker_environment(), done)
-        limit = effective.get('memory_budget_bytes')
+        # The prepared record has no execution-only fields, so the limit comes from the
+        # request (memory_budget_gib) unless an explicit byte value was supplied.
+        limit = supervisor_limit_bytes(effective)
         supervisor = MemorySupervisor(run, item.get('pid'), limit,
                                       on_pressure=lambda event: service.pm.stop('vdbfusion', 60, cancel=True))
         supervisor_task = asyncio.ensure_future(supervisor.run())

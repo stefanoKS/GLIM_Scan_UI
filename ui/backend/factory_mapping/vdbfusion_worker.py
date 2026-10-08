@@ -125,7 +125,8 @@ def arg_settings(args):
     """Translate CLI arguments into the validated settings input of :mod:`vdbfusion`."""
     return dict(voxel_size_m=args.voxel_size, sdf_trunc_m=args.sdf_trunc, preset=args.preset,
                 space_carving=args.space_carving == '1', mesh_output_mode=args.mesh_output_mode,
-                batch_points=args.batch_points, origin_error_budget_m=args.origin_error_budget,
+                memory_budget_gib=args.memory_budget_gib, batch_points=args.batch_points,
+                origin_error_budget_m=args.origin_error_budget,
                 roi_min_m=list(args.roi_min) if args.roi_min else None,
                 roi_max_m=list(args.roi_max) if args.roi_max else None)
 
@@ -353,31 +354,6 @@ def write_outputs(settings, vertices, faces, observed_bbox, event):
     return fields
 
 
-def publish_outputs(staging, destination, mode):
-    """Move validated outputs from staging into place, then drop the staging directory.
-
-    The move is a same-filesystem rename per artifact, so a reader either sees the previous
-    attempt or the complete new one, never a partially written mesh.
-    """
-    staging = Path(staging)
-    destination = Path(destination)
-    published = []
-    for name in (('mesh.ply',) if mode != 'chunks' else ()) + (('mesh_chunks',) if mode != 'merged' else ()):
-        source = staging/name
-        if not source.exists():
-            continue
-        target = destination/name
-        if target.exists():
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-        source.rename(target)
-        published.append(name)
-    shutil.rmtree(staging, ignore_errors=True)
-    return published
-
-
 def reconstruct(settings, event, cancel=None):
     bag = Path(settings['bag'])
     trajectory_path = Path(settings['trajectory'])
@@ -402,11 +378,12 @@ def reconstruct(settings, event, cancel=None):
     # The preflight is re-run here with the settings this run actually executes with, so a
     # resource change since preparation - or a finer resolution requested at mesh time - is
     # refused instead of silently attempted.
+    budget_bytes = V.resolve_memory_budget_bytes(settings)
     preflight = V.preflight(output.parent if output else Path.cwd(), resolved,
                             observed_points=estimated_points, observed_bbox=clipped, bag_bytes=bag_bytes,
                             occupancy=extent.get('occupancy'),
                             batch_points=resolved.get('batch_points'),
-                            memory_budget_bytes=settings.get('memory_budget_bytes'),
+                            memory_budget_bytes=budget_bytes,
                             reference_points=(edit_reference.metadata.get('reference_points')
                                               if edit_reference else None))
     if not preflight['ok']:
@@ -422,9 +399,8 @@ def reconstruct(settings, event, cancel=None):
                                     edit_reference=edit_reference,
                                     boundary_margin_m=settings.get('boundary_margin_m') or 0.0,
                                     unsupported_policy=settings.get('unsupported_policy') or 'exclude',
-                                    memory_budget_bytes=settings.get('memory_budget_bytes'),
-                                    event=event, cancel=cancel,
-                                    peak_limit_bytes=settings.get('memory_budget_bytes'))
+                                    memory_budget_bytes=budget_bytes,
+                                    event=event, cancel=cancel, peak_limit_bytes=budget_bytes)
     event('EXTRACTING_MESH')
     V.check_cancellation(cancel)
     vertices, faces, mesh_stats = V.extract_and_mask(
@@ -434,6 +410,11 @@ def reconstruct(settings, event, cancel=None):
         mask_deleted_triangles=bool(settings.get('mask_deleted_triangles', True)), cancel=cancel)
     del volume
     gc.collect()
+    # A cancellation that arrived while the native extractor held the interpreter is honoured
+    # here, before the geometry audit and before any mesh is written to disk. Measured on a
+    # 7.1 million triangle mesh: without this checkpoint the worker still spent about eight
+    # seconds writing a 135 MiB staged PLY before noticing.
+    V.check_cancellation(cancel)
     event('VALIDATING_MESH')
     metadata = V.validate_and_report(vertices, faces, resolved, extra=dict(
         settings=dict(resolved), trajectory=trajectory_report, bag_scan=extent, preflight=preflight,
@@ -452,15 +433,28 @@ def reconstruct(settings, event, cancel=None):
     if staging is not None:
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir(parents=True, exist_ok=True)
-    fields = write_outputs(dict(resolved, output=(staging/output.name if staging else None),
-                               staging_root=staging, chunk_size=settings.get('chunk_size')), vertices, faces,
-                           (extent['observed_bbox_min_m'], extent['observed_bbox_max_m']), event)
-    metadata.update(fields)
-    if staging is not None:
-        # Validate while still staged: an invalid mesh must never reach the published path.
-        V.check_cancellation(cancel)
-        published = publish_outputs(staging, output.parent, settings['mesh_output_mode'])
-        metadata['published_outputs'] = [str(output.parent/name) for name in published]
+    try:
+        fields = write_outputs(dict(resolved, output=(staging/output.name if staging else None),
+                                   staging_root=staging, chunk_size=settings.get('chunk_size')), vertices, faces,
+                               (extent['observed_bbox_min_m'], extent['observed_bbox_max_m']), event)
+        metadata.update(fields)
+        if staging is not None:
+            # Validate the whole staged set, then publish it. An invalid or incomplete set must
+            # never replace a valid published one (GATE 11).
+            V.check_cancellation(cancel)
+            manifest = V.publish_output_set(staging, output.parent, settings['mesh_output_mode'],
+                                           expected=dict(vertex_count=len(vertices), face_count=len(faces)) if
+                                           settings['mesh_output_mode'] != 'chunks' else None,
+                                           metadata=fields)
+            published = manifest['published']
+            metadata['published_outputs'] = [str(output.parent/name) for name in published]
+            metadata['publish_manifest'] = f'{V.PUBLISH_MANIFEST}'
+    finally:
+        # A cancelled or failed run must not leave an unpublished partial mesh on disk: the
+        # published path is never touched, and the staging area is removed. A successful
+        # publish has already removed it.
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
     if output is not None and settings['mesh_output_mode'] != 'chunks':
         persisted = inspect_mesh(output)
         metadata['vertex_count'] = persisted['vertex_count']
@@ -516,14 +510,19 @@ def main():
     def event(next_stage, **fields):
         nonlocal stage
         stage = next_stage
-        obj = dict(stage=stage, **fields)
+        obj = dict(stage=stage, at=time.time(), **fields)
         print(json.dumps(obj), file=sys.stderr, flush=True)
         if args.progress:
             atomic_json(args.progress, obj)
 
     # Cancellation is cooperative: a flag is raised and checked at every bounded
     # batch boundary, so the native integrator is never abandoned mid-call. A second
-    # signal unwinds immediately instead.
+    # signal unwinds immediately instead. SIGTERM behaves exactly like SIGINT because it is
+    # the escalation step of the managed stop ladder: a handler that only sets the flag lets
+    # the worker stop at the next checkpoint and report CANCELLED instead of being killed
+    # with no state, and the parent still escalates to SIGKILL if a checkpoint is too far
+    # away. A Python signal handler only runs when the interpreter regains control, so this
+    # never claims to interrupt a native call.
     cancelled = {'count': 0}
 
     def on_signal(signum, frame):
@@ -535,8 +534,8 @@ def main():
         if cancelled['count']:
             raise WorkerError('CANCELLED', 'VDBFusion reconstruction cancelled')
 
-    signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
     try:
         if args.check:
             health = run_check()
@@ -612,8 +611,7 @@ def main():
                         association_spacing_multiplier=args.association_spacing_multiplier,
                         boundary_margin_m=args.boundary_margin, unsupported_policy=args.unsupported_policy,
                         mask_deleted_triangles=args.mask_deleted_triangles == '1',
-                        memory_budget_bytes=(int(args.memory_budget_gib * 1024 ** 3)
-                                             if args.memory_budget_gib else None),
+                        memory_budget_bytes=V.resolve_memory_budget_bytes(dict(arg_settings(args))),
                         chunk_size=args.chunk_size, _started=started)
         metadata.update(reconstruct(settings, event, check_cancel))
         path = args.metadata or Path(args.output).parent / 'vdbfusion_metadata.json'

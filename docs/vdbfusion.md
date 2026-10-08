@@ -151,18 +151,27 @@ recording is never integrated with a constant origin.
   (343 at 20 mm voxels with 60 mm truncation), so a surface estimate of one voxel per
   observation is only sane because a surface band is one voxel thick. The union bound
   warns when the worst case would exceed the usable memory.
+* One byte-valued limit is derived from the request by
+  `resolve_memory_budget_bytes`: the UI/API control `memory_budget_gib` (or an explicit
+  `memory_budget_bytes`, or the default 24 GiB) is normalised once and used by the
+  preflight, the runtime soft check and the memory supervisor, so all three agree. A
+  malformed budget is an error rather than a silent fall back to the default, which could
+  only widen the limit.
 * A run is **refused before it starts** with `RESOURCE_PREFLIGHT_FAILED` plus
   mitigation advice when the estimated peak cannot fit inside
-  `min(configured budget, available RAM − reserve)`. The requested resolution is still
-  never silently reduced: the message tells the user which setting to change and asks
-  for a re-prepare.
+  `min(configured budget, available RAM − reserve)`. The comparison is arithmetic on byte
+  values, so zero usable headroom fails closed instead of passing a positive estimate. The
+  requested resolution is still never silently reduced: the message tells the user which
+  setting to change and asks for a re-prepare; when free RAM does not even cover the
+  reserve it says so explicitly.
 * **Streaming does not bound the TSDF itself.** A large fine-resolution sparse volume
   still grows with the touched surface. A soft memory budget (default 24 GiB, or
   `--memory-budget-gib`) also fails a run that grows past it *while* integrating, with
   `MEMORY_BUDGET_EXCEEDED` and the requested resolution untouched.
 * While the worker runs, the backend samples the **worker process tree** RSS every
   2 seconds and records the sampled peak, the stage at the peak, samples and elapsed
-  time per stage and any pressure event in `mesh_job.json → memory`. Sampling happens
+  time per stage and any pressure event in `mesh_job.json → memory`. The limit it samples
+  against is the same normalised byte value the worker enforces. Sampling happens
   in the backend so it keeps working while the worker is inside a native call. At 95 %
   of the budget the supervisor requests cooperative cancellation once and records the
   event; it never kills the process itself and never touches previous outputs. Every
@@ -175,11 +184,21 @@ recording is never integrated with a constant origin.
 * Progress is written to `reconstruction/run_ID/vdbfusion_progress.json`, logs to
   `reconstruction/run_ID/job.log`.
 * Cancellation is cooperative: the signal sets a flag that is checked at every
-  bounded boundary **including the mesh scan, the triangle probes and before the
-  outputs are published**, so the native integrator is never abandoned mid-call but a
-  long extraction or masking pass can still be interrupted. A second signal unwinds
-  immediately. A user-requested stop is recorded as `CANCELLED`, never as an engine
-  failure.
+  bounded boundary **including the mesh scan, the triangle probes, immediately after the
+  native extractor returns, and before the outputs are published**, so the native
+  integrator is never abandoned mid-call but a long extraction, masking or writing pass
+  still stops at the next checkpoint.
+* `SIGTERM` is handled like `SIGINT`, because it is the escalation step of the managed stop
+  ladder: the worker stops at the next checkpoint and reports `CANCELLED` instead of dying
+  with no state, and the parent still escalates to `SIGKILL` if a checkpoint is too far
+  away. A Python signal handler only runs when the interpreter regains control, so a signal
+  that arrives during a native call is honoured *after* that call returns - that deferral is
+  measured by `tests/test_vdbfusion_cancellation.py`, not assumed away: on a 7.1 million
+  triangle mesh the worker was signalled inside `EXTRACTING_MESH` and reported `CANCELLED`
+  2.4 s later (13.4 s before the post-extraction checkpoint was added, because it first
+  wrote a 135 MiB staged PLY).
+* A second signal unwinds immediately. A user-requested stop is recorded as `CANCELLED`,
+  never as an engine failure.
 * Cancellation escalates with a bounded grace period: `SIGINT` (cooperative), then
   `SIGTERM`, then `SIGKILL` on the worker's process group, so no orphan process tree is
   left behind.
@@ -187,10 +206,23 @@ recording is never integrated with a constant origin.
   staging directory into `attempts/previous_<id>/`. A validated mesh is never
   overwritten by a retry, and a stale progress file can never be mistaken for the
   current run's.
-* Meshes are written into `output/staging/`, validated there, and only then published
-  by a same-filesystem rename. A partial or invalid mesh is therefore never present at
-  the published `output/mesh.ply` path, and a failed attempt leaves the previous
-  output untouched.
+* Meshes are written into `output/staging/`, validated there, and only then published. A
+  partial or invalid mesh is therefore never present at the published path, and a failed
+  attempt leaves the previous output untouched. The whole staged set is validated before
+  anything moves: the merged PLY is re-read with the independent validator, and the chunk
+  set through the shared chunk-manifest validator.
+* Publishing never unlinks a previous valid artifact before its replacement exists: a file
+  is swapped with a single atomic rename, and a directory is moved aside before the new one
+  is moved in and restored if the swap fails. If a restore cannot be completed the error
+  names the exact backup path instead of losing the artifact silently. A cancelled or
+  failed run removes its staging area, so no partial mesh is left on disk either.
+* A **completion manifest** (`output/publish_manifest.json`) is written last and records the
+  mode, the published artifacts with their sizes and (up to 256 MiB) a SHA-256, and the
+  transaction limitation: the set is published artifact by artifact, so between the two
+  renames a reader can see the new mesh next to the previous chunk directory; the previous
+  artifacts are deleted only after every rename succeeded. `validate_completed` re-reads the
+  manifest and rejects a recorded artifact that is missing or has a different size, which is
+  what makes a partially published set detectable.
 * VDBFusion writes `output/vdbfusion_metadata.json`. NKSR metadata is never written
   for a VDBFusion job, and the two engines use separate managed processes, so neither
   can overwrite the other.
@@ -202,7 +234,8 @@ recording is never integrated with a constant origin.
 | `input/vdbfusion_prepare.json` | Preparation: validated sources, sampled scan summary, preflight, TSDF settings |
 | `output/mesh.ply` | Binary little-endian triangle PLY, XYZ in **world metres**, indexed faces, no local origin shift |
 | `output/mesh_chunks/chunk_NNNN.ply`, `chunks.json` | Separate meshes: spatial cells of the same single fused mesh |
-| `output/staging/` | Staging area: the mesh is written and validated here, then published by rename (removed after a successful publish) |
+| `output/staging/` | Staging area: the mesh is written and validated here, then published by rename (removed after a successful publish and after a cancellation) |
+| `output/publish_manifest.json` | Completion manifest: mode, published artifacts with sizes and SHA-256, and the documented cross-artifact transaction limitation |
 | `output/vdbfusion_metadata.json` | Engine identity, settings, timings, integration and edit-filter statistics, mesh validation, geometry audit |
 | `vdbfusion_progress.json`, `job.log` | Live stage, messages and full log |
 

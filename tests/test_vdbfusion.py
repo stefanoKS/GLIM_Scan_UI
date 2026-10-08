@@ -427,3 +427,27 @@ def test_worker_rejects_empty_tsdf_and_bad_input(tmp_path, vdbfusion_python):
     failure = json.loads(result.stderr.strip().splitlines()[-1])
     assert failure['error_type'] == 'RAW_BAG_UNREADABLE'
     assert not (tmp_path/'mesh.ply').exists()
+
+
+def test_worker_honours_the_ui_memory_budget_in_bytes(tmp_path, vdbfusion_python):
+    """The UI/API budget is gigabytes; the engine compares bytes. A 20 MB budget must be
+    refused from that value, naming it, rather than silently falling back to the 24 GiB
+    default - that fall back is what the normaliser fixed."""
+    trajectory = translating_trajectory(steps=5)
+    bag = write_synthetic_bag(tmp_path, trajectory, points_per_frame=2000, frames=2)
+    traj = tmp_path/'traj_lidar.txt'
+    np.savetxt(traj, trajectory)
+    result = subprocess.run(
+        [str(vdbfusion_python), str(Path(__file__).resolve().parents[1]/'tools/vdbfusion_worker.py'),
+         '--bag', str(bag), '--trajectory', str(traj), '--output', str(tmp_path/'mesh.ply'),
+         '--progress', str(tmp_path/'progress.json'), '--voxel-size', '0.02',
+         '--memory-budget-gib', '0.02'],
+        env=vdbfusion_env(), capture_output=True, text=True, timeout=600)
+    assert result.returncode != 0
+    failure = json.loads(result.stderr.strip().splitlines()[-1])
+    assert failure['error_type'] == 'RESOURCE_PREFLIGHT_FAILED'
+    assert 'budget 0.0 GiB' in failure['message'], failure['message']
+    assert not (tmp_path/'mesh.ply').exists()
+    # The preflight also echoes the normalised value, so the byte arithmetic is inspectable.
+    progress = json.loads((tmp_path/'progress.json').read_text())
+    assert progress['error_type'] == 'RESOURCE_PREFLIGHT_FAILED'

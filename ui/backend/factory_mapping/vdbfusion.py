@@ -12,8 +12,11 @@ trajectory interpolation in :mod:`factory_mapping.reconstruction`.
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 import time
+import uuid
 from pathlib import Path
 import numpy as np
 
@@ -178,6 +181,33 @@ SEMANTIC_SETTING_KEYS = (
 # between preparation and reconstruction without invalidating the prepared identity.
 EXECUTION_SETTING_KEYS = ('batch_points', 'memory_budget_gib', 'mesh_output_mode', 'chunk_size')
 PREPARATION_IDENTITY_VERSION = 1
+
+
+def resolve_memory_budget_bytes(settings, override=None):
+    """The one byte-valued memory limit used by every layer.
+
+    The UI/API control is ``memory_budget_gib`` (gigabytes, as the field name says), the
+    worker CLI passes gigabytes and the engine works in bytes. Reading only
+    ``memory_budget_bytes`` silently ignored the configured budget - the memory supervisor
+    received 0 and never escalated, and the preflight fell back to the default. Precedence
+    is: explicit ``override`` (the worker's own resolved limit) > ``memory_budget_bytes`` >
+    ``memory_budget_gib`` > :data:`DEFAULT_MEMORY_BUDGET_BYTES`.
+
+    A non-positive, non-finite or non-numeric configured value is an error rather than a
+    silent fall back to the default, so a malformed budget can never widen the limit.
+    """
+    for value, unit in ((override, 1), (settings.get('memory_budget_bytes'), 1),
+                        (settings.get('memory_budget_gib'), 1024 ** 3)):
+        if value is None:
+            continue
+        try:
+            number = float(value) * unit
+        except (TypeError, ValueError) as error:
+            raise ValueError(f'Memory budget must be a number of bytes or GiB, not {value!r}') from error
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError('Memory budget must be a positive, finite amount of memory')
+        return int(number)
+    return DEFAULT_MEMORY_BUDGET_BYTES
 
 
 def canonical_settings(settings, keys=SEMANTIC_SETTING_KEYS):
@@ -1078,20 +1108,24 @@ def preflight(root, settings, observed_points=None, observed_bbox=None, bag_byte
     estimate = memory_estimate(settings, observed_points=observed_points, observed_bbox=observed_bbox,
                                occupancy=occupancy, batch_points=batch_points, reference_points=reference_points)
     reserve = max(int(total_ram * PREFLIGHT_RAM_RESERVE_FRACTION), PREFLIGHT_MIN_RAM_RESERVE_BYTES)
-    budget = int(memory_budget_bytes or settings.get('memory_budget_bytes') or DEFAULT_MEMORY_BUDGET_BYTES)
+    budget = resolve_memory_budget_bytes(settings, override=memory_budget_bytes)
     usable = max(min(budget, free_ram - reserve), 0)
     total = estimate['total_peak_bytes']
     upper_bound = estimate.get('upper_bound_bytes')
     warnings, failures = [], []
     ok = True
-    if total is not None and usable and total > usable:
+    # Compared as byte values, never by truthiness: zero usable memory used to leave ``ok``
+    # True and report a run that cannot fit at all as passing.
+    if total is not None and total > usable:
         ok = False
         failures.append(
             f'RESOURCE_PREFLIGHT_FAILED: the estimated peak of {total / 1024 ** 3:.1f} GiB '
             f'({estimate["safety_margin"]:.2f}x safety margin over the component estimate) exceeds the usable '
             f'{usable / 1024 ** 3:.1f} GiB (budget {budget / 1024 ** 3:.1f} GiB, free RAM '
-            f'{free_ram / 1024 ** 3:.1f} GiB minus {reserve / 1024 ** 3:.1f} GiB reserve).')
-    elif total is not None and total > usable * 0.75:
+            f'{free_ram / 1024 ** 3:.1f} GiB minus {reserve / 1024 ** 3:.1f} GiB reserve).'
+            + (' Free RAM does not even cover the reserve, so no VDBFusion run fits on this workstation right now.'
+               if usable <= 0 else ''))
+    elif total is not None and usable > 0 and total > usable * 0.75:
         warnings.append(
             f'The estimated peak of {total / 1024 ** 3:.1f} GiB is close to the usable {usable / 1024 ** 3:.1f} GiB; '
             'keep the workstation free of other large jobs and watch the run.')
@@ -1179,7 +1213,7 @@ def integrate_bag(bag, trajectory, topic, settings, output=None, edit_reference=
 
     event = event or (lambda stage, **fields: None)
     process = psutil.Process()
-    budget = int(memory_budget_bytes or DEFAULT_MEMORY_BUDGET_BYTES)
+    budget = resolve_memory_budget_bytes(settings, override=memory_budget_bytes)
     volume = vdbfusion.VDBVolume(settings['voxel_size_m'], settings['sdf_trunc_m'], settings['space_carving'])
     stats = dict(
         raw_frames=0, raw_observations=0, integrated_observations=0, origin_groups=0,
@@ -1621,6 +1655,186 @@ def validate_and_report(vertices, faces, settings, extra=None, observed_bbox=Non
 def write_mesh_ply(path, vertices, faces):
     from .nksr_mesh import write_mesh
     return write_mesh(path, vertices, faces)
+
+
+PUBLISH_MANIFEST = 'publish_manifest.json'
+# A published artifact larger than this is recorded by size only: hashing a multi-gigabyte
+# mesh would cost minutes for no operational benefit.
+PUBLISH_HASH_LIMIT_BYTES = 256 * 1024 ** 2
+PUBLISH_BACKUP_SUFFIX = 'previous-'
+PUBLISH_TRANSACTION_NOTE = (
+    'Each artifact is replaced atomically on its own: a file is swapped with one rename that '
+    'never unlinks the previous version first, and a directory is moved aside before the new '
+    'one is moved in, with the previous one restored if the swap fails. The set as a whole is '
+    'therefore not a single transaction - between the two renames a reader can see the new '
+    'mesh next to the previous chunk directory - and the previous artifacts are only deleted '
+    'after every rename succeeded. This manifest, written last, records the artifacts that '
+    'belong to the completed run.')
+
+
+def output_artifact_names(mode):
+    """The artifacts a mesh output mode must publish, directories first."""
+    if mode not in MESH_OUTPUT_MODES:
+        raise ValueError(f'Mesh output mode must be one of {", ".join(MESH_OUTPUT_MODES)}')
+    names = []
+    if mode != 'merged':
+        names.append('mesh_chunks')
+    if mode != 'chunks':
+        names.append('mesh.ply')
+    return names
+
+
+def artifact_size_bytes(path):
+    """Content size of an artifact: a file's size, or the sum of a directory's files.
+
+    ``Path.stat().st_size`` on a directory is the size of its inode entry, not of its
+    contents, so directory artifacts must be measured by summing their files on both sides of
+    the comparison.
+    """
+    path = Path(path)
+    if path.is_dir():
+        return int(sum(item.stat().st_size for item in path.rglob('*') if item.is_file()))
+    return int(path.stat().st_size)
+
+
+def _artifact_digest(path):
+    """Size, file count and - for reasonably sized files - a content hash."""
+    path = Path(path)
+    if path.is_dir():
+        files = sorted(item for item in path.rglob('*') if item.is_file())
+        return dict(kind='directory', bytes=artifact_size_bytes(path),
+                    file_count=len(files), sha256=None)
+    size = path.stat().st_size
+    digest = None
+    if size <= PUBLISH_HASH_LIMIT_BYTES:
+        hasher = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    return dict(kind='file', bytes=int(size), file_count=1, sha256=digest)
+
+
+def validate_staged_outputs(staging, mode, expected=None, metadata=None):
+    """Validate every staged artifact before anything is published.
+
+    A corrupt or incomplete staged set must never replace a valid published one, so the whole
+    set is validated first: the merged PLY is re-read with the independent validator and the
+    chunk set is validated through the shared chunk-manifest validator. ``expected`` optionally
+    pins the merged mesh counts from the in-memory mesh that produced it.
+    """
+    staging = Path(staging)
+    if not staging.is_dir():
+        raise ValueError('Staged output directory is missing; nothing to publish')
+    names = output_artifact_names(mode)
+    missing = [name for name in names if not (staging/name).exists()]
+    if missing:
+        raise ValueError(f'Staged output set is incomplete: {", ".join(missing)} missing')
+    stats = {}
+    for name in names:
+        if name == 'mesh_chunks':
+            from .nksr_jobs import validate_chunks_completed
+            # The shared validator also compares the manifest against the worker metadata, so
+            # the same metadata that described the export is used here.
+            merged = dict(metadata or {})
+            merged.setdefault('mesh_output_mode', mode)
+            stats['mesh_chunks'] = dict(validate_chunks_completed(staging, merged) or {})
+        else:
+            stats['mesh.ply'] = validate_written_mesh(staging/name, expected) if expected else \
+                inspect_mesh_shared(staging/name)
+    return stats
+
+
+def inspect_mesh_shared(path):
+    from .nksr_mesh import inspect_mesh
+    return inspect_mesh(path)
+
+
+def publish_output_set(staging, destination, mode='merged', expected=None, metadata=None):
+    """Publish a validated staged output set, then record a completion manifest.
+
+    Order and guarantees:
+
+    1. every artifact of the requested mode must be present and validate while still staged;
+    2. directories are moved aside and files are replaced with a single atomic rename, so a
+       previous valid artifact is never unlinked before its replacement exists;
+    3. on any failure the previous artifacts are restored and the staged set is kept for retry;
+    4. only after every rename succeeded are the backups deleted and the manifest written.
+
+    See :data:`PUBLISH_TRANSACTION_NOTE` for the documented cross-artifact limitation.
+    """
+    staging = Path(staging)
+    destination = Path(destination)
+    names = output_artifact_names(mode)
+    validate_staged_outputs(staging, mode, expected, metadata)
+    destination.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+    backups = []
+    published = []
+
+    def rollback():
+        """Put the previous artifacts back; a failed publish must not lose them.
+
+        Returns the backups that could not be restored, so an unrecoverable swap is reported
+        with the exact path an operator can recover from instead of failing silently.
+        """
+        stranded = []
+        for target, backup in reversed(backups):
+            try:
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink()
+                os.replace(backup, target)
+            except OSError:
+                stranded.append((str(target), str(backup)))
+        return stranded
+
+    try:
+        for name in names:
+            source = staging/name
+            target = destination/name
+            artifacts[name] = _artifact_digest(source)
+            if source.is_dir():
+                backup = destination/f'{name}.{PUBLISH_BACKUP_SUFFIX}{uuid.uuid4().hex[:12]}'
+                if target.exists():
+                    os.replace(target, backup)
+                    backups.append((target, backup))
+                os.replace(source, target)
+            else:
+                # A single atomic rename: the previous file is replaced in place, never
+                # unlinked first, so a failure leaves it exactly as it was.
+                os.replace(source, target)
+            published.append(name)
+    except OSError as error:
+        stranded = rollback()
+        detail = (f'; the previous output could not be restored from {", ".join(backup for _, backup in stranded)}'
+                  if stranded else '')
+        raise OSError(error.errno, f'Publishing the mesh output set failed: {error.strerror}{detail}') from error
+    except Exception:
+        stranded = rollback()
+        if stranded:
+            raise RuntimeError(
+                'Publishing failed and the previous output could not be restored from '
+                + ', '.join(backup for _, backup in stranded)) from None
+        raise
+    for _, backup in backups:
+        if backup.is_dir():
+            shutil.rmtree(backup, ignore_errors=True)
+        else:
+            backup.unlink(missing_ok=True)
+    shutil.rmtree(staging, ignore_errors=True)
+    manifest = dict(mode=mode, published_at=time.time(), artifacts=artifacts, published=published,
+                    transaction_note=PUBLISH_TRANSACTION_NOTE,
+                    hash_limit_bytes=PUBLISH_HASH_LIMIT_BYTES)
+    _write_manifest(destination/PUBLISH_MANIFEST, manifest)
+    return manifest
+
+
+def _write_manifest(path, manifest):
+    """Write the manifest atomically: a reader never sees a half-written manifest."""
+    path = Path(path)
+    temporary = path.with_name(f'.{path.name}.partial')
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    os.replace(temporary, path)
 
 
 def validate_written_mesh(path, expected):
