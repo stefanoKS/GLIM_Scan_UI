@@ -9,7 +9,10 @@ Nothing here touches NKSR, Torch, CUDA or any existing GLIM export. World
 coordinates are always metres and every sensor origin comes from the GLIM
 trajectory interpolation in :mod:`factory_mapping.reconstruction`.
 """
+import hashlib
+import json
 import math
+import re
 import time
 from pathlib import Path
 import numpy as np
@@ -52,6 +55,27 @@ DEFAULT_ASSOCIATION_SPACING_SAMPLE = 200_000
 DEFAULT_REFERENCE_SAMPLING_M = 0.1
 MIN_ASSOCIATION_RADIUS_M = 0.02
 MAX_REFERENCE_INDEX_BYTES = 5 * 1024 ** 3
+# Resource preflight model (GATE 7). Every figure below is a documented heuristic,
+# not a promise; the estimate is reported component by component with the safety
+# margin that was applied, so a reader can judge it.
+PREFLIGHT_SAFETY_MARGIN = 1.3
+PREFLIGHT_RAM_RESERVE_FRACTION = 0.15
+PREFLIGHT_MIN_RAM_RESERVE_BYTES = 2 * 1024 ** 3
+# Permanent bytes per reference point: world f64 (24 B) + kept mask (4 B) plus the
+# kept/removed KD-tree index amortized over the reference set.
+REFERENCE_BYTES_PER_POINT = 24 + 4 + 96
+# One bounded input batch: world f64 (24 B) + origins f64 (24 B) + intensity f32 (4 B)
+# + timestamps f64 (8 B) per observation.
+BATCH_BYTES_PER_OBSERVATION = 60
+# Extraction keeps faces as int64 (24 B/triangle) and about 0.5 vertices per triangle
+# as float64 (12 B), before masking compacts both.
+MESH_BYTES_PER_TRIANGLE = 40
+# Binary PLY: int32 indices plus float32 vertices, and the writer builds one PlyData
+# copy that is then independently re-read for validation.
+PLY_BYTES_PER_TRIANGLE = 32
+PLY_TRANSIENT_FACTOR = 3
+# A triangle probe allocates 6 float64 samples per candidate triangle, bounded per batch.
+MASK_PROBE_BYTES_PER_TRIANGLE = 6 * 24
 
 
 def validate_voxel_size(value):
@@ -103,6 +127,29 @@ def validate_mesh_output_mode(value):
     return value
 
 
+class ReconstructionCancelled(RuntimeError):
+    """Cooperative cancellation was requested while a bounded stage was running.
+
+    Raised from :func:`check_cancellation`, which every long stage polls, so a
+    cancellation can land inside mesh extraction or output writing instead of only
+    between integration batches. The worker maps it to the ``CANCELLED`` state.
+    """
+
+    code = 'CANCELLED'
+
+
+def check_cancellation(cancel):
+    """Poll a cooperative cancellation callback and raise when it reports a stop.
+
+    ``cancel`` may either return a boolean or raise its own cancellation error;
+    both are accepted so the library and the worker can share one contract.
+    """
+    if cancel is None:
+        return
+    if cancel():
+        raise ReconstructionCancelled('VDBFusion reconstruction cancelled')
+
+
 def validate_roi(minimum, maximum):
     """Optional world-space ROI box. Both bounds are required together, in metres."""
     if minimum is None and maximum is None:
@@ -118,6 +165,122 @@ def validate_roi(minimum, maximum):
     if np.any(upper <= lower):
         raise ValueError('Region-of-interest maximum must be strictly greater than its minimum on every axis')
     return lower.tolist(), upper.tolist()
+
+
+# Settings that change *what* a run produces. They are part of the preparation identity:
+# a reconstruction with different values is a different job and must be prepared again.
+SEMANTIC_SETTING_KEYS = (
+    'preset', 'voxel_size_m', 'sdf_trunc_m', 'space_carving', 'origin_error_budget_m',
+    'roi_min_m', 'roi_max_m', 'unsupported_observations', 'mask_deleted_triangles',
+    'boundary_margin_m', 'association_spacing_multiplier',
+)
+# Settings that only change *how* a run executes or is written out. They may be changed
+# between preparation and reconstruction without invalidating the prepared identity.
+EXECUTION_SETTING_KEYS = ('batch_points', 'memory_budget_gib', 'mesh_output_mode', 'chunk_size')
+PREPARATION_IDENTITY_VERSION = 1
+
+
+def canonical_settings(settings, keys=SEMANTIC_SETTING_KEYS):
+    """Canonically typed semantic subset, so a fingerprint is deterministic."""
+    canonical = {}
+    for key in keys:
+        value = (settings or {}).get(key)
+        if value is None or isinstance(value, bool):
+            canonical[key] = value
+        elif isinstance(value, (list, tuple)):
+            canonical[key] = [float(item) for item in value]
+        elif isinstance(value, (int, float)):
+            canonical[key] = float(value)
+        else:
+            canonical[key] = str(value)
+    return canonical
+
+
+def settings_fingerprint(settings, keys=SEMANTIC_SETTING_KEYS):
+    """Stable SHA-256 fingerprint of the semantic settings."""
+    payload = json.dumps(canonical_settings(settings, keys), sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def compare_semantic_settings(prepared, current):
+    """Compare the settings a run was prepared with against the current request.
+
+    Execution-only settings (``batch_points``, memory budget, mesh output mode, chunk
+    size) are excluded: they change how the run executes, not what it produces. A value the
+    request omits is not a mismatch, it means "use the prepared value" - which is also what
+    the reconstruction then runs with, so the prepared resolution can never be silently
+    replaced by a different one.
+    """
+    prepared_canonical = canonical_settings(prepared)
+    requested_canonical = canonical_settings(current)
+    differing = []
+    for key in SEMANTIC_SETTING_KEYS:
+        if (current or {}).get(key) is None:
+            continue
+        if requested_canonical[key] != prepared_canonical[key]:
+            differing.append(key)
+    return dict(matches=not differing, differing=differing,
+                detail={key: dict(prepared=prepared_canonical[key], requested=requested_canonical[key])
+                        for key in differing},
+                prepared=prepared_canonical, requested=requested_canonical)
+
+
+def effective_settings(prepared, current):
+    """Prepared semantic settings with the request's execution-only choices applied."""
+    effective = dict(prepared)
+    for key in EXECUTION_SETTING_KEYS:
+        if (current or {}).get(key) is not None:
+            effective[key] = current[key]
+    return effective
+
+
+def source_identity(bag, trajectory, topic, edited_workspace=None, edit_fingerprints=None):
+    """Pin the prepared source so a later reconstruction can prove it is unchanged.
+
+    The raw bag is read-only after capture and may be many gigabytes, so it is pinned by
+    its byte total, file count and metadata mtime rather than a full hash; the small
+    trajectory text file is hashed in full. This detects a replaced, re-recorded or
+    trimmed source, which is what "the prepared input is stale" means in practice.
+    """
+    bag = Path(bag)
+    trajectory = Path(trajectory)
+    bag_files = [path for path in bag.rglob('*') if path.is_file()]
+    metadata = bag / 'metadata.yaml'
+    identity = dict(
+        bag=str(bag), bag_files=len(bag_files), topic=str(topic),
+        bag_bytes=int(sum(path.stat().st_size for path in bag_files)),
+        bag_metadata_bytes=int(metadata.stat().st_size) if metadata.is_file() else None,
+        bag_metadata_mtime=float(metadata.stat().st_mtime) if metadata.is_file() else None,
+        trajectory=str(trajectory),
+        trajectory_bytes=int(trajectory.stat().st_size) if trajectory.is_file() else None,
+        trajectory_sha256=(hashlib.sha256(trajectory.read_bytes()).hexdigest()
+                           if trajectory.is_file() else None),
+        edited_workspace=str(edited_workspace) if edited_workspace is not None else None,
+    )
+    for key, value in (edit_fingerprints or {}).items():
+        identity[f'edit_{key}'] = value
+    payload = json.dumps(identity, sort_keys=True, separators=(',', ':'))
+    identity['fingerprint'] = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    return identity
+
+
+def compare_source_identity(prepared_source, current_source):
+    """Diff two source identities, including the combined fingerprint."""
+    keys = sorted(set(prepared_source) | set(current_source))
+    differing = [key for key in keys if prepared_source.get(key) != current_source.get(key)]
+    return dict(matches=not differing, differing=differing,
+                detail={key: dict(prepared=prepared_source.get(key), current=current_source.get(key))
+                        for key in differing})
+
+
+def preparation_identity(source, settings):
+    """The canonical identity a prepared VDBFusion run is pinned to."""
+    return dict(version=PREPARATION_IDENTITY_VERSION, source=source,
+                semantic=canonical_settings(settings),
+                semantic_fingerprint=settings_fingerprint(settings),
+                execution=canonical_settings(settings, EXECUTION_SETTING_KEYS),
+                note='Semantic settings and source files are pinned at preparation. Execution-only settings '
+                     '(batch size, memory budget, mesh output mode, chunk size) may change without re-preparing.')
 
 
 def resolve_settings(settings, origin_error_budget_m=None):
@@ -223,8 +386,13 @@ def batch_world_observations(frames, trajectory, batch_points, counters=None, pr
     ``frames`` yields ``(xyz, intensity, timestamps)`` in recorded order. Reuses the
     proven GLIM trajectory interpolation from :mod:`factory_mapping.reconstruction`
     for every point, so each observation gets its own interpolated sensor origin.
-    Bounded by ``batch_points`` per yield: the caller never holds the whole
-    recording. Observations outside the trajectory time range are counted in
+
+    ``batch_points`` is a hard bound on every yielded batch, not an average: a single
+    LiDAR frame larger than the bound is split across several batches in recorded
+    order, observations are never dropped, reordered or duplicated at a slice
+    boundary, and the trailing partial batch is always emitted. ``counters`` records
+    ``batches``, ``split_frames`` and ``max_batch_points`` so the bound can be checked
+    from run metadata. Observations outside the trajectory time range are counted in
     ``counters`` and never silently clamped. ``timings`` accumulates per-phase
     seconds, which is what the benchmark CLI reports.
     """
@@ -232,11 +400,34 @@ def batch_world_observations(frames, trajectory, batch_points, counters=None, pr
     batch_points = validate_batch_points(batch_points)
     counters = counters if counters is not None else {}
     timings = timings if timings is not None else {}
-    for key in ('frames', 'observations', 'outside_trajectory'):
+    for key in ('frames', 'observations', 'outside_trajectory', 'batches', 'split_frames'):
         counters.setdefault(key, 0)
+    counters.setdefault('max_batch_points', 0)
     for key in ('transform_seconds', 'batch_seconds'):
         timings.setdefault(key, 0.0)
     buffers = {key: [] for key in ('points', 'origins', 'intensity', 'timestamps')}
+
+    def count_batch(length):
+        counters['batches'] += 1
+        counters['max_batch_points'] = max(counters['max_batch_points'], int(length))
+
+    def drain():
+        """Concatenate the buffered frames into one batch, or ``None`` when empty."""
+        if not buffers['points']:
+            return None
+        started_batch = time.perf_counter()
+        batch = {key: (np.concatenate(values) if len(values) > 1 else values[0])
+                 for key, values in buffers.items()}
+        timings['batch_seconds'] += time.perf_counter() - started_batch
+        count_batch(len(batch['points']))
+        for values in buffers.values():
+            values.clear()
+        return batch
+
+    def window(values, start, stop):
+        count_batch(stop - start)
+        return {key: value[start:stop] for key, value in zip(buffers, values)}
+
     pending = 0
     for xyz, intensity, timestamps in frames:
         if cancel is not None:
@@ -249,22 +440,36 @@ def batch_world_observations(frames, trajectory, batch_points, counters=None, pr
         # never silently clamped to the first or last pose.
         counters['outside_trajectory'] += int(len(valid) - np.count_nonzero(valid))
         if len(points):
-            for key, values in zip(buffers, (points, origins, intensity[valid], timestamps[valid])):
-                buffers[key].append(values)
-            pending += len(points)
             counters['observations'] += len(points)
-        if pending >= batch_points:
-            started = time.perf_counter()
-            yield {key: np.concatenate(values) for key, values in buffers.items()}
-            timings['batch_seconds'] += time.perf_counter() - started
-            for values in buffers.values():
-                values.clear()
-            pending = 0
+            values = (points, origins, intensity[valid], timestamps[valid])
+            if len(points) > batch_points:
+                # A single frame larger than the bound is emitted, in recorded order, as
+                # several batches. batch_points is the memory-safety limit for *every*
+                # batch, not an average: no batch ever exceeds it, no observation is
+                # dropped or duplicated at a slice boundary, and the final partial slice
+                # is still emitted.
+                counters['split_frames'] += 1
+                buffered = drain()
+                if buffered is not None:
+                    yield buffered
+                for start in range(0, len(points), batch_points):
+                    yield window(values, start, min(start + batch_points, len(points)))
+                pending = 0
+            else:
+                if pending and pending + len(points) > batch_points:
+                    yield drain()
+                    pending = 0
+                for key, value in zip(buffers, values):
+                    buffers[key].append(value)
+                pending += len(points)
+                if pending >= batch_points:
+                    yield drain()
+                    pending = 0
         if counters['frames'] % 200 == 0 and progress is not None:
             progress(f'Reading raw bag: {counters["frames"]:,} LiDAR frames, '
                      f'{counters["observations"]:,} world observations')
     if pending:
-        yield {key: np.concatenate(values) for key, values in buffers.items()}
+        yield drain()
     if not counters['frames']:
         raise ValueError('The raw bag has no LiDAR messages on the selected topic')
 
@@ -357,7 +562,13 @@ class EditedGeometryReference:
         self.association_radius_m = float(max(radius, MIN_ASSOCIATION_RADIUS_M))
         return self.association_radius_m
 
-    def classify(self, points, association_radius_m, boundary_margin_m=0.0):
+    CLASS_KEEP = 0
+    CLASS_REMOVE = 1
+    CLASS_UNSUPPORTED = 2
+    CLASS_AMBIGUOUS = 3
+    CLASS_LABELS = ('KEEP', 'REMOVE', 'UNSUPPORTED', 'AMBIGUOUS')
+
+    def classify(self, points, association_radius_m, boundary_margin_m=0.0, ambiguity_band_m=None):
         """Classify world coordinates against verified kept and removed geometry.
 
         Returns a dict of boolean masks. A coordinate is kept when verified kept
@@ -365,12 +576,23 @@ class EditedGeometryReference:
         not at least as close (minus ``boundary_margin_m``, which biases the edit
         boundary toward exclusion). Coordinates without kept support inside the
         radius are ``unsupported`` and are excluded by default rather than guessed.
+
+        ``ambiguous`` marks coordinates whose nearest kept and nearest removed samples
+        are both inside the radius and within ``ambiguity_band_m`` of each other: they
+        are inside the documented boundary uncertainty band, so their membership is
+        decided by the documented policy (kept unless removed geometry dominates) and
+        reported instead of being presented as a confident classification. The band
+        defaults to the measured reference sampling resolution, which is the resolution
+        limit of the GLIM submap samples themselves; it never widens the association
+        radius. ``class_of`` maps the mask dict to ``CLASS_*`` labels for reporting.
         """
         _, tree_retained, tree_deleted = self.trees()
         count = len(points)
         if not count:
             empty = np.zeros(0, dtype=bool)
-            return dict(keep=empty, unsupported=empty, removed_dominated=empty, removed_support=empty)
+            return dict(keep=empty, unsupported=empty, removed_dominated=empty, removed_support=empty,
+                        ambiguous=empty)
+        band = float(self.sampling_resolution_m if ambiguity_band_m is None else ambiguity_band_m)
         upper = np.nextafter(float(association_radius_m), math.inf)
         near_retained, _ = tree_retained.query(points, k=1, distance_upper_bound=upper, workers=1)
         retained_support = np.isfinite(near_retained) & (near_retained <= association_radius_m)
@@ -378,43 +600,228 @@ class EditedGeometryReference:
         if tree_deleted is None:
             return dict(keep=retained_support, unsupported=unsupported,
                         removed_dominated=np.zeros(count, dtype=bool),
-                        removed_support=np.zeros(count, dtype=bool))
+                        removed_support=np.zeros(count, dtype=bool),
+                        ambiguous=np.zeros(count, dtype=bool))
         near_removed, _ = tree_deleted.query(points, k=1, distance_upper_bound=upper, workers=1)
         removed_support = np.isfinite(near_removed) & (near_removed <= association_radius_m)
         removed_dominated = retained_support & removed_support & (near_retained + float(boundary_margin_m) >= near_removed)
+        # Inside the documented uncertainty band, and not already decided as removed. The
+        # difference is only evaluated where both neighbours exist, so unsupported
+        # coordinates never produce a meaningless infinity-minus-infinity.
+        both = retained_support & removed_support
+        margin = np.full(count, np.inf, dtype=np.float64)
+        np.subtract(near_removed, near_retained, out=margin, where=both)
+        ambiguous = both & ~removed_dominated & (margin <= band)
         return dict(keep=retained_support & ~removed_dominated, unsupported=unsupported,
-                    removed_dominated=removed_dominated, removed_support=removed_support)
+                    removed_dominated=removed_dominated, removed_support=removed_support,
+                    ambiguous=ambiguous)
+
+    @classmethod
+    def class_of(cls, classified):
+        """Label each classified coordinate as KEEP, REMOVE, UNSUPPORTED or AMBIGUOUS."""
+        labels = np.full(len(classified['keep']), cls.CLASS_KEEP, dtype=np.int8)
+        labels[classified['removed_dominated']] = cls.CLASS_REMOVE
+        labels[classified['unsupported']] = cls.CLASS_UNSUPPORTED
+        labels[classified['ambiguous'] & classified['keep']] = cls.CLASS_AMBIGUOUS
+        return labels
+
+
+SUBMAP_ROW_BYTES = 12
+# Rotation blocks from GLIM are text-parsed; this tolerance only sanity-checks the
+# frame, it is never used to establish source identity (that is bit-exact).
+SUBMAP_FRAME_TOLERANCE = 1e-6
+
+
+class SavedSubmapError(ValueError):
+    """Saved cleanup geometry is not a provably valid subset of its pre-edit source.
+
+    The pre-edit (``map_01``) and saved (``saved_map``) submaps are compared as
+    multisets of exact float32 rows. A point the pre-edit submap never contained, or
+    a saved multiplicity above the original multiplicity, is rejected outright rather
+    than silently reinterpreted as removed geometry.
+
+    Measurements on the real saved cleanup ``edit_ef16d03e7f86`` (57 submaps):
+    ``data.txt`` is byte-identical between ``map_01`` and ``saved_map``, every saved
+    submap is an exact multiplicity-valid subset of its pre-edit submap, and every
+    saved submap preserves the original point order. The contract also holds that the
+    first ``id:`` line of ``data.txt`` equals the submap directory index.
+    """
+
+    code = 'INVALID_SAVED_SUBMAP'
+
+    def __init__(self, edit_id, submap_id, mismatch, invalid_points, action=None):
+        self.edit_id = edit_id
+        self.submap_id = submap_id
+        self.mismatch = mismatch
+        self.invalid_points = int(invalid_points)
+        self.action = action or ('Re-export the Clean Map workspace from the native map editor so that '
+                                 'saved_map is a strict subset of map_01, then prepare the job again.')
+        super().__init__(
+            f'{self.code}: edit {edit_id or "unknown"} submap {submap_id or "unknown"}: {mismatch} '
+            f'({self.invalid_points:,} invalid saved points). {self.action}')
+
+
+def submap_block_bytes(path):
+    """Read one ``points_compact.bin`` as its exact bytes.
+
+    Identity is compared on file bytes, so a saved point can only ever match the
+    pre-edit point it was copied from. ``'<f4'`` is used explicitly for values, which
+    keeps the decoded coordinates correct on any host endianness.
+    """
+    try:
+        raw = np.fromfile(path, dtype=np.uint8)
+    except OSError as error:
+        raise ValueError(f'Saved cleanup submap {Path(path).parent.name} has no readable point block') from error
+    if raw.size == 0 or raw.size % SUBMAP_ROW_BYTES:
+        raise ValueError(f'Saved cleanup submap {Path(path).parent.name} has an invalid point block '
+                         f'({raw.size} bytes is not a whole number of 3 x float32 rows)')
+    return raw
+
+
+def submap_rows(raw):
+    """Float32 coordinates and exact byte keys for one raw point block."""
+    return raw.view('<f4').reshape(-1, 3), raw.view(np.dtype((np.void, SUBMAP_ROW_BYTES))).ravel()
 
 
 def _read_submap_points(path):
+    """Backwards-compatible coordinate reader used by tests and diagnostics."""
+    rows, _ = submap_rows(submap_block_bytes(path))
+    if not np.isfinite(rows).all():
+        raise ValueError(f'Saved cleanup submap {Path(path).parent.name} contains non-finite points')
+    return rows
+
+
+def _read_submap_origin(data_txt, submap_id=None):
+    """Parse the submap frame: the leading ``id:`` and ``T_world_origin``.
+
+    The frame is validated structurally (rigid rotation, bottom row) so an
+    inconsistent or corrupt transform is reported instead of being used.
+    """
     try:
-        raw = np.fromfile(path, dtype='<f4')
+        lines = Path(data_txt).read_text().splitlines()
     except OSError as error:
-        raise ValueError(f'Saved cleanup submap {Path(path).parent.name} has no readable point block') from error
-    if raw.size == 0 or raw.size % 3:
-        raise ValueError(f'Saved cleanup submap {Path(path).parent.name} has an invalid point block')
-    return raw.reshape(-1, 3)
-
-
-def _read_submap_origin(data_txt):
-    lines = data_txt.read_text().splitlines()
+        raise ValueError(f'Saved cleanup submap {submap_id or "?"} has no readable data.txt') from error
+    declared = None
+    for line in lines[:4]:
+        match = re.match(r'^id:\s*(\d+)\s*$', line)
+        if match:
+            declared = int(match.group(1))
+            break
+    matrix = None
     for index, line in enumerate(lines):
         if line.startswith('T_world_origin'):
-            rows = [np.fromstring(lines[index + 1 + k], sep=' ') for k in range(4)]
+            try:
+                rows = [np.fromstring(lines[index + 1 + k], sep=' ') for k in range(4)]
+            except IndexError as error:
+                raise ValueError(f'Saved cleanup submap {submap_id or "?"} has a truncated T_world_origin') from error
             matrix = np.vstack(rows)
-            if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
-                raise ValueError('Saved cleanup submap has an invalid T_world_origin')
-            return matrix
-    raise ValueError('Saved cleanup submap has no T_world_origin')
+            break
+    if matrix is None:
+        raise ValueError(f'Saved cleanup submap {submap_id or "?"} has no T_world_origin')
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise ValueError(f'Saved cleanup submap {submap_id or "?"} has an invalid T_world_origin')
+    if submap_id is not None and declared is not None:
+        try:
+            expected = int(submap_id)
+        except (TypeError, ValueError):
+            expected = None
+        if expected is not None and declared != expected:
+            raise ValueError(
+                f'Saved cleanup submap {submap_id} declares id {declared} in data.txt; the submap set is inconsistent')
+    rotation = matrix[:3, :3]
+    if not np.allclose(rotation @ rotation.T, np.eye(3), atol=SUBMAP_FRAME_TOLERANCE) or \
+            not np.isclose(np.linalg.det(rotation), 1.0, atol=SUBMAP_FRAME_TOLERANCE):
+        raise ValueError(f'Saved cleanup submap {submap_id or "?"} has a non-rigid T_world_origin rotation')
+    if not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=SUBMAP_FRAME_TOLERANCE):
+        raise ValueError(f'Saved cleanup submap {submap_id or "?"} has an invalid T_world_origin bottom row')
+    return matrix
+
+
+def validate_submap_pair(original_raw, saved_raw, edit_id, submap_id):
+    """Prove saved geometry is a multiplicity-valid subset of the pre-edit submap.
+
+    Returns the per-original-row retained mask and integrity statistics. Multiplicity
+    is compared exactly, so ``original = A, A, B`` with ``saved = A, A, A`` is
+    rejected instead of accepting every saved ``A`` by membership alone.
+    """
+    original_rows, original_keys = submap_rows(original_raw)
+    saved_rows, saved_keys = submap_rows(saved_raw)
+    if not np.isfinite(original_rows).all():
+        raise ValueError(f'Pre-edit submap {submap_id} contains non-finite points')
+    if not np.isfinite(saved_rows).all():
+        raise ValueError(f'Saved cleanup submap {submap_id} contains non-finite points')
+    if not len(saved_rows):
+        return np.zeros(len(original_rows), dtype=bool), dict(
+            saved_points=0, unknown_saved_points=0, multiplicity_excess_points=0, max_multiplicity_excess=0)
+
+    original_unique, original_counts = np.unique(original_keys, return_counts=True)
+    saved_unique, saved_counts = np.unique(saved_keys, return_counts=True)
+    position = np.searchsorted(original_unique, saved_unique)
+    clipped = np.clip(position, 0, len(original_unique) - 1)
+    found = (position < len(original_unique)) & (original_unique[clipped] == saved_unique)
+    unknown = int(saved_counts[~found].sum())
+    if unknown:
+        raise SavedSubmapError(edit_id, submap_id,
+                               'saved geometry contains points that the pre-edit submap never contained',
+                               unknown,
+                               'The saved map is not a subset of this cleanup working copy. Do not copy points '
+                               'between maps; re-save the Clean Map workspace and export it again.')
+    excess = saved_counts - original_counts[clipped]
+    excess_points = int(excess[excess > 0].sum())
+    if excess_points:
+        raise SavedSubmapError(edit_id, submap_id,
+                               'saved geometry repeats points more often than the pre-edit submap',
+                               excess_points,
+                               'Saved multiplicities exceed the pre-edit multiplicities, so retained/removed '
+                               'membership cannot be proven. Export the Clean Map workspace again without '
+                               'duplicating points.')
+    positions = np.clip(np.searchsorted(saved_unique, original_keys), 0, len(saved_unique) - 1)
+    retained = saved_unique[positions] == original_keys
+    stats = dict(saved_points=int(len(saved_rows)), unknown_saved_points=0,
+                 multiplicity_excess_points=0,
+                 max_multiplicity_excess=int(excess.max()) if len(excess) else 0,
+                 original_unique_keys=int(len(original_unique)), saved_unique_keys=int(len(saved_unique)))
+    return retained, stats
+
+
+def load_validated_submap_pair(original_dir, saved_dir, submap_id, edit_id):
+    """Validate one pre-edit/saved submap pair and return its retained mask.
+
+    Both point blocks and both ``data.txt`` frames are read and checked: the block must be
+    a whole number of float32 rows and finite, the frame must be rigid and its declared id
+    must match the submap directory, the two frames must agree exactly, and the saved rows
+    must be a multiplicity-valid subset of the pre-edit rows. Any failure raises
+    :class:`SavedSubmapError` naming the edit, the submap and the mismatch.
+    """
+    name = Path(original_dir).name
+    original_raw = submap_block_bytes(Path(original_dir) / submap_id / 'points_compact.bin')
+    saved_raw = submap_block_bytes(Path(saved_dir) / submap_id / 'points_compact.bin')
+    original_matrix = _read_submap_origin(Path(original_dir) / submap_id / 'data.txt', submap_id)
+    saved_matrix = _read_submap_origin(Path(saved_dir) / submap_id / 'data.txt', submap_id)
+    if not np.array_equal(original_matrix, saved_matrix):
+        raise SavedSubmapError(
+            edit_id=edit_id, submap_id=submap_id,
+            mismatch='saved and pre-edit submaps declare different T_world_origin transforms',
+            invalid_points=len(saved_raw) // SUBMAP_ROW_BYTES,
+            action='The saved map was written in a different frame. Archive this cleanup and export the Clean Map '
+                   'workspace again against the same session.')
+    keep, integrity = validate_submap_pair(original_raw, saved_raw, edit_id, submap_id)
+    original_rows, _ = submap_rows(original_raw)
+    del original_raw, saved_raw
+    return keep, integrity, original_matrix, original_rows
 
 
 def load_edited_reference(workspace, association_radius_m=None, association_spacing_multiplier=None,
                           spacing_sample=DEFAULT_ASSOCIATION_SPACING_SAMPLE):
     """Load and verify the retained/removed reference geometry of a saved cleanup.
 
-    The pre-edit (``map_01``) and saved (``saved_map``) submaps must share the
-    same ids, and every retained point must be a byte-exact member of the pre-edit
-    submap it came from. Anything else is reported as unsupported, never guessed.
+    The pre-edit (``map_01``) and saved (``saved_map``) submaps must share the same
+    ids and the same ``T_world_origin``, and every saved point must be a byte-exact
+    member of the pre-edit submap it came from, counted with multiplicity. The saved
+    submap frame is validated rather than ignored, so a cleanup written in a different
+    coordinate frame is rejected instead of silently producing wrong world geometry.
+    Anything that fails is reported as ``INVALID_SAVED_SUBMAP`` with the edit id,
+    submap id, mismatch type and invalid point count; nothing is guessed.
     """
     workspace = Path(workspace)
     original_dir = workspace / 'map_01'
@@ -430,25 +837,32 @@ def load_edited_reference(workspace, association_radius_m=None, association_spac
         raise ValueError('Saved cleanup submaps do not match the pre-edit submaps; export the cleanup again')
 
     # One pass over the submap pair to class every pre-edit point as kept or removed.
+    # Each pair is validated as an exact multiset subset before it is trusted, and the
+    # saved frame is compared with the pre-edit frame instead of being ignored.
     all_blocks, labels, submaps = [], [], []
     retained_total = original_total = retained_bytes = 0
     for name in original_ids:
-        original = _read_submap_points(original_dir / name / 'points_compact.bin')
-        saved = _read_submap_points(saved_dir / name / 'points_compact.bin')
-        original_view = original.view([('x', '<f4'), ('y', '<f4'), ('z', '<f4')]).ravel()
-        saved_view = saved.view([('x', '<f4'), ('y', '<f4'), ('z', '<f4')]).ravel()
-        keep = np.isin(original_view, saved_view)
-        matrix = _read_submap_origin(original_dir / name / 'data.txt')
-        rotation = matrix[:3, :3].astype(np.float64)
-        translation = matrix[:3, 3].astype(np.float64)
-        world = original.astype(np.float64) @ rotation.T + translation
-        del original, saved, original_view, saved_view
+        try:
+            keep, integrity, original_matrix, original_rows = load_validated_submap_pair(
+                original_dir, saved_dir, name, workspace.name)
+        except SavedSubmapError:
+            raise
+        except ValueError as error:
+            raise SavedSubmapError(edit_id=workspace.name, submap_id=name, mismatch=str(error), invalid_points=0,
+                                   action='The saved cleanup submap is corrupt. Export the Clean Map workspace '
+                                          'again, then prepare the job again.') from error
+        rotation = original_matrix[:3, :3].astype(np.float64)
+        translation = original_matrix[:3, 3].astype(np.float64)
+        world = original_rows.astype(np.float64) @ rotation.T + translation
+        del original_rows, rotation, translation
         all_blocks.append(world)
         labels.append(keep)
         retained_total += int(keep.sum())
         original_total += len(world)
         retained_bytes += int(keep.sum()) * 24
-        submaps.append(dict(id=name, original_points=int(len(world)), retained_points=int(keep.sum())))
+        submaps.append(dict(id=name, original_points=int(len(world)), retained_points=int(keep.sum()),
+                            saved_points=integrity['saved_points'],
+                            max_multiplicity_excess=integrity['max_multiplicity_excess']))
     if not retained_total:
         raise ValueError('Saved cleanup retains no submaps; export a cleanup that keeps geometry')
     world = np.concatenate(all_blocks)
@@ -479,6 +893,10 @@ def load_edited_reference(workspace, association_radius_m=None, association_spac
         association_spacing_multiplier=reference.association_spacing_multiplier,
         method='nearest_kept_within_measured_sampling_radius_with_nearest_removed_exclusion',
         accuracy=EditedGeometryReference.VALIDATION,
+        integrity=dict(validation='strict_multiset_subset', submaps_checked=len(submaps),
+                       saved_points=sum(int(entry['saved_points']) for entry in submaps),
+                       unknown_saved_points=0, multiplicity_violations=0,
+                       transform_identity_verified=True),
         limitation='GLIM stores submaps as voxel samples, so kept/removed membership cannot be traced back to '
                    'individual raw observations. Edited boundaries therefore carry a documented uncertainty band '
                    'equal to the reported association radius.')
@@ -503,54 +921,218 @@ def measure_sampling_resolution(points, sample=DEFAULT_ASSOCIATION_SPACING_SAMPL
     return spacing
 
 
-def preflight(root, settings, observed_points=None, observed_bbox=None, bag_bytes=None):
-    """Resource preflight: free RAM, free disk, resolution and estimated pressure.
+def truncation_influence_voxels(voxel_size_m, sdf_trunc_m):
+    """Voxels one observation can influence: the truncation band around its cell."""
+    half = int(math.ceil(float(sdf_trunc_m) / float(voxel_size_m)))
+    return (2 * half + 1) ** 3
 
-    Streaming bounds the *input* memory, not the TSDF: a fine sparse volume over a
-    whole factory still grows with the touched surface. The estimate below is an
-    order-of-magnitude figure, not a promise, and is reported so a user can see the
-    pressure before committing to a long run.
+
+def surface_triangles_estimate(touched_voxels, band_thickness):
+    """Triangles a marching-cubes isosurface produces from a touched voxel count.
+
+    A surface band is one voxel thick, so the traced surface voxels are the touched
+    voxels divided by the truncation band thickness, and each surface voxel yields about
+    two triangles. Calibrated against the recorded real-engine benchmark (a 20 mm run over
+    the ROI that touched about 14 M voxels produced 3.99 M triangles).
+    """
+    return 2.0 * float(touched_voxels) / max(int(band_thickness), 1)
+
+
+def memory_estimate(settings, observed_points=None, observed_bbox=None, occupancy=None,
+                    batch_points=None, reference_points=None):
+    """Component-wise memory estimate, with every heuristic labelled.
+
+    Components are reported separately because they fail for different reasons: the TSDF
+    grows with the touched surface, the reference index grows with the export size, the
+    input batches grow with ``batch_points``, and extraction/masking/output grow with the
+    triangle count.
+
+    The *primary* estimate for the touched surface is the observation count times the
+    measured voxels-per-observation when a bag sample is available, and the observation
+    count itself otherwise (one voxel per surface observation). The audit's finding is
+    still fixed and reported explicitly: the previous code used ``min(dense_band, N)``,
+    which understates the touched surface by up to ``truncation_influence_voxels()`` (343x
+    at 20 mm voxels with 60 mm truncation) because one observation can influence many
+    voxels. That union bound, and the dense truncation band, are now computed and reported
+    as ``upper_bound`` figures next to the primary estimate instead of being hidden inside
+    a single number.
+    """
+    voxel = float(settings['voxel_size_m'])
+    trunc = float(settings['sdf_trunc_m'])
+    influence = truncation_influence_voxels(voxel, trunc)
+    band_thickness = 2 * int(math.ceil(trunc / voxel)) + 1
+    batch_points = int(batch_points or settings.get('batch_points') or DEFAULT_BATCH_POINTS)
+    components = {}
+    basis = []
+    extent = dense_voxels = upper_voxels = None
+    if observed_bbox is not None:
+        lower = np.asarray(observed_bbox[0], dtype=np.float64)
+        upper = np.asarray(observed_bbox[1], dtype=np.float64)
+        sizes = np.ceil(np.maximum(upper - lower, voxel) / voxel) + 2 * math.ceil(trunc / voxel)
+        extent = (upper - lower).tolist()
+        dense_voxels = float(np.prod(np.maximum(sizes, 1)))
+        components['tsdf_dense_band_voxels'] = dense_voxels
+        components['tsdf_dense_band_bytes'] = int(dense_voxels * TSDF_BYTES_PER_TOUCHED_VOXEL)
+        basis.append(f'dense truncation band over the sampled extent: {dense_voxels:,.0f} voxels (geometric '
+                     'ceiling, assumes no sparse surface)')
+    if occupancy and occupancy.get('observations'):
+        density = float(occupancy['voxels']) / float(occupancy['observations'])
+        basis.append(f'measured occupancy from a bag sample: {density:.2f} voxels per observation at '
+                     f'{occupancy.get("voxel_size_m", voxel) * 1000:.0f} mm')
+    else:
+        density = 1.0
+        basis.append('no bag sample was available, so one TSDF voxel per surface observation is assumed')
+    primary_voxels = None
+    if observed_points:
+        primary_voxels = float(observed_points) * density
+        basis.append(f'{int(observed_points):,} estimated observations x {density:.2f} voxels')
+    elif dense_voxels:
+        primary_voxels = dense_voxels
+        basis.append('no observation count was available, so the dense band is used')
+    if observed_points and observed_bbox is not None:
+        upper_voxels = min(dense_voxels, float(observed_points) * influence)
+    elif observed_points:
+        upper_voxels = float(observed_points) * influence
+    if primary_voxels is None:
+        return dict(components={}, total_peak_bytes=None, basis=basis, heuristics={},
+                    safety_margin=PREFLIGHT_SAFETY_MARGIN, observed_extent_m=extent,
+                    observed_points=None if observed_points is None else int(observed_points),
+                    band_voxels_upper_bound=dense_voxels, estimated_tsdf_voxels=None,
+                    estimated_tsdf_bytes=None, truncation_influence_voxels=influence, density=None,
+                    upper_bound_voxels=None, upper_bound_bytes=None, band_thickness_voxels=band_thickness)
+    if dense_voxels and primary_voxels > dense_voxels:
+        primary_voxels = dense_voxels
+    touched = min(primary_voxels, upper_voxels) if upper_voxels else primary_voxels
+    components['tsdf_estimated_bytes'] = int(touched * TSDF_BYTES_PER_TOUCHED_VOXEL)
+    upper_bound_bytes = int(upper_voxels * TSDF_BYTES_PER_TOUCHED_VOXEL) if upper_voxels else None
+    components['tsdf_upper_bound_bytes'] = upper_bound_bytes
+    basis.append(f'truncation influence: {influence} voxels per observation, {band_thickness} voxels thick')
+    triangles = surface_triangles_estimate(touched, band_thickness)
+    components['mesh_triangles_estimate'] = int(triangles)
+    components['mesh_extraction_bytes'] = int(triangles * MESH_BYTES_PER_TRIANGLE)
+    components['mesh_masking_bytes'] = int(min(MASK_FACE_BATCH, triangles) * MASK_PROBE_BYTES_PER_TRIANGLE)
+    components['mesh_output_bytes'] = int(triangles * PLY_BYTES_PER_TRIANGLE)
+    components['mesh_output_transient_bytes'] = int(triangles * PLY_BYTES_PER_TRIANGLE * PLY_TRANSIENT_FACTOR)
+    components['input_batch_bytes'] = int(batch_points * BATCH_BYTES_PER_OBSERVATION)
+    if reference_points:
+        components['reference_bytes'] = int(float(reference_points) * REFERENCE_BYTES_PER_POINT)
+        basis.append(f'edited-geometry reference: {int(reference_points):,} pre-edit samples')
+    else:
+        components['reference_bytes'] = 0
+    peak = (components['tsdf_estimated_bytes'] + components['input_batch_bytes'] +
+            components['reference_bytes'] + components['mesh_extraction_bytes'] +
+            components['mesh_output_transient_bytes'])
+    heuristics = dict(mesh_bytes_per_triangle=MESH_BYTES_PER_TRIANGLE, ply_bytes_per_triangle=PLY_BYTES_PER_TRIANGLE,
+                      ply_transient_factor=PLY_TRANSIENT_FACTOR, reference_bytes_per_point=REFERENCE_BYTES_PER_POINT,
+                      batch_bytes_per_observation=BATCH_BYTES_PER_OBSERVATION,
+                      bytes_per_touched_voxel=TSDF_BYTES_PER_TOUCHED_VOXEL,
+                      triangles_per_surface_voxel=2.0, band_thickness_voxels=band_thickness)
+    return dict(components=components, total_peak_bytes=int(peak * PREFLIGHT_SAFETY_MARGIN), basis=basis,
+                heuristics=heuristics, safety_margin=PREFLIGHT_SAFETY_MARGIN, observed_extent_m=extent,
+                observed_points=None if observed_points is None else int(observed_points),
+                band_voxels_upper_bound=dense_voxels, estimated_tsdf_voxels=touched,
+                estimated_tsdf_bytes=components['tsdf_estimated_bytes'],
+                truncation_influence_voxels=influence, density=density, upper_bound_voxels=upper_voxels,
+                upper_bound_bytes=upper_bound_bytes, band_thickness_voxels=band_thickness)
+
+
+def _mitigations(voxel_size_m, target_bytes, extent_m, free_ram):
+    """Concrete ways to fit a run into the available memory, never a silent downgrade."""
+    suggestions = []
+    if free_ram > 0:
+        suggestions.append(f'Free memory or reduce concurrent work so about {target_bytes / 1024 ** 3:.1f} GiB is '
+                           f'available (currently {free_ram / 1024 ** 3:.1f} GiB).')
+    if extent_m:
+        suggestions.append('Use a region of interest (ROI) covering only the edited area instead of the whole '
+                           f'sampled {np.round(extent_m, 1).tolist()} m extent.')
+    suggestions.append(f'Use a larger voxel size than {voxel_size_m * 1000:.0f} mm and re-prepare: the request is '
+                       'never downgraded silently, so the configured resolution is what runs.')
+    return suggestions
+
+
+def preflight(root, settings, observed_points=None, observed_bbox=None, bag_bytes=None, occupancy=None,
+              batch_points=None, reference_points=None, memory_budget_bytes=None):
+    """Resource preflight: measured free RAM/disk and a component-wise memory estimate.
+
+    Streaming bounds the *input* memory, not the TSDF: a fine sparse volume over a whole
+    factory still grows with the touched surface, and extraction, masking and PLY writing
+    add their own peaks after integration. Every estimate is an order-of-magnitude figure
+    with an explicit safety margin, reported per component so a user can see which part
+    is under pressure before committing to a long run.
+
+    ``ok`` is False when the estimated peak cannot fit inside
+    ``min(configured budget, available RAM - reserve)``. When it is False the run must be
+    refused with ``RESOURCE_PREFLIGHT_FAILED`` and mitigation advice; the requested
+    resolution is never silently downgraded.
     """
     import psutil
     free_ram = psutil.virtual_memory().available
+    total_ram = psutil.virtual_memory().total
     target = Path(root)
     while not target.exists() and target.parent != target:
         target = target.parent
     disk = psutil.disk_usage(str(target))
-    voxel = settings['voxel_size_m']
-    trunc = settings['sdf_trunc_m']
-    extent = band_voxels = touched_voxels = None
-    estimate = None
-    if observed_bbox is not None:
-        lower = np.asarray(observed_bbox[0], dtype=np.float64)
-        upper = np.asarray(observed_bbox[1], dtype=np.float64)
-        extents = np.maximum(upper - lower, voxel)
-        extent = extents.tolist()
-        sizes = np.ceil(extents / voxel) + 2 * math.ceil(trunc / voxel)
-        band_voxels = float(np.prod(np.maximum(sizes, 1)))
-        # Each observation touches at least one voxel, so the observation count caps
-        # the touched surface even when the sampled extent is sparse.
-        touched_voxels = band_voxels if observed_points is None else min(band_voxels, float(observed_points))
-        estimate = int(touched_voxels * TSDF_BYTES_PER_TOUCHED_VOXEL)
-    warnings = []
-    if estimate is not None and estimate > free_ram:
+    settings = dict(settings)
+    if batch_points is not None:
+        settings['batch_points'] = batch_points
+    estimate = memory_estimate(settings, observed_points=observed_points, observed_bbox=observed_bbox,
+                               occupancy=occupancy, batch_points=batch_points, reference_points=reference_points)
+    reserve = max(int(total_ram * PREFLIGHT_RAM_RESERVE_FRACTION), PREFLIGHT_MIN_RAM_RESERVE_BYTES)
+    budget = int(memory_budget_bytes or settings.get('memory_budget_bytes') or DEFAULT_MEMORY_BUDGET_BYTES)
+    usable = max(min(budget, free_ram - reserve), 0)
+    total = estimate['total_peak_bytes']
+    upper_bound = estimate.get('upper_bound_bytes')
+    warnings, failures = [], []
+    ok = True
+    if total is not None and usable and total > usable:
+        ok = False
+        failures.append(
+            f'RESOURCE_PREFLIGHT_FAILED: the estimated peak of {total / 1024 ** 3:.1f} GiB '
+            f'({estimate["safety_margin"]:.2f}x safety margin over the component estimate) exceeds the usable '
+            f'{usable / 1024 ** 3:.1f} GiB (budget {budget / 1024 ** 3:.1f} GiB, free RAM '
+            f'{free_ram / 1024 ** 3:.1f} GiB minus {reserve / 1024 ** 3:.1f} GiB reserve).')
+    elif total is not None and total > usable * 0.75:
         warnings.append(
-            f'A {voxel * 1000:.0f} mm TSDF over the observed {np.round(extent, 1).tolist()} m extent could touch about '
-            f'{estimate / 1024 ** 3:.1f} GiB of voxels, above the {free_ram / 1024 ** 3:.1f} GiB of free RAM. '
-            'Reduce the scan extent, use a larger voxel size or use an ROI.')
+            f'The estimated peak of {total / 1024 ** 3:.1f} GiB is close to the usable {usable / 1024 ** 3:.1f} GiB; '
+            'keep the workstation free of other large jobs and watch the run.')
+    if upper_bound is not None and usable and upper_bound > usable:
+        warnings.append(
+            f'Worst case, every observation could influence {estimate["truncation_influence_voxels"]} voxels, which '
+            f'would need up to {upper_bound / 1024 ** 3:.1f} GiB of TSDF against the usable '
+            f'{usable / 1024 ** 3:.1f} GiB. The estimate above assumes a sparse surface; watch the run, and prefer an '
+            'ROI or a larger voxel size if memory pressure appears.')
+    voxel = settings['voxel_size_m']
+    if estimate['band_voxels_upper_bound'] and estimate['observed_extent_m']:
+        span = max(estimate['observed_extent_m'])
+        if voxel <= 0.01 and span >= 40.0:
+            warnings.append(
+                f'A {voxel * 1000:.0f} mm TSDF over a {span:.0f} m scan is memory intensive: the dense truncation '
+                f'band alone is {estimate["band_voxels_upper_bound"]:,.0f} voxels. Prefer 20 mm, or restrict the '
+                'run with an ROI, then re-prepare.')
     if disk.free < 2 * 1024 ** 3:
-        warnings.append(f'Only {disk.free / 1024 ** 3:.1f} GiB of free disk space on {target}.')
-    return dict(free_ram_bytes=int(free_ram), total_ram_bytes=int(psutil.virtual_memory().total),
+        failures.append(f'Only {disk.free / 1024 ** 3:.1f} GiB of free disk space on {target}.')
+        ok = False
+    return dict(ok=ok, code=None if ok else 'RESOURCE_PREFLIGHT_FAILED',
+                free_ram_bytes=int(free_ram), total_ram_bytes=int(total_ram),
                 free_disk_bytes=int(disk.free), disk_path=str(target),
-                voxel_size_m=voxel, sdf_trunc_m=trunc, observed_extent_m=extent,
-                estimated_tsdf_voxels=touched_voxels,
-                band_voxels_upper_bound=band_voxels,
-                estimated_tsdf_bytes=estimate,
+                voxel_size_m=voxel, sdf_trunc_m=settings['sdf_trunc_m'], observed_extent_m=estimate['observed_extent_m'],
+                estimated_tsdf_voxels=estimate['estimated_tsdf_voxels'],
+                band_voxels_upper_bound=estimate['band_voxels_upper_bound'],
+                estimated_tsdf_bytes=estimate['estimated_tsdf_bytes'],
+                truncation_influence_voxels=estimate['truncation_influence_voxels'],
+                density=estimate['density'], components=estimate['components'],
+                estimated_tsdf_upper_bound_bytes=upper_bound,
+                band_thickness_voxels=estimate['band_thickness_voxels'],
+                estimated_peak_bytes=total, safety_margin=estimate['safety_margin'],
+                usable_bytes=int(usable), ram_reserve_bytes=int(reserve), memory_budget_bytes=int(budget),
                 bytes_per_touched_voxel=TSDF_BYTES_PER_TOUCHED_VOXEL,
-                estimate_note='Order-of-magnitude estimate from the sampled extent and observation count. '
-                              'Streaming bounds input memory only; the sparse TSDF itself is not memory bounded.',
+                estimate_note='Component-wise order-of-magnitude estimate with an explicit safety margin. Streaming '
+                              'bounds input memory only; the sparse TSDF itself is not memory bounded.',
+                estimate_basis=estimate['basis'], heuristics=estimate['heuristics'],
                 observed_points=None if observed_points is None else int(observed_points),
-                bag_bytes=None if bag_bytes is None else int(bag_bytes), warnings=warnings)
+                bag_bytes=None if bag_bytes is None else int(bag_bytes),
+                warnings=warnings, failures=failures,
+                suggestions=[] if ok else _mitigations(voxel, total or 0, estimate['observed_extent_m'], free_ram))
 
 
 def _format_bytes(value):
@@ -562,6 +1144,24 @@ def _format_bytes(value):
 
 class MemoryBudgetExceeded(RuntimeError):
     """The configured soft memory budget was reached; fail cleanly, never re-resolve."""
+
+
+def check_memory_budget(rss_bytes, peak_limit_bytes, budget_bytes):
+    """Return the failure message when RSS exceeds the soft budget, otherwise ``None``.
+
+    A separate function because this is the runtime half of memory safety: the preflight
+    refuses a run that cannot fit, and this check fails a run that grows past its budget
+    *while* integrating. Neither ever lowers the requested resolution.
+    """
+    if peak_limit_bytes is not None and rss_bytes > peak_limit_bytes:
+        return (f'Worker RSS {_format_bytes(rss_bytes)} exceeded the configured memory budget '
+                f'{_format_bytes(peak_limit_bytes)} while integrating. Reduce the voxel size request or the scan '
+                'extent; the requested resolution was not changed.')
+    if peak_limit_bytes is None and rss_bytes > budget_bytes:
+        return (f'Worker RSS {_format_bytes(rss_bytes)} exceeded the default memory budget '
+                f'{_format_bytes(budget_bytes)} while integrating. Reduce the voxel size request or the scan '
+                'extent; the requested resolution was not changed.')
+    return None
 
 
 def integrate_bag(bag, trajectory, topic, settings, output=None, edit_reference=None,
@@ -659,15 +1259,8 @@ def integrate_bag(bag, trajectory, topic, settings, output=None, edit_reference=
         del batch, points, origins, groups
         rss = process.memory_info().rss
         peak_rss = max(peak_rss, rss)
-        if peak_limit_bytes is not None and rss > peak_limit_bytes:
-            raise MemoryBudgetExceeded(
-                f'Worker RSS {_format_bytes(rss)} exceeded the configured memory budget '
-                f'{_format_bytes(peak_limit_bytes)} while integrating. Reduce the voxel size request or the scan '
-                'extent; the requested resolution was not changed.')
-        if peak_limit_bytes is None and rss > budget:
-            raise MemoryBudgetExceeded(
-                f'Worker RSS {_format_bytes(rss)} exceeded the default memory budget {_format_bytes(budget)}. '
-                'Reduce the voxel size request or the scan extent.')
+        if exceed := check_memory_budget(rss, peak_limit_bytes, budget):
+            raise MemoryBudgetExceeded(exceed)
         event('INTEGRATING', batches=stats['batches'], origin_groups=stats['origin_groups'],
               integrated_observations=stats['integrated_observations'], rss_bytes=int(rss),
               message=(f'Integrated {stats["integrated_observations"]:,} observations in '
@@ -685,17 +1278,138 @@ def integrate_bag(bag, trajectory, topic, settings, output=None, edit_reference=
     return volume, stats
 
 
-def extract_and_mask(volume, edit_reference=None, association_radius_m=None, boundary_margin_m=0.0,
-                     event=None, mask_deleted_triangles=True):
-    """Extract the fused triangle mesh and optionally mask removed regions.
+MASK_FACE_BATCH = 250_000
+MAX_EDGE_INTERIOR_SAMPLES = 8
+# Interior probes are allocated in chunks so an unusual mesh with many long edges
+# cannot spike memory while it is being validated.
+MASK_PROBE_CHUNK = 50_000
+# Exact topology (edge orientation and connected components) is computed up to this many
+# faces; above it the topology is measured on a bounded, deterministic sample so a
+# 50-million-triangle factory mesh cannot blow up the audit's memory.
+AUDIT_TOPOLOGY_FACE_LIMIT = 1_500_000
+# Edge-length statistics keep at most this many evenly spread measurements, so a
+# 17-million-triangle mesh (52 million edges) cannot allocate a 400 MiB array just to
+# compute a median. The count is reported alongside the sample size.
+AUDIT_EDGE_SAMPLE = 600_000
 
-    Removing observations is necessary but not sufficient: a retained ray can
-    still bridge a small deleted gap. Triangle centroids are therefore classified
-    with the same rule as the observations, so removed geometry is never
-    recreated by meshing.
+
+def vertex_and_midpoint_probes(vertices, faces):
+    """The three vertices and three edge midpoints of every given triangle."""
+    corners = vertices[faces]
+    probes = np.empty((len(faces), 6, 3), dtype=np.float64)
+    probes[:, :3] = corners
+    probes[:, 3] = 0.5 * (corners[:, 0] + corners[:, 1])
+    probes[:, 4] = 0.5 * (corners[:, 1] + corners[:, 2])
+    probes[:, 5] = 0.5 * (corners[:, 2] + corners[:, 0])
+    return probes
+
+
+def interior_edge_probes(vertices, faces, spacing_m, max_interior=MAX_EDGE_INTERIOR_SAMPLES):
+    """Adaptive interior samples along edges longer than the reference spacing.
+
+    Returns ``(points, valid, capped)``: a ``(len(faces), 3 * max_interior, 3)`` array
+    with a validity mask, and how many triangles needed more interior samples than the
+    documented cap allows. Endpoints and midpoints are excluded, so no probe duplicates
+    the vertex/midpoint pass.
+    """
+    corners = vertices[faces]
+    edges = ((0, 1), (1, 2), (2, 0))
+    slots = 3 * max_interior
+    points = np.zeros((len(faces), slots, 3), dtype=np.float64)
+    valid = np.zeros((len(faces), slots), dtype=bool)
+    capped = 0
+    limit = max(float(spacing_m), 1e-9)
+    for index, (first, second) in enumerate(edges):
+        start, end = corners[:, first], corners[:, second]
+        length = np.linalg.norm(end - start, axis=1)
+        needed = np.ceil(length / (0.5 * limit)) - 1.0
+        capped += int(np.count_nonzero(needed > max_interior))
+        counts = np.clip(np.nan_to_num(needed, nan=0.0), 0, max_interior).astype(np.int64)
+        for slot in range(max_interior):
+            active = np.flatnonzero(counts > slot)
+            if not len(active):
+                continue
+            fraction = ((slot + 1) / (counts[active] + 1)).reshape(-1, 1)
+            points[active, index * max_interior + slot] = start[active] + (end[active] - start[active]) * fraction
+            valid[active, index * max_interior + slot] = True
+    return points, valid, capped
+
+
+def probe_removed_geometry(vertices, faces, reference, association_radius_m, boundary_margin_m,
+                           ambiguity_band_m, spacing_m):
+    """Conservative staged probe of candidate triangles against removed geometry.
+
+    Returns ``(removed, ambiguous, stats)``. ``removed`` is True for a triangle that any
+    probe showed to be dominated by removed reference geometry: deleted geometry must not
+    be glued back into the mesh, so one hit removes the whole triangle.
+    """
+    removed = np.zeros(len(faces), dtype=bool)
+    ambiguous = np.zeros(len(faces), dtype=bool)
+    stats = dict(probe_triangles=0, interior_probe_triangles=0, long_edge_cap_hits=0,
+                 ambiguous_triangles=0, max_probe_samples_per_triangle=0)
+    if not len(faces):
+        return removed, ambiguous, stats
+    classify = lambda coordinates: reference.classify(  # noqa: E731
+        coordinates, association_radius_m, boundary_margin_m, ambiguity_band_m)
+    probes = vertex_and_midpoint_probes(vertices, faces)
+    flat = probes.reshape(-1, 3)
+    classified = classify(flat) if len(flat) else None
+    if classified is not None:
+        removed = classified['removed_dominated'].reshape(len(faces), 6).any(axis=1)
+        ambiguous = (~removed) & classified['ambiguous'].reshape(len(faces), 6).any(axis=1)
+    stats['probe_triangles'] = int(len(faces))
+    stats['max_probe_samples_per_triangle'] = 6
+    stats['ambiguous_triangles'] = int(ambiguous.sum())
+    long_candidates = np.flatnonzero(~removed)
+    if not len(long_candidates):
+        return removed, ambiguous, stats
+    for start in range(0, len(long_candidates), MASK_PROBE_CHUNK):
+        chunk = long_candidates[start:start + MASK_PROBE_CHUNK]
+        points, valid, capped = interior_edge_probes(vertices, faces[chunk], spacing_m)
+        stats['long_edge_cap_hits'] += capped
+        flat_valid = valid.reshape(-1)
+        if not flat_valid.any():
+            continue
+        inner = classify(points.reshape(-1, 3)[flat_valid])
+        removed_full = np.zeros(flat_valid.size, dtype=bool)
+        removed_full[flat_valid] = inner['removed_dominated']
+        ambiguous_full = np.zeros(flat_valid.size, dtype=bool)
+        ambiguous_full[flat_valid] = inner['ambiguous']
+        hit = removed_full.reshape(len(chunk), -1).any(axis=1)
+        removed[chunk] |= hit
+        inner_ambiguous = (~hit) & ambiguous_full.reshape(len(chunk), -1).any(axis=1)
+        ambiguous[chunk] |= inner_ambiguous
+        stats['interior_probe_triangles'] += int(len(chunk))
+        stats['max_probe_samples_per_triangle'] = max(
+            stats['max_probe_samples_per_triangle'], 6 + 3 * MAX_EDGE_INTERIOR_SAMPLES)
+    stats['ambiguous_triangles'] = int(ambiguous.sum())
+    return removed, ambiguous, stats
+
+
+def extract_and_mask(volume, edit_reference=None, association_radius_m=None, boundary_margin_m=0.0,
+                     event=None, mask_deleted_triangles=True, cancel=None, ambiguity_band_m=None):
+    """Extract the fused triangle mesh and mask triangles that touch removed geometry.
+
+    Removing observations is necessary but not sufficient: a retained ray can still
+    bridge a deleted gap, and a large triangle can cross a deleted strip while its
+    centroid sits in kept geometry. Masking is therefore staged and conservative:
+
+    1. triangles whose centroid is dominated by removed reference geometry are dropped;
+    2. the survivors are probed at all three vertices and all three edge midpoints, and a
+       triangle touched by removed geometry is dropped;
+    3. survivors with edges longer than the measured reference sampling resolution get
+       interior samples along those edges, bounded by ``MAX_EDGE_INTERIOR_SAMPLES`` per
+       edge (hits on that cap are reported, never silently ignored).
+
+    One hit on removed geometry removes the whole triangle, because gluing deleted
+    geometry back into the mesh is exactly the failure this filter prevents. Probes inside
+    the documented ambiguity band are counted and reported, not used to remove geometry.
+    Face batches are bounded, cancellation is polled while masking, and winding and vertex
+    connectivity are preserved when vertices are compacted.
     """
     event = event or (lambda stage, **fields: None)
     started = time.monotonic()
+    check_cancellation(cancel)
     vertices, faces = volume.extract_triangle_mesh()
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
@@ -705,18 +1419,55 @@ def extract_and_mask(volume, edit_reference=None, association_radius_m=None, bou
         return vertices, faces, stats
     if edit_reference is not None and mask_deleted_triangles and len(faces):
         stats['mask_enabled'] = True
-        kept = []
-        batch = 2_000_000
-        for start in range(0, len(faces), batch):
-            stop = min(start + batch, len(faces))
-            centroids = vertices[faces[start:stop]].mean(axis=1)
-            classified = edit_reference.classify(centroids, association_radius_m, boundary_margin_m)
-            kept.append(np.flatnonzero(classified['keep']) + start)
-            event('VALIDATING_MESH', masked_faces=stats['masked_triangles'],
+        started_mask = time.monotonic()
+        radius = association_radius_m if association_radius_m is not None else \
+            edit_reference.resolve_association_radius()
+        band = ambiguity_band_m if ambiguity_band_m is not None else edit_reference.sampling_resolution_m
+        keep = np.ones(len(faces), dtype=bool)
+        by_centroid = by_probe = by_unsupported = ambiguous_total = 0
+        for start in range(0, len(faces), MASK_FACE_BATCH):
+            check_cancellation(cancel)
+            stop = min(start + MASK_FACE_BATCH, len(faces))
+            window = faces[start:stop]
+            corners = vertices[window]
+            centroids = corners.mean(axis=1)
+            classified = edit_reference.classify(centroids, radius, boundary_margin_m, band)
+            # The centroid stage keeps the established edit-filter semantics: a triangle
+            # without kept support inside the radius was dropped before this audit and is
+            # dropped here as well, so the fix cannot silently start retaining geometry.
+            removed = ~classified['keep']
+            by_centroid += int(classified['removed_dominated'].sum())
+            by_unsupported += int(classified['unsupported'].sum())
+            # Probing only applies to triangles that would otherwise be retained: the
+            # possible false-retention set. A probe can only remove extra triangles when it
+            # finds removed geometry, never resurrect one.
+            candidates = np.flatnonzero(classified['keep'])
+            if len(candidates):
+                hit, ambiguous, probe_stats = probe_removed_geometry(
+                    vertices, window[candidates], edit_reference, radius, boundary_margin_m, band,
+                    edit_reference.sampling_resolution_m)
+                removed[candidates[hit]] = True
+                ambiguous_total += int(ambiguous.sum())
+                by_probe += int(hit.sum())
+                stats['long_edge_cap_hits'] = stats.get('long_edge_cap_hits', 0) + probe_stats['long_edge_cap_hits']
+                stats['interior_probe_triangles'] = stats.get('interior_probe_triangles', 0) + \
+                    probe_stats['interior_probe_triangles']
+                stats['max_probe_samples_per_triangle'] = max(
+                    stats.get('max_probe_samples_per_triangle', 0),
+                    probe_stats['max_probe_samples_per_triangle'])
+            keep[start:stop] = ~removed
+            del corners, centroids, classified, candidates, removed, window
+            event('VALIDATING_MESH', masked_faces=by_centroid + by_probe,
                   message=f'Checking triangles against the removed regions: {stop:,}/{len(faces):,}')
-        keep_all = np.concatenate(kept) if kept else np.zeros(0, dtype=np.int64)
-        stats['masked_triangles'] = int(len(faces) - len(keep_all))
-        faces = faces[keep_all]
+        stats['mask_seconds'] = time.monotonic() - started_mask
+        stats['triangles_before'] = int(len(faces))
+        stats['triangles_removed_by_centroid'] = int(by_centroid)
+        stats['triangles_removed_by_probe'] = int(by_probe)
+        stats['triangles_dropped_unsupported'] = int(by_unsupported)
+        stats['ambiguous_triangles'] = int(ambiguous_total)
+        stats['ambiguity_band_m'] = float(band)
+        stats['masked_triangles'] = int(len(faces) - np.count_nonzero(keep))
+        faces = faces[keep]
         if len(faces):
             used = np.unique(faces)
             remap = np.full(len(vertices), -1, dtype=np.int64)
@@ -730,7 +1481,121 @@ def extract_and_mask(volume, edit_reference=None, association_radius_m=None, bou
     return vertices, faces, stats
 
 
-def validate_and_report(vertices, faces, settings, extra=None):
+def audit_mesh(vertices, faces, settings, observed_bbox=None, batch=MASK_FACE_BATCH):
+    """Independent structural audit of a triangle mesh.
+
+    Everything here is *reported*, never used to delete geometry: a legitimate factory
+    mesh may legitimately have several disconnected components or long triangles, so the
+    audit surfaces the numbers and warnings and leaves the decision to a human. Hard
+    corruption (non-finite vertices, out-of-range indices) is raised by
+    :func:`validate_and_report` instead.
+
+    The audit is batched over faces and every per-edge statistic is computed with
+    ``bincount`` over a single ``unique`` pass, so a four-million-triangle mesh costs
+    seconds and a bounded working set rather than a Python loop over millions of edges.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components as scipy_components
+    # Pass 1: exact totals, running maxima and an evenly spread edge-length sample.
+    stride = max(1, int(math.ceil(3.0 * len(faces) / AUDIT_EDGE_SAMPLE)))
+    degenerate = 0
+    total_area = 0.0
+    longest_edge = 0.0
+    sampled_lengths = []
+    for start in range(0, len(faces), batch):
+        window = faces[start:start + batch]
+        corners = vertices[window]
+        first = corners[:, 1] - corners[:, 0]
+        second = corners[:, 2] - corners[:, 0]
+        areas = 0.5 * np.linalg.norm(np.cross(first, second), axis=1)
+        degenerate += int(np.count_nonzero(areas <= 0.0))
+        total_area += float(areas.sum())
+        lengths = np.concatenate([np.linalg.norm(first, axis=1),
+                                 np.linalg.norm(corners[:, 2] - corners[:, 1], axis=1),
+                                 np.linalg.norm(corners[:, 0] - corners[:, 2], axis=1)])
+        longest_edge = max(longest_edge, float(lengths.max()) if len(lengths) else 0.0)
+        if stride == 1:
+            sampled_lengths.append(lengths)
+        else:
+            sampled_lengths.append(lengths[::stride])
+        del corners, first, second, areas, window
+    sampled = np.concatenate(sampled_lengths) if sampled_lengths else np.zeros(0)
+    del sampled_lengths
+    median_edge = float(np.median(sampled)) if len(sampled) else 0.0
+    threshold = max(8.0 * median_edge, float(settings['sdf_trunc_m']) * 8.0) if median_edge else 0.0
+    # The extreme-edge count uses the measured sample and the reported median, so it is
+    # labelled with the same scope as the median rather than costing a second full pass.
+    extreme_edges = int(np.count_nonzero(sampled > threshold)) if threshold else 0
+    # Orientation conflicts: a consistently wound manifold uses every shared edge once in
+    # each direction, so an edge seen twice in the *same* direction is a conflict. Both the
+    # unique pass and the per-edge tally are vectorised, and the 2 x int64 edge keys are
+    # viewed as one 16-byte key so the sort runs on a flat array instead of a structured one.
+    topological = faces if len(faces) <= AUDIT_TOPOLOGY_FACE_LIMIT else \
+        faces[np.random.default_rng(0).choice(len(faces), AUDIT_TOPOLOGY_FACE_LIMIT, replace=False)]
+    ordered = np.concatenate([topological[:, [0, 1]], topological[:, [1, 2]], topological[:, [2, 0]]])
+    keys = np.ascontiguousarray(np.sort(ordered, axis=1))
+    edge_keys = keys.view(np.dtype((np.void, 2 * keys.dtype.itemsize))).ravel()
+    _, inverse, counts = np.unique(edge_keys, return_inverse=True, return_counts=True)
+    inverse = np.asarray(inverse).ravel()
+    # One representative occurrence per unique edge, without a second sort.
+    representative = np.empty(len(counts), dtype=np.int64)
+    representative[inverse] = np.arange(len(inverse), dtype=np.int64)
+    forward = np.bincount(inverse, weights=(ordered[:, 0] < ordered[:, 1]).astype(np.float64),
+                          minlength=len(counts))
+    backward = counts - forward
+    conflicts = int(np.count_nonzero((forward >= 2) | (backward >= 2)))
+    graph_edges = keys[representative]
+    del inverse, forward, backward, counts, representative, edge_keys, keys, ordered
+    if len(graph_edges) and len(vertices) < np.iinfo(np.int32).max:
+        graph_edges = graph_edges.astype(np.int32)
+    exact_topology = len(topological) == len(faces)
+    used_components = largest = None
+    if exact_topology:
+        graph = coo_matrix((np.ones(len(graph_edges), dtype=np.int8), (graph_edges[:, 0], graph_edges[:, 1])),
+                           shape=(len(vertices), len(vertices)))
+        component_count, labels = scipy_components(graph, directed=False)
+        per_component = np.bincount(labels[topological[:, 0]], minlength=component_count)
+        used_components = int(np.count_nonzero(per_component))
+        largest = int(per_component.max()) if len(per_component) else 0
+    del graph_edges
+    report = dict(
+        degenerate_triangles=degenerate,
+        degenerate_ratio=float(degenerate / len(faces)),
+        total_surface_area_m2=total_area,
+        median_edge_m=median_edge,
+        longest_edge_m=longest_edge,
+        extreme_edges=extreme_edges,
+        extreme_edge_threshold_m=threshold,
+        edge_lengths_measured=int(len(sampled)),
+        edge_statistics_scope='exact' if len(sampled) == 3 * len(faces) else 'sampled',
+        orientation_conflict_edges=conflicts,
+        orientation_consistent=bool(conflicts == 0),
+        connected_components=used_components,
+        largest_component_ratio=(float(largest / len(topological)) if largest is not None and len(topological)
+                                else None),
+        topology_scope='exact' if exact_topology else 'sampled',
+        topology_faces_measured=int(len(topological)),
+        orientation_conflicts_are_lower_bound=not exact_topology,
+        connected_components_note=(None if exact_topology else
+                                  'Not measurable from a face sample: sampling an arbitrary face subset cuts the '
+                                  'edge adjacency, so a component count on the sample would be a fragmentation '
+                                  'artefact, not a property of the mesh.'),
+        audit_note='Reported, never used to delete geometry: disconnected components and long triangles are normal '
+                   'in factory scans. Above the documented face limit the topology is measured on a bounded sample '
+                   'and labelled as such.',
+    )
+    if observed_bbox is not None:
+        lower = np.asarray(observed_bbox[0], dtype=np.float64)
+        upper = np.asarray(observed_bbox[1], dtype=np.float64)
+        margin = 2.0 * float(settings['sdf_trunc_m'])
+        mesh_lower, mesh_upper = vertices.min(axis=0), vertices.max(axis=0)
+        report['mesh_outside_observed_bbox_m'] = float(max(
+            np.max(lower - margin - mesh_lower), np.max(mesh_upper - (upper + margin)), 0.0))
+        report['mesh_within_observed_bbox'] = bool(report['mesh_outside_observed_bbox_m'] <= 0.0)
+    return report
+
+
+def validate_and_report(vertices, faces, settings, extra=None, observed_bbox=None):
     """Independent mesh validation through the shared NKSR-era mesh reader."""
     if not len(vertices) or not len(faces):
         raise ValueError('TSDF produced an empty mesh; verify the observations, trajectory and TSDF settings')
@@ -746,7 +1611,8 @@ def validate_and_report(vertices, faces, settings, extra=None):
                   bounding_box_min=vertices.min(axis=0).tolist(),
                   bounding_box_max=vertices.max(axis=0).tolist(),
                   units='meters', coordinate_system='GLIM_world', voxel_size_m=settings['voxel_size_m'],
-                  sdf_trunc_m=settings['sdf_trunc_m'], space_carving=settings['space_carving'])
+                  sdf_trunc_m=settings['sdf_trunc_m'], space_carving=settings['space_carving'],
+                  geometry_audit=audit_mesh(vertices, faces, settings, observed_bbox))
     if extra:
         report.update(extra)
     return report

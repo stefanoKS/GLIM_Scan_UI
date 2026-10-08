@@ -14,6 +14,7 @@ import argparse
 import gc
 import json
 import signal
+import shutil
 import sys
 import time
 import traceback
@@ -181,7 +182,7 @@ def bag_topic_frames(bag, topic):
     return None
 
 
-def sample_bag_extent(bag, trajectory, topic, samples=8):
+def sample_bag_extent(bag, trajectory, topic, samples=8, voxel_size_m=None):
     """Evenly spread bounded sample of real world-space observations.
 
     Seeks across the interval where the trajectory and the bag actually overlap, so a
@@ -205,6 +206,9 @@ def sample_bag_extent(bag, trajectory, topic, samples=8):
     upper = np.full(3, -np.inf)
     sampled = 0
     observations = 0
+    # Bounded sample of real observations, used to *measure* how many TSDF voxels the
+    # recording actually touches instead of assuming one voxel per observation.
+    collected = []
 
     def collect(payload):
         nonlocal sampled, observations
@@ -214,6 +218,8 @@ def sample_bag_extent(bag, trajectory, topic, samples=8):
         if len(points):
             lower[:] = np.minimum(lower, points.min(axis=0))
             upper[:] = np.maximum(upper, points.max(axis=0))
+            if voxel_size_m:
+                collected.append(np.ascontiguousarray(points, dtype=np.float64))
         sampled += 1
 
     stamps = seek_targets(bag, trajectory, samples)
@@ -240,9 +246,19 @@ def sample_bag_extent(bag, trajectory, topic, samples=8):
                           'Sampled LiDAR frames produced no observations inside the trajectory range')
     per_frame = observations / sampled
     estimated = int(round(per_frame * total_frames)) if total_frames else int(observations)
+    occupancy = None
+    if collected:
+        sample_points = np.concatenate(collected)
+        del collected
+        cells = np.floor(sample_points / float(voxel_size_m)).astype(np.int64)
+        occupied = int(len(np.unique(cells.view([('x', '<i8'), ('y', '<i8'), ('z', '<i8')]))))
+        occupancy = dict(voxels=occupied, observations=int(len(sample_points)),
+                         voxel_size_m=float(voxel_size_m),
+                         note='Measured on evenly spread sampled frames at the requested voxel size, so it is a '
+                              'sample of the touched surface, not a promise for the whole recording.')
     return dict(lidar_frames=total_frames, sampled_frames=sampled, sampled_observations=int(observations),
                 estimated_observations=estimated, observations_per_frame=float(per_frame),
-                extent_is_sample=True,
+                extent_is_sample=True, occupancy=occupancy,
                 extent_note='Observed bounds come from evenly spread sampled frames, not from the whole recording.',
                 observed_bbox_min_m=lower.tolist(), observed_bbox_max_m=upper.tolist()), estimated
 
@@ -307,7 +323,10 @@ def write_outputs(settings, vertices, faces, observed_bbox, event):
     """
     mode = settings['mesh_output_mode']
     output = Path(settings['output'])
-    chunks_dir = output.parent / 'mesh_chunks'
+    # Everything is written into a staging directory first; the caller publishes it only
+    # after the staged mesh has been validated, so a partial or invalid mesh is never at
+    # the published path (GATE 11).
+    chunks_dir = (Path(settings['staging_root']) if settings.get('staging_root') else output.parent) / 'mesh_chunks'
     fields = dict(mesh_output_mode=mode, output_bytes=0)
     chunk_totals = manifest = None
     if mode in ('chunks', 'both'):
@@ -334,6 +353,31 @@ def write_outputs(settings, vertices, faces, observed_bbox, event):
     return fields
 
 
+def publish_outputs(staging, destination, mode):
+    """Move validated outputs from staging into place, then drop the staging directory.
+
+    The move is a same-filesystem rename per artifact, so a reader either sees the previous
+    attempt or the complete new one, never a partially written mesh.
+    """
+    staging = Path(staging)
+    destination = Path(destination)
+    published = []
+    for name in (('mesh.ply',) if mode != 'chunks' else ()) + (('mesh_chunks',) if mode != 'merged' else ()):
+        source = staging/name
+        if not source.exists():
+            continue
+        target = destination/name
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        source.rename(target)
+        published.append(name)
+    shutil.rmtree(staging, ignore_errors=True)
+    return published
+
+
 def reconstruct(settings, event, cancel=None):
     bag = Path(settings['bag'])
     trajectory_path = Path(settings['trajectory'])
@@ -351,13 +395,26 @@ def reconstruct(settings, event, cancel=None):
     edit_reference = load_edit_reference(settings.get('edited_workspace'),
                                          settings.get('association_radius_m'),
                                          settings.get('association_spacing_multiplier'))
-    extent, estimated_points = sample_bag_extent(bag, trajectory, settings['topic'])
+    extent, estimated_points = sample_bag_extent(bag, trajectory, settings['topic'],
+                                                voxel_size_m=resolved['voxel_size_m'])
     bag_bytes = sum(p.stat().st_size for p in bag.rglob('*') if p.is_file())
     clipped = roi_clipped_bbox(resolved, (extent['observed_bbox_min_m'], extent['observed_bbox_max_m']))
+    # The preflight is re-run here with the settings this run actually executes with, so a
+    # resource change since preparation - or a finer resolution requested at mesh time - is
+    # refused instead of silently attempted.
     preflight = V.preflight(output.parent if output else Path.cwd(), resolved,
-                            observed_points=estimated_points, observed_bbox=clipped, bag_bytes=bag_bytes)
+                            observed_points=estimated_points, observed_bbox=clipped, bag_bytes=bag_bytes,
+                            occupancy=extent.get('occupancy'),
+                            batch_points=resolved.get('batch_points'),
+                            memory_budget_bytes=settings.get('memory_budget_bytes'),
+                            reference_points=(edit_reference.metadata.get('reference_points')
+                                              if edit_reference else None))
+    if not preflight['ok']:
+        raise WorkerError('RESOURCE_PREFLIGHT_FAILED', '; '.join(
+            preflight['failures'] + preflight['suggestions']))
     event('PREFLIGHT', **{key: preflight[key] for key in
-                          ('free_ram_bytes', 'free_disk_bytes', 'estimated_tsdf_bytes')},
+                          ('free_ram_bytes', 'free_disk_bytes', 'estimated_tsdf_bytes',
+                           'estimated_peak_bytes', 'usable_bytes')},
           warnings=preflight['warnings'], message='; '.join(preflight['warnings']) if preflight['warnings'] else
           'Resource preflight passed')
 
@@ -369,18 +426,20 @@ def reconstruct(settings, event, cancel=None):
                                     event=event, cancel=cancel,
                                     peak_limit_bytes=settings.get('memory_budget_bytes'))
     event('EXTRACTING_MESH')
+    V.check_cancellation(cancel)
     vertices, faces, mesh_stats = V.extract_and_mask(
         volume, edit_reference, association_radius_m=(edit_reference.resolve_association_radius()
                                                      if edit_reference else None),
         boundary_margin_m=settings.get('boundary_margin_m') or 0.0, event=event,
-        mask_deleted_triangles=bool(settings.get('mask_deleted_triangles', True)))
+        mask_deleted_triangles=bool(settings.get('mask_deleted_triangles', True)), cancel=cancel)
     del volume
     gc.collect()
     event('VALIDATING_MESH')
     metadata = V.validate_and_report(vertices, faces, resolved, extra=dict(
         settings=dict(resolved), trajectory=trajectory_report, bag_scan=extent, preflight=preflight,
         integration=stats, extraction=mesh_stats, engine='vdbfusion',
-        algorithm='vdbfusion'))
+        algorithm='vdbfusion'),
+        observed_bbox=(clipped if clipped else (extent['observed_bbox_min_m'], extent['observed_bbox_max_m'])))
     if edit_reference is not None:
         # Mirror the filtering decision at the top level so a reader never has to dig
         # into the integration details to see how the saved edit was applied.
@@ -389,9 +448,19 @@ def reconstruct(settings, event, cancel=None):
                         unsupported_observations=stats.get('unsupported_observations'),
                         mask_deleted_triangles=bool(settings.get('mask_deleted_triangles', True)),
                         edited_geometry=stats.get('edit_reference'))
-    fields = write_outputs(dict(resolved, output=output, chunk_size=settings.get('chunk_size')), vertices, faces,
+    staging = output.parent/'staging' if output is not None else None
+    if staging is not None:
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+    fields = write_outputs(dict(resolved, output=(staging/output.name if staging else None),
+                               staging_root=staging, chunk_size=settings.get('chunk_size')), vertices, faces,
                            (extent['observed_bbox_min_m'], extent['observed_bbox_max_m']), event)
     metadata.update(fields)
+    if staging is not None:
+        # Validate while still staged: an invalid mesh must never reach the published path.
+        V.check_cancellation(cancel)
+        published = publish_outputs(staging, output.parent, settings['mesh_output_mode'])
+        metadata['published_outputs'] = [str(output.parent/name) for name in published]
     if output is not None and settings['mesh_output_mode'] != 'chunks':
         persisted = inspect_mesh(output)
         metadata['vertex_count'] = persisted['vertex_count']
@@ -491,20 +560,41 @@ def main():
             event('VALIDATING_SOURCE')
             trajectory, trajectory_report = V.load_trajectory(args.trajectory)
             resolved = V.resolve_settings(arg_settings(args))
+            # Advanced controls arrive as their own arguments, so record the values this
+            # preparation actually used: the preparation identity is what a later
+            # reconstruction is compared against, and an omitted key must never read as a
+            # silent mismatch.
+            for key, value in (('association_spacing_multiplier', args.association_spacing_multiplier),
+                               ('boundary_margin_m', args.boundary_margin),
+                               ('unsupported_observations', args.unsupported_policy),
+                               ('mask_deleted_triangles', args.mask_deleted_triangles == '1')):
+                if value is not None:
+                    resolved[key] = value
             edit_reference = load_edit_reference(args.edited_workspace, args.association_radius,
                                                 args.association_spacing_multiplier)
-            extent, estimated_points = sample_bag_extent(args.bag, trajectory, args.topic)
+            extent, estimated_points = sample_bag_extent(args.bag, trajectory, args.topic,
+                                                voxel_size_m=resolved['voxel_size_m'])
             bag_bytes = sum(p.stat().st_size for p in args.bag.rglob('*') if p.is_file())
             event('PREFLIGHT')
             clipped = roi_clipped_bbox(resolved, (extent['observed_bbox_min_m'], extent['observed_bbox_max_m']))
             preflight = V.preflight(args.prepare_output, resolved, observed_points=estimated_points,
-                                    observed_bbox=clipped, bag_bytes=bag_bytes)
+                                    observed_bbox=clipped, bag_bytes=bag_bytes,
+                                    occupancy=extent.get('occupancy'),
+                                    reference_points=(edit_reference.metadata.get('reference_points')
+                                                      if edit_reference else None))
+            if not preflight['ok']:
+                raise WorkerError('RESOURCE_PREFLIGHT_FAILED', '; '.join(
+                    preflight['failures'] + preflight['suggestions']))
+            source = V.source_identity(args.bag, args.trajectory, args.topic, args.edited_workspace,
+                                       edit_fingerprints=dict(edit_id=Path(args.edited_workspace).name)
+                                       if args.edited_workspace else None)
             prepared = dict(
                 version=1, algorithm='vdbfusion', engine='vdbfusion', state='PREPARED',
                 created_at=time.time(), python=sys.executable, runtime=runtime,
                 trajectory=str(args.trajectory), trajectory_report=trajectory_report,
                 bag=str(args.bag), topic=args.topic, bag_scan=extent, bag_bytes=bag_bytes,
                 settings=resolved, preflight=preflight,
+                identity=V.preparation_identity(source, resolved),
                 edited_geometry=dict(edit_reference.metadata) if edit_reference else None,
                 edit_filter_accuracy='validated_approximate' if edit_reference else None,
                 preparation_note='VDBFusion preparation validates sources and resources only; raw observations are '

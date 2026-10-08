@@ -130,15 +130,43 @@ recording is never integrated with a constant origin.
   20,000,000) are read, filtered, grouped and handed to the native integrator one at
   a time. No whole-cloud `concatenate`, no global `unique`, no intermediate PLY and no
   100M-point NumPy array exists anywhere in the pipeline.
+* `batch_points` is a **hard** bound on every batch, not an average. A single LiDAR
+  frame larger than the bound is split across several batches in recorded order:
+  observations are never dropped, reordered or duplicated at a slice boundary, and the
+  trailing partial batch is still emitted. `bag_scan`/integration metadata reports
+  `batches`, `split_frames` and `max_batch_points` so the bound can be checked after a
+  run.
 * VDBFusion preparation writes **no** prepared point cloud. It validates the sources
   and reports a resource preflight to `input/vdbfusion_prepare.json`.
 * Resource preflight reports free RAM, free disk, requested voxel size, the sampled
-  scan extent and an order-of-magnitude TSDF footprint estimate. The estimate is
-  capped by the observation count, so it is realistic rather than a whole-box volume.
+  scan extent and a **component-wise** footprint estimate: TSDF (primary estimate plus
+  the dense-band and truncation-influence upper bounds), edited-geometry reference
+  index, bounded input batches, mesh extraction, masking and PLY output plus its
+  transient copy. The primary TSDF estimate is the observation count times the
+  **measured** voxels-per-observation from the sampled bag frames, or the observation
+  count itself when no sample is available. Every component is reported with the
+  heuristic behind it; the total carries an explicit `1.3x` safety margin.
+* The truncation-influence bound is reported separately and is never hidden inside a
+  single number: one observation can influence `(2·trunc/voxel + 1)³` voxels
+  (343 at 20 mm voxels with 60 mm truncation), so a surface estimate of one voxel per
+  observation is only sane because a surface band is one voxel thick. The union bound
+  warns when the worst case would exceed the usable memory.
+* A run is **refused before it starts** with `RESOURCE_PREFLIGHT_FAILED` plus
+  mitigation advice when the estimated peak cannot fit inside
+  `min(configured budget, available RAM − reserve)`. The requested resolution is still
+  never silently reduced: the message tells the user which setting to change and asks
+  for a re-prepare.
 * **Streaming does not bound the TSDF itself.** A large fine-resolution sparse volume
   still grows with the touched surface. A soft memory budget (default 24 GiB, or
-  `--memory-budget-gib`) fails the run cleanly with `MEMORY_BUDGET_EXCEEDED`; the
-  requested resolution is never silently reduced.
+  `--memory-budget-gib`) also fails a run that grows past it *while* integrating, with
+  `MEMORY_BUDGET_EXCEEDED` and the requested resolution untouched.
+* While the worker runs, the backend samples the **worker process tree** RSS every
+  2 seconds and records the sampled peak, the stage at the peak, samples and elapsed
+  time per stage and any pressure event in `mesh_job.json → memory`. Sampling happens
+  in the backend so it keeps working while the worker is inside a native call. At 95 %
+  of the budget the supervisor requests cooperative cancellation once and records the
+  event; it never kills the process itself and never touches previous outputs. Every
+  figure is labelled as a *sampled* peak, i.e. a lower bound on the true peak.
 
 ## Run, cancel and job isolation
 
@@ -147,10 +175,22 @@ recording is never integrated with a constant origin.
 * Progress is written to `reconstruction/run_ID/vdbfusion_progress.json`, logs to
   `reconstruction/run_ID/job.log`.
 * Cancellation is cooperative: the signal sets a flag that is checked at every
-  bounded batch boundary, so the native integrator is never abandoned mid-call. A
-  second signal unwinds immediately.
-* Every mesh attempt archives a previous `output/`, `mesh_job.json` and progress file
-  into `attempts/previous_<id>/`. A validated mesh is never overwritten by a retry.
+  bounded boundary **including the mesh scan, the triangle probes and before the
+  outputs are published**, so the native integrator is never abandoned mid-call but a
+  long extraction or masking pass can still be interrupted. A second signal unwinds
+  immediately. A user-requested stop is recorded as `CANCELLED`, never as an engine
+  failure.
+* Cancellation escalates with a bounded grace period: `SIGINT` (cooperative), then
+  `SIGTERM`, then `SIGKILL` on the worker's process group, so no orphan process tree is
+  left behind.
+* Every mesh attempt archives a previous `output/`, `mesh_job.json`, progress file and
+  staging directory into `attempts/previous_<id>/`. A validated mesh is never
+  overwritten by a retry, and a stale progress file can never be mistaken for the
+  current run's.
+* Meshes are written into `output/staging/`, validated there, and only then published
+  by a same-filesystem rename. A partial or invalid mesh is therefore never present at
+  the published `output/mesh.ply` path, and a failed attempt leaves the previous
+  output untouched.
 * VDBFusion writes `output/vdbfusion_metadata.json`. NKSR metadata is never written
   for a VDBFusion job, and the two engines use separate managed processes, so neither
   can overwrite the other.
@@ -162,7 +202,8 @@ recording is never integrated with a constant origin.
 | `input/vdbfusion_prepare.json` | Preparation: validated sources, sampled scan summary, preflight, TSDF settings |
 | `output/mesh.ply` | Binary little-endian triangle PLY, XYZ in **world metres**, indexed faces, no local origin shift |
 | `output/mesh_chunks/chunk_NNNN.ply`, `chunks.json` | Separate meshes: spatial cells of the same single fused mesh |
-| `output/vdbfusion_metadata.json` | Engine identity, settings, timings, integration and edit-filter statistics, mesh validation |
+| `output/staging/` | Staging area: the mesh is written and validated here, then published by rename (removed after a successful publish) |
+| `output/vdbfusion_metadata.json` | Engine identity, settings, timings, integration and edit-filter statistics, mesh validation, geometry audit |
 | `vdbfusion_progress.json`, `job.log` | Live stage, messages and full log |
 
 Separate meshes reuse the existing validated spatial partitioner on the **one** fused
@@ -186,6 +227,20 @@ GLIM processing -> Clean Map -> Save As edits/edit_ID/saved_map/ -> close editor
   identity. A trajectory from one edit is never combined with geometry from another,
   and `edits/edit_ID/map_01/traj_lidar.txt` is never substituted for the saved one.
 * The saved cleanup itself is never mutated or regenerated.
+* The saved geometry is validated as an **exact multiset subset** of the pre-edit
+  geometry, submap by submap. Both point blocks must be a whole number of float32 rows
+  and finite, both `data.txt` files must declare the same submap `id` as the directory
+  and a rigid `T_world_origin`, and the two frames must match exactly. A saved point the
+  pre-edit submap never contained, or a saved multiplicity above the original
+  multiplicity, raises `INVALID_SAVED_SUBMAP` naming the edit id, the submap id, the
+  mismatch type, the number of invalid saved points and the corrective action. Nothing
+  is reinterpreted as "removed" and nothing is guessed. (Measured on the real cleanup
+  `edit_ef16d03e7f86`: all 57 submap pairs are byte-identical in `data.txt`, every saved
+  submap is a multiplicity-valid subset, no submap contains a duplicate row, and saved
+  points keep the original order.)
+* The **saved** submap frame is read and compared, not ignored: a cleanup saved in a
+  different coordinate frame is rejected instead of producing silently wrong world
+  geometry.
 * NKSR still uses its proximity tolerance. **VDBFusion does not use that tolerance.**
   It classifies observations against the verified kept **and removed** submap geometry
   and derives its own association radius from the measured reference sampling spacing
@@ -197,10 +252,29 @@ GLIM processing -> Clean Map -> Save As edits/edit_ID/saved_map/ -> close editor
   labelled `validated_approximate` everywhere and the limitation is written into the
   metadata, not only into documentation.
 * Observation filtering alone does not guarantee that an implicit surface respects
-  every deletion, so triangles whose centroids fall inside a removed region are masked
-  after extraction. On the real factory ROI this removed 30,291 triangles that the
-  observation filter could not have removed. Masking is on by default and reported as
-  `extraction.masked_triangles`.
+  every deletion, and a centroid test alone misses a large triangle that crosses a
+  deleted strip while its centroid sits in kept geometry. Masking is therefore staged
+  and conservative:
+
+  1. triangles whose **centroid** is dominated by removed geometry are dropped (this
+     keeps the established edit-filter semantics, unsupported centroids included);
+  2. the survivors are probed at all **three vertices and all three edge midpoints**,
+     and a triangle touched by removed geometry is dropped;
+  3. survivors whose edges are longer than the measured reference sampling resolution
+     get **interior samples** along those edges, at most 8 per edge; hits on that cap
+     are reported in `extraction.long_edge_cap_hits`.
+
+  One hit removes the whole triangle, because gluing deleted geometry back into the
+  mesh is exactly what this filter exists to prevent. Masking is on by default and
+  reports `triangles_before`, `triangles_removed_by_centroid`, `triangles_removed_by_probe`,
+  `triangles_dropped_unsupported`, `masked_triangles` and the probe counts.
+* Classification reports a fourth class. Coordinates whose nearest kept and nearest
+  removed samples are both inside the association radius and within the documented
+  boundary band are labelled **AMBIGUOUS** (`classify()['ambiguous']`,
+  `class_of()`). They are kept unless removed geometry dominates, and the count is
+  reported as `ambiguous_triangles`, so the boundary band is visible instead of being
+  presented as a confident classification. The band defaults to the measured reference
+  sampling resolution and never widens the association radius.
 
 Limits, stated plainly:
 
@@ -244,6 +318,55 @@ Synthetic acceptance results
 | ≥ 98 % removed-region exclusion, outside the band | 1.00 |
 | No large artificial holes in retained planar surfaces | ≥ 0.95 with no band allowance, 1.00 with the band |
 | No bridging across a deliberately deleted gap | 0 triangles in the deleted connector |
+
+## Prepared settings, staleness and source immutability
+
+Preparation pins a canonical identity in `input/vdbfusion_prepare.json → identity`:
+
+* **source**: bag path, file count, byte total and `metadata.yaml` size/mtime, topic,
+  trajectory path/size/SHA-256, and the edited workspace plus edit id when filtering.
+  The raw bag is read-only after capture and can be many gigabytes, so it is pinned by
+  its byte total and metadata timestamp rather than a full hash; the small trajectory
+  text file is hashed in full.
+* **semantic settings**: preset, voxel size, truncation, space carving, origin error
+  budget, ROI, unsupported policy, triangle masking, boundary margin, association
+  spacing multiplier and the edited-geometry source. Their canonical form has a stable
+  SHA-256 `semantic_fingerprint`.
+
+Reconstruction re-resolves the requested settings, compares them with the prepared
+identity, re-verifies the source identity and re-runs the resource preflight with the
+settings the run will actually execute:
+
+* a semantic difference is refused with `PREPARED_SETTINGS_STALE`, listing the
+  differing keys with their prepared and requested values, and asks for a re-prepare.
+  The requested values are never substituted silently, and the prepared ones never win
+  silently either - the run is refused.
+* a changed source is refused with `PREPARED_SOURCE_CHANGED` naming the changed fields.
+* a resource change since preparation (or a finer resolution requested at mesh time) is
+  refused by the preflight before any native work starts.
+* **execution-only** settings - `batch_points`, memory budget, mesh output mode and
+  chunk size - may change at mesh time without re-preparing, because they change how the
+  run executes, not what it produces. The prepared semantic settings are what the worker
+  runs with, and `mesh_job.json` records both the effective settings and the requested
+  ones.
+
+A run whose metadata is unreadable still reads as its historical engine (NKSR), so old
+runs keep working; a VDBFusion run is never executed by the NKSR path and a missing
+VDBFusion installation is always a clear error, never a silent fallback.
+
+## Mesh geometry audit
+
+`validate_and_report` refuses hard corruption (non-finite vertices, non-integer or
+out-of-range indices, empty meshes) and additionally reports an independent
+`geometry_audit` block: degenerate/zero-area triangles and their ratio, total surface
+area, median and longest edge, extreme-edge count, orientation conflicts measured from
+directed edge usage, connected-component count and the largest component's share, and
+whether the mesh stays inside the observed extent (plus two truncation bands).
+
+The audit **reports and never deletes geometry**: disconnected components and long
+triangles are legitimate in factory scans, so the numbers are written to the metadata
+and left for a human to judge. Chunk manifests are validated separately by the existing
+chunk validator.
 
 ## Validation commands
 
@@ -306,6 +429,61 @@ Stage C — 10 m × 10 m × 6 m ROI, 20 mm TSDF:
 | Peak RSS | 628 MiB |
 | Total elapsed | 48.6 s |
 | Max origin approximation error | 20.00 mm of the 20.00 mm budget |
+
+Stage C re-measured after the production-hardening audit (same session, same ROI, same
+command shape, `scripts/benchmark_vdbfusion.sh`, one run at a time):
+
+| Measurement | 20 mm plain | 20 mm edited | 10 mm plain | 10 mm edited |
+| --- | --- | --- | --- | --- |
+| Integrated observations | 1,717,122 | 1,488,392 | 1,717,122 | 1,488,392 |
+| Batches / origin groups | 54 / 8,232 | 54 / 8,128 | 54 / 13,250 | 54 / 12,928 |
+| Bag read + decode | 4.7 s | 4.6 s | 4.6 s | 4.6 s |
+| Trajectory interpolation | 25.5 s | 25.0 s | 25.5 s | 25.1 s |
+| Edit filter | — | 2.51 s | — | 2.55 s |
+| TSDF integration | 0.92 s | 0.79 s | 2.27 s | 2.01 s |
+| Mesh extraction | 1.73 s | 1.71 s | 10.95 s | 10.71 s |
+| Triangle masking | — | 16.8 s (30,300 masked) | — | 53.9 s (66,768 masked) |
+| Mesh validation (audit + write + re-read) | 7.1 s | 7.0 s | 26.4 s | 26.0 s |
+| Triangles / vertices | 3,989,261 / 2,685,098 | 3,824,200 / 2,541,917 | 17,440,326 / 12,608,994 | 17,064,642 / 12,260,343 |
+| Output | 80.2 MiB | 76.5 MiB | 360.5 MiB | 351.9 MiB |
+| Process peak RSS | 1,066 MiB | 1,263 MiB | 2,706 MiB | 2,891 MiB |
+| Total elapsed | 50.1 s | 71.3 s | 80.4 s | 141.0 s |
+| Estimated peak / usable (preflight) | 8.02 / 24.0 GiB | 8.44 / 24.0 GiB | 6.34 / 24.0 GiB | 6.77 / 24.0 GiB |
+| Max origin error vs budget | 20.00 mm / 20.00 mm | 20.00 mm / 20.00 mm | 10.00 mm / 10.00 mm | 10.00 mm / 10.00 mm |
+
+The edit filter retained 86.68 % of the ROI observations in both resolutions
+(1,717,122 → 1,488,392), with 228,730 observations dropped as unsupported and **0**
+dropped as removed-dominated, which matches the earlier measurement.
+
+Mesh geometry audit on those four saved meshes (10 mm/20 mm, plain/edited):
+
+| Measurement | 20 mm plain | 20 mm edited | 10 mm plain | 10 mm edited |
+| --- | --- | --- | --- | --- |
+| Degenerate triangles | 20 (5.2e-6) | 20 (5.2e-6) | 233 (1.34e-5) | 237 (1.39e-5) |
+| Median edge | 20.16 mm | 20.16 mm | 10.05 mm | 10.05 mm |
+| Longest edge | 34.63 mm | 34.63 mm | 17.32 mm | 17.32 mm |
+| Extreme edges (> 0.48 m) | 0 | 0 | 0 | 0 |
+| Orientation conflicts (sampled) | 0 | 0 | 0 | 0 |
+| Surface area | 501.9 m² | 501.1 m² | 573.4 m² | 562.1 m² |
+| Outside the observed ROI | 0.00 m | 0.00 m | 0.00 m | 0.00 m |
+
+Read those audit figures with their limits in mind:
+
+* All four meshes exceed the exact-topology face limit, so the topology and edge statistics
+  are measured on a bounded, deterministic sample and labelled `topology_scope: sampled` /
+  `edge_statistics_scope: sampled` in the metadata. The orientation-conflict count is
+  therefore a **lower bound**, and no connected-component count is claimed for them:
+  sampling arbitrary faces cuts edge adjacency, so a component count on the sample would be
+  a fragmentation artefact rather than a property of the mesh (for reference, on a
+  contiguous 1,000,000-face slice of the same mesh the exact scope reports 14,759 components
+  with a largest-component share of 38.5 %).
+* The audit itself costs 2.2–4.6 s on these meshes. The validation row is larger because it
+  also writes and independently re-reads the PLY.
+* The earlier stage C figures in the table above were measured before the audit existed and
+  before `batch_points` became a hard bound; the extra 66 triangles at 20 mm and the higher
+  peak RSS are the audit's working set, not a change in the TSDF or in the extracted
+  surface. Integration peak RSS, observation counts, edit-filter retention and the origin
+  error bound are unchanged.
 
 Read these figures with their limits in mind:
 

@@ -107,7 +107,8 @@ def run_stage(options, bag, trajectory_path, label, output, settings, edit_works
     # Reuse the worker's own evenly spread bag sampler so the benchmark and the engine
     # agree on how a scan is summarised.
     from factory_mapping.vdbfusion_worker import sample_bag_extent
-    report['source'] = sample_bag_extent(bag, trajectory, options.topic)[0]
+    report['source'] = sample_bag_extent(bag, trajectory, options.topic,
+                                        voxel_size_m=settings['voxel_size_m'])[0]
     edit_reference = None
     if edit_workspace is not None:
         started = time.monotonic()
@@ -117,7 +118,10 @@ def run_stage(options, bag, trajectory_path, label, output, settings, edit_works
     report['preflight'] = V.preflight(output.parent, settings,
                                       observed_points=report['source']['estimated_observations'],
                                       observed_bbox=(report['source']['observed_bbox_min_m'],
-                                                     report['source']['observed_bbox_max_m']))
+                                                     report['source']['observed_bbox_max_m']),
+                                      occupancy=report['source'].get('occupancy'),
+                                      reference_points=(edit_reference.metadata.get('reference_points')
+                                                        if edit_reference else None))
     started_integration = time.monotonic()
     volume, stats = V.integrate_bag(bag, trajectory, options.topic, settings, output=output,
                                     edit_reference=edit_reference, memory_budget_bytes=None,
@@ -138,7 +142,7 @@ def run_stage(options, bag, trajectory_path, label, output, settings, edit_works
     report['validation'] = dict(elapsed_seconds=time.monotonic() - started_validate,
                                 vertex_count=mesh['vertex_count'], face_count=mesh['face_count'],
                                 bounding_box_min=mesh['bounding_box_min'], bounding_box_max=mesh['bounding_box_max'],
-                                persisted=persisted)
+                                geometry_audit=mesh['geometry_audit'], persisted=persisted)
     report['output'] = dict(path=str(output), bytes=output.stat().st_size)
     report['elapsed_seconds'] = time.monotonic() - report['started_at']
     report['peak_rss_bytes'] = peak_rss_bytes()

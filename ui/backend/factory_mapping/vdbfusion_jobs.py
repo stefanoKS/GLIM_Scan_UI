@@ -16,6 +16,11 @@ from .storage import atomic_json, now, read_json
 
 MESH_OUTPUT_MODES = ('merged', 'chunks', 'both')
 PROGRESS_FILE = 'vdbfusion_progress.json'
+# Memory supervisor (GATE 8): the worker can be inside a native call that holds the GIL,
+# so the samples are taken by the backend from the worker's process tree (an "outside in"
+# sample) rather than by a thread inside the worker.
+MEMORY_SAMPLE_INTERVAL_SECONDS = 2.0
+MEMORY_PRESSURE_RATIO = 0.95
 HEALTH_FILE = '.state/vdbfusion_health.json'
 PREPARED_FILE = engines.PREPARED_MARKERS[engines.VDBFUSION]
 
@@ -159,6 +164,178 @@ def settings_arguments(settings):
     return args
 
 
+class MemorySupervisor:
+    """Sample the VDBFusion worker process tree while it runs, and record where it peaked.
+
+    The backend samples rather than the worker, so sampling keeps working while the worker is
+    inside a native call that holds the interpreter lock. Every figure is labelled as a
+    *sampled* peak at a documented interval: it is a lower bound on the true peak, never a
+    claim to have instrumented the allocations.
+
+    On dangerous pressure the supervisor requests cooperative cancellation once - the worker
+    checks cancellation at every bounded batch boundary - and records the event. It never
+    kills the worker itself, and it never touches previous outputs.
+    """
+
+    def __init__(self, run_dir, pid, budget_bytes, interval=MEMORY_SAMPLE_INTERVAL_SECONDS,
+                 pressure_ratio=MEMORY_PRESSURE_RATIO, on_pressure=None, read_rss=None,
+                 read_stage=None, max_samples=None):
+        self.run_dir = Path(run_dir) if run_dir is not None else None
+        self.pid = pid
+        self.limit_bytes = int(budget_bytes or 0)
+        self.interval = max(float(interval), 0.0)
+        self.pressure_ratio = float(pressure_ratio)
+        self.on_pressure = on_pressure
+        self.read_rss = read_rss or self._tree_rss
+        self.read_stage = read_stage or self._stage
+        self.max_samples = max_samples
+        self.samples = 0
+        self.peak_rss_bytes = 0
+        self.peak_stage = None
+        self.last_rss_bytes = 0
+        self.samples_by_stage = {}
+        self.elapsed_by_stage = {}
+        self.pressure_events = []
+        self._pressure_requested = False
+        self._started = None
+
+    def _tree_rss(self):
+        import psutil
+        try:
+            process = psutil.Process(self.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+            return 0
+        total = 0
+        processes = [process]
+        try:
+            processes += process.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        for item in processes:
+            try:
+                total += item.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return int(total)
+
+    def _stage(self):
+        if self.run_dir is None:
+            return None
+        return read_json(self.run_dir/PROGRESS_FILE, {}).get('stage')
+
+    def sample(self, at=None):
+        """Take one measurement and apply the pressure policy."""
+        import time as _time
+        at = _time.monotonic() if at is None else at
+        if self._started is None:
+            self._started = at
+        rss = int(self.read_rss() or 0)
+        stage = self.read_stage() or self.peak_stage
+        self.samples += 1
+        self.last_rss_bytes = rss
+        if stage:
+            self.samples_by_stage[stage] = self.samples_by_stage.get(stage, 0) + 1
+        if rss > self.peak_rss_bytes:
+            self.peak_rss_bytes = rss
+            self.peak_stage = stage
+        pressure = bool(self.limit_bytes) and rss > self.limit_bytes * self.pressure_ratio
+        if pressure and not self._pressure_requested:
+            self._pressure_requested = True
+            event = dict(stage=stage, rss_bytes=rss, limit_bytes=self.limit_bytes,
+                         at=time.time(), action='requested cooperative cancellation')
+            self.pressure_events.append(event)
+            if self.on_pressure is not None:
+                asyncio.ensure_future(self.on_pressure(event))
+        return rss
+
+    def close(self, at=None):
+        """Close the stage timings from the per-stage sample counts."""
+        for stage, count in self.samples_by_stage.items():
+            self.elapsed_by_stage[stage] = round(count * self.interval, 3)
+        return self.summary()
+
+    def summary(self):
+        return dict(sampled=True, sample_interval_seconds=self.interval, samples=self.samples,
+                    peak_rss_bytes=self.peak_rss_bytes, peak_stage=self.peak_stage,
+                    last_rss_bytes=self.last_rss_bytes, limit_bytes=self.limit_bytes,
+                    pressure_ratio=self.pressure_ratio,
+                    samples_by_stage=dict(self.samples_by_stage),
+                    elapsed_seconds_by_stage=dict(self.elapsed_by_stage),
+                    pressure_events=self.pressure_events,
+                    note='Sampled from the backend over the worker process tree at the documented interval, so the '
+                         'peak is a lower bound on the true peak, not an instrumented measurement.')
+
+    async def run(self):
+        try:
+            while self.max_samples is None or self.samples < self.max_samples:
+                self.sample()
+                if self.interval:
+                    await asyncio.sleep(self.interval)
+                else:
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:  # a finished or stopped worker ends the sampling
+            raise
+        finally:
+            self.close()
+
+
+def settings_status(record, current, key='settings'):
+    """Compare a prepared VDBFusion record against the settings a mesh request asks for.
+
+    Only semantic settings are compared, and only where the request supplies a value: an
+    omitted value means "use the prepared one", which is what the run then uses.
+    """
+    from .vdbfusion import compare_semantic_settings
+    prepared = (record or {}).get(key) or {}
+    return compare_semantic_settings(prepared, current)
+
+
+def enforce_prepared_identity(run, record, job, request, sid=None, source_identity=None):
+    """Refuse a reconstruction whose prepared settings or source no longer describe it.
+
+    Returns the settings the worker must run with: the prepared semantic settings plus the
+    request's execution-only choices. A mismatch is reported with the differing keys and an
+    explicit re-prepare instruction, never silently resolved in favour of either side.
+    """
+    from .vdbfusion import compare_source_identity, effective_settings
+    prepared = record.get('settings') or {}
+    status = settings_status(record, request)
+    if not status['matches']:
+        raise ValueError(
+            'PREPARED_SETTINGS_STALE: this run was prepared with different VDBFusion settings, so its validated '
+            'resource preflight and edited-geometry reference no longer describe it. Differing '
+            f'{", ".join(status["differing"])}: prepared '
+            f'{ {key: value.get("prepared") for key, value in status["detail"].items()} }, requested '
+            f'{ {key: value.get("requested") for key, value in status["detail"].items()} }. '
+            'Prepare VDBFusion again with these settings; the requested values are not substituted silently.')
+    identity = record.get('identity') or {}
+    prepared_source = identity.get('source') or {}
+    if prepared_source and source_identity is not None:
+        diff = compare_source_identity(prepared_source, source_identity)
+        if not diff['matches']:
+            raise ValueError(
+                'PREPARED_SOURCE_CHANGED: the prepared source is no longer the same recording or trajectory '
+                f'(changed: {", ".join(diff["differing"])}). Prepare VDBFusion again before reconstructing.')
+    return effective_settings(prepared, request)
+
+
+def enforce_resources(record, settings, run):
+    """Re-run the resource preflight before a long native run and refuse when it fails."""
+    from .vdbfusion import preflight
+    scan = record.get('bag_scan') or {}
+    geometry = record.get('edited_geometry') or {}
+    report = preflight(run, settings, observed_points=scan.get('estimated_observations'),
+                       observed_bbox=(scan['observed_bbox_min_m'], scan['observed_bbox_max_m'])
+                       if scan.get('observed_bbox_min_m') else None,
+                       bag_bytes=record.get('bag_bytes'), occupancy=scan.get('occupancy'),
+                       batch_points=settings.get('batch_points'),
+                       memory_budget_bytes=settings.get('memory_budget_bytes'),
+                       reference_points=geometry.get('reference_points'))
+    if not report['ok']:
+        raise ValueError('; '.join(report['failures'] + report['suggestions']))
+    return report
+
+
 def validate_completed(output, returncode):
     """Validate the mesh a finished worker claims to have written."""
     from .nksr_mesh import inspect_mesh
@@ -222,20 +399,32 @@ async def reconstruct(service, sid, rid, request):
     input_marker = run/PREPARED_FILE
     if input_marker.is_symlink() or output.is_symlink():
         raise ValueError('Invalid reconstruction path')
+    # The prepared settings and the prepared source are authoritative. A request that asks
+    # for a different resolution is refused, and the run always executes with the settings
+    # its validated preflight and edited-geometry reference were built from.
+    from .vdbfusion import source_identity
+    current_source = source_identity(record['bag'], record['trajectory'], record.get('topic', '/livox/lidar'),
+                                    service.edit_workspace(sid, source['edit_id'])
+                                    if job.get('filter_edited_geometry') and source else None,
+                                    edit_fingerprints=dict(edit_id=source['edit_id'])
+                                    if job.get('filter_edited_geometry') and source else None)
+    effective = enforce_prepared_identity(run, record, job, request, sid=sid, source_identity=current_source)
+    enforce_resources(record, effective, run)
     # Preserve successful and failed prior attempts. Never overwrite a validated mesh.
     archive = run/'attempts'/('previous_'+uuid.uuid4().hex[:12])
-    for name in ('output', 'mesh_job.json', PROGRESS_FILE):
+    for name in ('output', 'mesh_job.json', PROGRESS_FILE, 'staging'):
         path = run/name
         if path.exists():
             archive.mkdir(parents=True, exist_ok=True)
             path.rename(archive/name)
     data = dict(state='RUNNING', started_at=now(), algorithm=engines.VDBFUSION, engine=engines.VDBFUSION,
-                settings=request, python=str(python))
+                settings=effective, requested_settings=request, python=str(python),
+                prepared_semantic_fingerprint=(record.get('identity') or {}).get('semantic_fingerprint'))
     atomic_json(run/'mesh_job.json', data)
-    settings = settings_arguments(request)
-    settings += ['--mesh-output-mode', str(request.get('mesh_output_mode', 'merged'))]
-    if request.get('chunk_size') is not None:
-        settings += ['--chunk-size', repr(float(request['chunk_size']))]
+    settings = settings_arguments(effective)
+    settings += ['--mesh-output-mode', str(effective.get('mesh_output_mode', 'merged'))]
+    if effective.get('chunk_size') is not None:
+        settings += ['--chunk-size', repr(float(effective['chunk_size']))]
     args = [str(python), str(worker_path()), '--bag', record['bag'], '--trajectory', record['trajectory'],
             '--topic', record.get('topic', '/livox/lidar'), '--output', str(output/'mesh.ply'),
             '--metadata', str(output/'vdbfusion_metadata.json'), '--progress', str(run/PROGRESS_FILE)]
@@ -245,6 +434,10 @@ async def reconstruct(service, sid, rid, request):
 
     async def done(item):
         progress = read_json(run/PROGRESS_FILE, {})
+        if supervisor_task is not None and not supervisor_task.done():
+            supervisor_task.cancel()
+        if supervisor is not None:
+            data['memory'] = supervisor.close()
         data.update(ended_at=now(), returncode=item['returncode'])
         if item['state'] == 'cancelled' or progress.get('error_type') == 'CANCELLED':
             # The worker reports CANCELLED whenever it received an interrupt, so an
@@ -260,8 +453,14 @@ async def reconstruct(service, sid, rid, request):
             data.update(state='FAILED', error_type=progress.get('error_type', 'VDBFUSION_RECONSTRUCTION_FAILED'),
                         message=progress.get('message', 'VDBFusion worker failed; inspect job.log'))
         atomic_json(run/'mesh_job.json', data)
+    supervisor = None
+    supervisor_task = None
     try:
-        await service.pm.start('vdbfusion', args, run/'job.log', worker_environment(), done)
+        item = await service.pm.start('vdbfusion', args, run/'job.log', worker_environment(), done)
+        limit = effective.get('memory_budget_bytes')
+        supervisor = MemorySupervisor(run, item.get('pid'), limit,
+                                      on_pressure=lambda event: service.pm.stop('vdbfusion', 60, cancel=True))
+        supervisor_task = asyncio.ensure_future(supervisor.run())
     except Exception as error:
         data.update(state='FAILED', error_type='VDBFUSION_NOT_INSTALLED', message=str(error))
         atomic_json(run/'mesh_job.json', data)

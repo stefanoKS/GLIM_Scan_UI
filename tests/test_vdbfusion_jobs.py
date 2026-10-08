@@ -39,9 +39,23 @@ def prepared(root, monkeypatch):
                                      created_at='2026-01-01T00:00:00+00:00',
                                      trajectory=str(trajectory.relative_to(session)),
                                      filter_edited_geometry=False))
+    # A prepared record as the worker really writes it: fully resolved semantic settings
+    # plus the pinned source identity (GATE 10).
+    from factory_mapping import vdbfusion as V
+    from factory_mapping.reconstruction_jobs import validate_vdbfusion_settings
+    prepared_settings = validate_vdbfusion_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06, space_carving=False,
+                                                         mask_deleted_triangles=True,
+                                                         unsupported_observations='exclude'))
     atomic_json(vdb/jobs.PREPARED_FILE, dict(state='PREPARED', algorithm='vdbfusion',
                                              bag=str(sessions), trajectory=str(trajectory),
-                                             settings=dict(voxel_size_m=0.02, sdf_trunc_m=0.06)))
+                                             topic='/livox/lidar', bag_bytes=64,
+                                             bag_scan=dict(estimated_observations=1000,
+                                                           observed_bbox_min_m=[-1.0, -1.0, 0.0],
+                                                           observed_bbox_max_m=[1.0, 1.0, 1.0]),
+                                             settings=prepared_settings,
+                                             identity=V.preparation_identity(
+                                                 V.source_identity(sessions, trajectory, '/livox/lidar'),
+                                                 prepared_settings)))
 
     nksr = session/'reconstruction/run_abcdefabcdef'
     (nksr/'input').mkdir(parents=True)
@@ -92,7 +106,8 @@ def test_reconstruct_launches_the_isolated_managed_worker(prepared, monkeypatch)
         return dict(state='running')
 
     monkeypatch.setattr(service.pm, 'start', start)
-    request = dict(voxel_size_m=0.01, sdf_trunc_m=0.03, space_carving=False, mesh_output_mode='both',
+    # The prepared semantic settings, with execution-only choices changed at mesh time.
+    request = dict(voxel_size_m=0.02, sdf_trunc_m=0.06, space_carving=False, mesh_output_mode='both',
                    chunk_size=3.0, mask_deleted_triangles=True, unsupported_observations='exclude',
                    association_spacing_multiplier=None, boundary_margin_m=None, batch_points=None,
                    origin_error_budget_m=None, roi_min_m=None, roi_max_m=None, memory_budget_gib=None,
@@ -105,7 +120,7 @@ def test_reconstruct_launches_the_isolated_managed_worker(prepared, monkeypatch)
     assert call['args'][0] == str(python) and call['args'][1].endswith('tools/vdbfusion_worker.py')
     assert '--edited-workspace' not in call['args']
     assert call['args'][call['args'].index('--mesh-output-mode')+1] == 'both'
-    assert call['args'][call['args'].index('--sdf-trunc')+1] == '0.03'
+    assert call['args'][call['args'].index('--sdf-trunc')+1] == '0.06'
     # Unlike NKSR, the worker reads the bag itself, so ROS paths stay reachable.
     assert 'PYTHONPATH' not in () and 'PYTHONHOME' not in call['env']
     assert read_json(vdb/'mesh_job.json')['engine'] == 'vdbfusion'

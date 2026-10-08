@@ -206,9 +206,13 @@ def test_batches_are_bounded_and_deterministic():
                np.full(frame_points, float(index))) for index in range(6)]
     limit = 12000
     batches = list(V.batch_world_observations(frames, trajectory, limit))
-    assert len(batches) == 2, 'batches are flushed at the bounded limit'
+    # GATE 09 (hardening audit): batch_points is now a hard per-batch bound, not an
+    # average. A frame is never buffered past the bound, so 6 x 5000 points split into
+    # three exactly-bounded batches instead of two oversized ones.
+    assert len(batches) == 3, 'batches are flushed at the bounded limit'
     sizes = [len(batch['points']) for batch in batches]
-    assert max(sizes) < 2 * limit, sizes
+    assert max(sizes) <= limit, sizes
+    assert sizes == [10000, 10000, 10000], sizes
     for batch in batches:
         assert len(batch['points']) == len(batch['origins']) == len(batch['intensity']) == len(batch['timestamps'])
         assert batch['points'].dtype == np.float64
@@ -242,6 +246,11 @@ def run_isolated(vdbfusion_python, code, tmp_path):
 def test_memory_budget_failure_is_clean(tmp_path, vdbfusion_python):
     """A soft memory budget fails the run instead of lowering the requested resolution.
 
+    GATE 07 (hardening audit): an impossible budget is now refused by the resource
+    preflight *before* any integration starts, which is strictly better than discovering it
+    between batches. The run is still refused cleanly, with mitigation advice, and the
+    requested resolution is never changed.
+
     The native library lives only in the isolated interpreter, so this runs there.
     """
     trajectory = translating_trajectory(steps=5)
@@ -255,9 +264,21 @@ def test_memory_budget_failure_is_clean(tmp_path, vdbfusion_python):
         env=vdbfusion_env(), capture_output=True, text=True, timeout=600)
     assert result.returncode != 0
     failure = json.loads(result.stderr.strip().splitlines()[-1])
-    assert failure['error_type'] == 'MEMORY_BUDGET_EXCEEDED'
-    assert 'not changed' in failure['message']
+    assert failure['error_type'] == 'RESOURCE_PREFLIGHT_FAILED'
+    assert 'RESOURCE_PREFLIGHT_FAILED' in failure['message']
+    assert 'voxel size' in failure['message'], 'the refusal must carry mitigation advice'
     assert not (tmp_path/'mesh.ply').exists()
+
+
+def test_runtime_memory_budget_fails_cleanly_and_never_changes_resolution():
+    """The runtime half of memory safety: growth past the budget while integrating fails
+    the run with the requested resolution untouched."""
+    assert V.check_memory_budget(10, 10, 10) is None
+    configured = V.check_memory_budget(2 * 1024 ** 3, 1024 ** 3, 24 * 1024 ** 3)
+    assert 'configured memory budget' in configured and 'not changed' in configured
+    default = V.check_memory_budget(25 * 1024 ** 3, None, 24 * 1024 ** 3)
+    assert 'default memory budget' in default and 'not changed' in default
+    assert V.check_memory_budget(25 * 1024 ** 3, 26 * 1024 ** 3, 1) is None
 
 
 # --------------------------------------------------------------------------- #

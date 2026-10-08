@@ -156,8 +156,18 @@ function renderReconstruction(){
  const sourceSettings=job?.edited_geometry_source||{},sourceStale=filter!==!!job?.filter_edited_geometry||
   (filter&&(sourceSettings.edit_id!==source||(engine==='nksr'&&Math.abs((sourceSettings.tolerance_m||0)-tolerance)>1e-12)));
  const preparationVoxel=Number($('voxel-size-cm').value)/100;
+ // A VDBFusion run is prepared against pinned semantic settings, so changing one makes the
+ // prepared input stale in the UI instead of only failing at reconstruction time.
+ function vdbFusionSettingsStale(){
+  const stored=meta?.settings;if(!stored)return false;
+  let current;try{current=vdbfusionSettings()}catch{return false}
+  const comparable=['preset','voxel_size_m','sdf_trunc_m','space_carving','roi_min_m','roi_max_m',
+   'unsupported_observations','mask_deleted_triangles'];
+  return comparable.some(key=>key in current&&JSON.stringify(current[key]??null)!==JSON.stringify(stored[key]??null));
+ }
  const prepared=job?.state==='PREPARED',stale=prepared&&(engine!==engineJob||
   (engine==='nksr'&&Math.abs((meta.voxel_size_m||0)-preparationVoxel)>1e-12)||
+  (engine==='vdbfusion'&&vdbFusionSettingsStale())||
   (!filter&&job.trajectory!==$('reconstruction-trajectory').value)||sourceStale);
  $('reconstruction-results').replaceChildren();$('nksr-mesh-results').replaceChildren();
  const preparing=data?.jobs.find(j=>j.state==='PREPARING');
