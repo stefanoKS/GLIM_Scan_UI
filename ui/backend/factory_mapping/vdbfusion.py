@@ -79,6 +79,16 @@ PLY_BYTES_PER_TRIANGLE = 32
 PLY_TRANSIENT_FACTOR = 3
 # A triangle probe allocates 6 float64 samples per candidate triangle, bounded per batch.
 MASK_PROBE_BYTES_PER_TRIANGLE = 6 * 24
+# Disk preflight (GATE 2). The published set is written into staging and then renamed into
+# place, so the previous set is still present as a backup while the new one exists: the peak
+# requirement is current-previous + new + reserve.
+DISK_RESERVE_FRACTION = 0.05
+DISK_MIN_RESERVE_BYTES = 2 * 1024 ** 3
+# Chunked export duplicates vertices along cell boundaries. Measured on the real 20 mm edited
+# ROI export (8 cells, 3,824,200 triangles): 80,346,854 bytes of chunks against 80,217,785
+# bytes for the same mesh merged, i.e. a factor of 1.002. A factor of 1.1 is applied so a
+# finer partition - more cells, more boundary duplication - is still covered.
+CHUNK_OUTPUT_OVERHEAD_FACTOR = 1.1
 
 
 def validate_voxel_size(value):
@@ -1066,8 +1076,69 @@ def memory_estimate(settings, observed_points=None, observed_bbox=None, occupanc
                 upper_bound_bytes=upper_bound_bytes, band_thickness_voxels=band_thickness)
 
 
-def _mitigations(voxel_size_m, target_bytes, extent_m, free_ram):
-    """Concrete ways to fit a run into the available memory, never a silent downgrade."""
+def directory_bytes(path):
+    """Total content bytes under a path, or 0 when it does not exist."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return int(path.stat().st_size)
+    return int(sum(item.stat().st_size for item in path.rglob('*') if item.is_file()))
+
+
+def disk_estimate(root, mode, triangles, previous_output_dir=None, attempts_dir=None):
+    """Predicted disk requirement for one mesh publication, in bytes.
+
+    Components, all reported separately so the uncertainty is visible:
+
+    * ``published_bytes`` - the artifact set itself: the merged PLY, the chunk set (the same
+      triangles with per-cell vertex duplication, hence the documented overhead factor), or
+      both, from the triangle estimate and the measured bytes-per-triangle of real output;
+    * ``staging_bytes`` - the staged copy that is renamed into place. It is a move, not a copy,
+      so it does not double the requirement; it is reported because it is what exists before
+      the commit marker is written;
+    * ``previous_set_bytes`` - the *measured* size of the set already at the destination, which
+      is kept as a backup until the commit marker is written;
+    * ``archived_bytes`` - the retry history already on disk (``attempts/``). It is not part of
+      this run's requirement, but it is reported because it only ever grows.
+
+    The estimate is derived from the triangle estimate, which is itself a heuristic, and from
+    ``PLY_BYTES_PER_TRIANGLE``, which is deliberately above the 21-22 bytes per triangle
+    measured on real 20 mm and 10 mm ROI output. Measured against the real 20 mm edited ROI
+    export in ``both`` mode (3,824,200 triangles): predicted 256.7 MiB of published artifacts
+    against 153.1 MiB actually written, i.e. 1.68x conservative. Treat the result as a guard
+    against clearly insufficient storage, not as a precise prediction.
+    """
+    if mode not in MESH_OUTPUT_MODES:
+        raise ValueError(f'Mesh output mode must be one of {", ".join(MESH_OUTPUT_MODES)}')
+    triangles = max(float(triangles or 0), 0.0)
+    merged = int(triangles * PLY_BYTES_PER_TRIANGLE)
+    chunks = int(merged * CHUNK_OUTPUT_OVERHEAD_FACTOR) + 4096 if mode != 'merged' else 0
+    published = (merged if mode != 'chunks' else 0) + chunks
+    previous_set = directory_bytes(previous_output_dir) if previous_output_dir else 0
+    archived = directory_bytes(attempts_dir) if attempts_dir else 0
+    reserve = max(int(DISK_MIN_RESERVE_BYTES), int(DISK_RESERVE_FRACTION * max(published + previous_set, 1)))
+    required = published + previous_set + reserve
+    return dict(mode=mode, published_bytes=int(published), merged_bytes=merged, chunks_bytes=chunks,
+                staging_bytes=int(chunks + (merged if mode != 'chunks' else 0)),
+                previous_set_bytes=int(previous_set), archived_bytes=int(archived),
+                reserve_bytes=int(reserve), required_bytes=int(required),
+                bytes_per_triangle=PLY_BYTES_PER_TRIANGLE,
+                chunk_overhead_factor=CHUNK_OUTPUT_OVERHEAD_FACTOR,
+                starts_from_scratch=previous_set == 0,
+                uncertainty='Derived from the triangle estimate (a heuristic) times '
+                            f'{PLY_BYTES_PER_TRIANGLE} bytes per triangle, which is above the 21-22 bytes per '
+                            'triangle measured on real ROI output; chunked modes add a '
+                            f'{CHUNK_OUTPUT_OVERHEAD_FACTOR}x cell-boundary duplication factor. Use it to refuse '
+                            'a clearly too-small disk, not as a precise prediction.',
+                notes=["The retry history under attempts/ is kept, never pruned, so it is reported but is not "
+                       "counted as part of the requirement for this run.",
+                       "The requested resolution is never changed automatically: a shortfall is refused with "
+                       "advice instead."])
+
+
+def _mitigations(voxel_size_m, target_bytes, extent_m, free_ram, disk=None, free_disk=None, root=None):
+    """Concrete ways to fit a run into the available resources, never a silent downgrade."""
     suggestions = []
     if free_ram > 0:
         suggestions.append(f'Free memory or reduce concurrent work so about {target_bytes / 1024 ** 3:.1f} GiB is '
@@ -1075,6 +1146,14 @@ def _mitigations(voxel_size_m, target_bytes, extent_m, free_ram):
     if extent_m:
         suggestions.append('Use a region of interest (ROI) covering only the edited area instead of the whole '
                            f'sampled {np.round(extent_m, 1).tolist()} m extent.')
+    if disk and free_disk is not None and free_disk < disk['required_bytes']:
+        suggestions.append(
+            f'Free about {(disk["required_bytes"] - free_disk) / 1024 ** 3:.1f} GiB on {root} (the retry history in '
+            f'attempts/ is {disk["archived_bytes"] / 1024 ** 3:.1f} GiB of it and is kept, never pruned).')
+        if disk['mode'] == 'both':
+            suggestions.append('Export the merged mesh only, or the chunk set only, instead of both.')
+        else:
+            suggestions.append('Restrict the run with an ROI so the published set is smaller.')
     suggestions.append(f'Use a larger voxel size than {voxel_size_m * 1000:.0f} mm and re-prepare: the request is '
                        'never downgraded silently, so the configured resolution is what runs.')
     return suggestions
@@ -1143,12 +1222,30 @@ def preflight(root, settings, observed_points=None, observed_bbox=None, bag_byte
                 f'A {voxel * 1000:.0f} mm TSDF over a {span:.0f} m scan is memory intensive: the dense truncation '
                 f'band alone is {estimate["band_voxels_upper_bound"]:,.0f} voxels. Prefer 20 mm, or restrict the '
                 'run with an ROI, then re-prepare.')
-    if disk.free < 2 * 1024 ** 3:
-        failures.append(f'Only {disk.free / 1024 ** 3:.1f} GiB of free disk space on {target}.')
+    # Disk: the published set, plus the previous set that is kept as a backup until the commit
+    # marker is written, plus a reserve. A shortfall is refused here, before a long run can fill
+    # the filesystem halfway through.
+    mode = settings.get('mesh_output_mode', 'merged')
+    root = target if target.is_dir() else target.parent
+    disk_plan = disk_estimate(root, mode, (estimate['components'] or {}).get('mesh_triangles_estimate'),
+                              previous_output_dir=root/'output', attempts_dir=root/'attempts')
+    if disk.free < disk_plan['required_bytes']:
         ok = False
+        failures.append(
+            f'RESOURCE_PREFLIGHT_FAILED: the estimated disk requirement of '
+            f'{disk_plan["required_bytes"] / 1024 ** 3:.1f} GiB (a {mode} output set of about '
+            f'{disk_plan["published_bytes"] / 1024 ** 3:.1f} GiB, the previous set of '
+            f'{disk_plan["previous_set_bytes"] / 1024 ** 3:.1f} GiB kept as a backup until the completion marker, '
+            f'and a {disk_plan["reserve_bytes"] / 1024 ** 3:.1f} GiB reserve) exceeds the '
+            f'{disk.free / 1024 ** 3:.1f} GiB free on {root}.')
+        if disk.free < 2 * 1024 ** 3:
+            failures.append(f'Only {disk.free / 1024 ** 3:.1f} GiB of free disk space on {root}.')
+    elif disk.free < 2 * 1024 ** 3:
+        warnings.append(f'Only {disk.free / 1024 ** 3:.1f} GiB of free disk space on {root}.')
     return dict(ok=ok, code=None if ok else 'RESOURCE_PREFLIGHT_FAILED',
                 free_ram_bytes=int(free_ram), total_ram_bytes=int(total_ram),
-                free_disk_bytes=int(disk.free), disk_path=str(target),
+                free_disk_bytes=int(disk.free), disk_path=str(target), disk_estimate=disk_plan,
+                estimated_disk_requirement_bytes=disk_plan['required_bytes'],
                 voxel_size_m=voxel, sdf_trunc_m=settings['sdf_trunc_m'], observed_extent_m=estimate['observed_extent_m'],
                 estimated_tsdf_voxels=estimate['estimated_tsdf_voxels'],
                 band_voxels_upper_bound=estimate['band_voxels_upper_bound'],
@@ -1166,7 +1263,8 @@ def preflight(root, settings, observed_points=None, observed_bbox=None, bag_byte
                 observed_points=None if observed_points is None else int(observed_points),
                 bag_bytes=None if bag_bytes is None else int(bag_bytes),
                 warnings=warnings, failures=failures,
-                suggestions=[] if ok else _mitigations(voxel, total or 0, estimate['observed_extent_m'], free_ram))
+                suggestions=[] if ok else _mitigations(voxel, total or 0, estimate['observed_extent_m'], free_ram,
+                                                           disk=disk_plan, free_disk=disk.free, root=root))
 
 
 def _format_bytes(value):
@@ -1750,82 +1848,95 @@ def inspect_mesh_shared(path):
     return inspect_mesh(path)
 
 
-def publish_output_set(staging, destination, mode='merged', expected=None, metadata=None):
-    """Publish a validated staged output set, then record a completion manifest.
+def publish_output_set(staging, destination, mode='merged', expected=None, metadata=None, attempt_id=None):
+    """Publish a validated staged output set behind a completion marker.
 
-    Order and guarantees:
+    Steps, in order:
 
-    1. every artifact of the requested mode must be present and validate while still staged;
-    2. directories are moved aside and files are replaced with a single atomic rename, so a
-       previous valid artifact is never unlinked before its replacement exists;
-    3. on any failure the previous artifacts are restored and the staged set is kept for retry;
-    4. only after every rename succeeded are the backups deleted and the manifest written.
+    1. the whole staged set is validated while it is still staged (merged PLY through the
+       independent validator, chunks through the shared chunk-manifest validator);
+    2. every artifact already at the destination is **moved aside** to a backup, never
+       unlinked or overwritten first;
+    3. each staged artifact is moved into place with one atomic rename;
+    4. the completion manifest is written atomically - **this is the commit point**;
+    5. only after the commit point are the backups and the staging area deleted.
 
-    See :data:`PUBLISH_TRANSACTION_NOTE` for the documented cross-artifact limitation.
+    A failure in steps 2-4 restores every backup, removes any artifact this attempt placed,
+    and keeps the staged set so the publish can be retried. Multi-artifact atomicity is *not*
+    claimed: between the renames a reader can see a mixed set, and a hard kill in that window
+    leaves backups on disk next to a stale manifest. Those backups are inside ``destination``,
+    so the run's own retry history archives them, and the manifest is the marker that says a
+    set is complete: it is written last, it carries the attempt id, and callers must refuse a
+    set whose manifest is missing, inconsistent, or belongs to a different attempt.
     """
     staging = Path(staging)
     destination = Path(destination)
     names = output_artifact_names(mode)
     validate_staged_outputs(staging, mode, expected, metadata)
     destination.mkdir(parents=True, exist_ok=True)
-    artifacts = {}
+    attempt = attempt_id or uuid.uuid4().hex
+    artifacts = {name: _artifact_digest(staging/name) for name in names}
+    placed = []
     backups = []
-    published = []
 
     def rollback():
-        """Put the previous artifacts back; a failed publish must not lose them.
+        """Undo this attempt: drop what it placed, then put every backup back.
 
         Returns the backups that could not be restored, so an unrecoverable swap is reported
         with the exact path an operator can recover from instead of failing silently.
         """
+        for target in reversed(placed):
+            try:
+                shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink(missing_ok=True)
+            except OSError:
+                continue
         stranded = []
         for target, backup in reversed(backups):
             try:
                 if target.exists():
-                    shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink()
+                    shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink(missing_ok=True)
                 os.replace(backup, target)
             except OSError:
                 stranded.append((str(target), str(backup)))
         return stranded
 
+    def fail(message, error=None):
+        stranded = rollback()
+        suffix = (f'; the previous output could not be restored from {", ".join(backup for _, backup in stranded)}'
+                  if stranded else '')
+        if error is not None:
+            raise OSError(error.errno, f'{message}: {error.strerror}{suffix}') from error
+        raise RuntimeError(f'{message}{suffix}')
+
     try:
         for name in names:
             source = staging/name
             target = destination/name
-            artifacts[name] = _artifact_digest(source)
-            if source.is_dir():
-                backup = destination/f'{name}.{PUBLISH_BACKUP_SUFFIX}{uuid.uuid4().hex[:12]}'
-                if target.exists():
-                    os.replace(target, backup)
-                    backups.append((target, backup))
-                os.replace(source, target)
-            else:
-                # A single atomic rename: the previous file is replaced in place, never
-                # unlinked first, so a failure leaves it exactly as it was.
-                os.replace(source, target)
-            published.append(name)
+            if target.exists():
+                backup = destination/f'{name}.{PUBLISH_BACKUP_SUFFIX}{attempt[:12]}'
+                os.replace(target, backup)
+                backups.append((target, backup))
+            os.replace(source, target)
+            placed.append(target)
     except OSError as error:
-        stranded = rollback()
-        detail = (f'; the previous output could not be restored from {", ".join(backup for _, backup in stranded)}'
-                  if stranded else '')
-        raise OSError(error.errno, f'Publishing the mesh output set failed: {error.strerror}{detail}') from error
+        fail('Publishing the mesh output set failed', error)
     except Exception:
-        stranded = rollback()
-        if stranded:
-            raise RuntimeError(
-                'Publishing failed and the previous output could not be restored from '
-                + ', '.join(backup for _, backup in stranded)) from None
-        raise
+        fail('Publishing the mesh output set failed')
+    manifest = dict(attempt_id=attempt, mode=mode, published_at=time.time(), artifacts=artifacts,
+                    published=list(names), transaction_note=PUBLISH_TRANSACTION_NOTE,
+                    hash_limit_bytes=PUBLISH_HASH_LIMIT_BYTES)
+    try:
+        _write_manifest(destination/PUBLISH_MANIFEST, manifest)
+    except OSError as error:
+        fail('Writing the output completion manifest failed, so the publish was rolled back', error)
+    except Exception:
+        fail('Writing the output completion manifest failed, so the publish was rolled back')
     for _, backup in backups:
         if backup.is_dir():
             shutil.rmtree(backup, ignore_errors=True)
         else:
             backup.unlink(missing_ok=True)
     shutil.rmtree(staging, ignore_errors=True)
-    manifest = dict(mode=mode, published_at=time.time(), artifacts=artifacts, published=published,
-                    transaction_note=PUBLISH_TRANSACTION_NOTE,
-                    hash_limit_bytes=PUBLISH_HASH_LIMIT_BYTES)
-    _write_manifest(destination/PUBLISH_MANIFEST, manifest)
     return manifest
 
 
@@ -1833,8 +1944,14 @@ def _write_manifest(path, manifest):
     """Write the manifest atomically: a reader never sees a half-written manifest."""
     path = Path(path)
     temporary = path.with_name(f'.{path.name}.partial')
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        os.replace(temporary, path)
+    except OSError:
+        # Leave no partial manifest behind; the caller rolls the publish back.
+        if temporary.is_file():
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def validate_written_mesh(path, expected):

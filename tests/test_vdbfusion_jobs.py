@@ -517,3 +517,37 @@ def test_publish_manifest_mismatch_is_reported_not_ignored(prepared, monkeypatch
     (out/V.PUBLISH_MANIFEST).unlink()
     with pytest.raises(ValueError, match='manifest'):
         jobs.validate_completed(out, 0)
+
+
+def test_partial_or_stale_publication_is_never_completed(prepared, monkeypatch):
+    """A set that is not this attempt's completed publication must never validate."""
+    service, sid, session, vdb, nksr, python = prepared
+    from factory_mapping import vdbfusion as V
+    vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    out = vdb/'output'
+    out.mkdir(parents=True, exist_ok=True)
+    V.write_mesh_ply(out/'mesh.ply', vertices, faces)
+    size = (out/'mesh.ply').stat().st_size
+    atomic_json(out/V.PUBLISH_MANIFEST, dict(attempt_id='attempt-one', mode='merged', published=['mesh.ply'],
+                                            artifacts={'mesh.ply': dict(bytes=size)}))
+    atomic_json(out/'vdbfusion_metadata.json', dict(engine='vdbfusion', mesh_output_mode='merged',
+                                                    validation_status='PASS', vertex_count=3, face_count=1,
+                                                    publish_manifest='publish_manifest.json',
+                                                    publish_attempt_id='attempt-one'))
+    assert jobs.validate_completed(out, 0)['engine'] == 'vdbfusion'
+    # A manifest from a different attempt (e.g. an earlier interrupted publish) is refused.
+    atomic_json(out/'vdbfusion_metadata.json', dict(engine='vdbfusion', mesh_output_mode='merged',
+                                                    validation_status='PASS', vertex_count=3, face_count=1,
+                                                    publish_manifest='publish_manifest.json',
+                                                    publish_attempt_id='attempt-two'))
+    with pytest.raises(ValueError, match='different attempt'):
+        jobs.validate_completed(out, 0)
+    # A backup left in the output directory means the publish never completed.
+    atomic_json(out/'vdbfusion_metadata.json', dict(engine='vdbfusion', mesh_output_mode='merged',
+                                                    validation_status='PASS', vertex_count=3, face_count=1,
+                                                    publish_manifest='publish_manifest.json',
+                                                    publish_attempt_id='attempt-one'))
+    (out/'mesh.ply.previous-deadbeef').write_bytes(b'old')
+    with pytest.raises(ValueError, match='unfinished publish backup'):
+        jobs.validate_completed(out, 0)

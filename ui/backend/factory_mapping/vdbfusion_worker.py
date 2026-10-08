@@ -449,6 +449,9 @@ def reconstruct(settings, event, cancel=None):
             published = manifest['published']
             metadata['published_outputs'] = [str(output.parent/name) for name in published]
             metadata['publish_manifest'] = f'{V.PUBLISH_MANIFEST}'
+            # The manifest is the completion marker: recording its attempt id in the metadata
+            # (written only on success) lets the backend refuse any set that is not this run's.
+            metadata['publish_attempt_id'] = manifest['attempt_id']
     finally:
         # A cancelled or failed run must not leave an unpublished partial mesh on disk: the
         # published path is never touched, and the staging area is removed. A successful

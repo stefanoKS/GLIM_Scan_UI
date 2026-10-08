@@ -157,6 +157,19 @@ recording is never integrated with a constant origin.
   preflight, the runtime soft check and the memory supervisor, so all three agree. A
   malformed budget is an error rather than a silent fall back to the default, which could
   only widen the limit.
+* The preflight also plans **disk**: the published set (merged PLY, the chunk set with its
+  documented cell-boundary duplication factor, or both), the previous set that is kept as a
+  backup until the completion marker is written, and a reserve of 5 % of the predicted set or
+  2 GiB, whichever is larger. The measured retry history under `attempts/` is reported
+  separately because it is kept, never pruned. A shortfall is refused with advice (free
+  space, export one mode instead of both, or use an ROI); the requested resolution is never
+  changed automatically.
+* That disk figure is deliberately conservative and its uncertainty is documented: it uses 32
+  bytes per triangle where real 20 mm and 10 mm ROI output measured 21.0 and 21.7, and a 1.1x
+  chunk factor where the real 20 mm edited ROI export measured 1.002 (80,346,854 bytes of
+  chunk files against 80,217,785 bytes for the same mesh merged, 8 cells, 3,824,200
+  triangles). On that run the prediction was 1.68x the 153.1 MiB actually written. Treat it as
+  a guard against a clearly too-small disk, not as a prediction.
 * A run is **refused before it starts** with `RESOURCE_PREFLIGHT_FAILED` plus
   mitigation advice when the estimated peak cannot fit inside
   `min(configured budget, available RAM − reserve)`. The comparison is arithmetic on byte
@@ -176,6 +189,13 @@ recording is never integrated with a constant origin.
   of the budget the supervisor requests cooperative cancellation once and records the
   event; it never kills the process itself and never touches previous outputs. Every
   figure is labelled as a *sampled* peak, i.e. a lower bound on the true peak.
+* What the sampled figures do **not** establish: the sampler observes the process tree every
+  2 seconds from outside, so a spike between two samples, or memory held inside the native
+  library between allocations, is invisible; the peak is a lower bound, not an instrumented
+  measurement. The per-stage elapsed times are derived from sample counts, not from stage
+  timestamps, so they are approximate to the sampling interval. The runtime budget check
+  inside the worker remains the authority on exceeding the limit, and the preflight remains
+  the authority on whether the run should start at all.
 
 ## Run, cancel and job isolation
 
@@ -216,13 +236,20 @@ recording is never integrated with a constant origin.
   is moved in and restored if the swap fails. If a restore cannot be completed the error
   names the exact backup path instead of losing the artifact silently. A cancelled or
   failed run removes its staging area, so no partial mesh is left on disk either.
-* A **completion manifest** (`output/publish_manifest.json`) is written last and records the
-  mode, the published artifacts with their sizes and (up to 256 MiB) a SHA-256, and the
-  transaction limitation: the set is published artifact by artifact, so between the two
-  renames a reader can see the new mesh next to the previous chunk directory; the previous
-  artifacts are deleted only after every rename succeeded. `validate_completed` re-reads the
-  manifest and rejects a recorded artifact that is missing or has a different size, which is
-  what makes a partially published set detectable.
+* Publication order is: validate the staged set, move every existing artifact aside to a
+  backup, move each staged artifact into place, **write the completion manifest, and only then
+  delete the backups and the staging area**. The manifest is the commit point, so a failure
+  while writing it - including a full disk - rolls the whole publication back: the previous
+  artifacts are restored, anything this attempt placed is removed, and the staged set is kept
+  for a retry. Multi-artifact atomicity is *not* claimed: between the renames a reader can see
+  a mixed set, and a hard kill in that window leaves backups on disk next to a stale manifest.
+* A **completion manifest** (`output/publish_manifest.json`) records the attempt id, the mode,
+  the published artifacts with their sizes and (up to 256 MiB) a SHA-256, and the transaction
+  limitation above. `validate_completed` re-reads it and refuses a set whose manifest is
+  missing, records different artifacts than the mode requires, records an artifact that is
+  missing or has a different size, belongs to a different attempt, or sits next to a leftover
+  `*.previous-*` backup from an interrupted publish. A partially published set therefore can
+  never be reported as `COMPLETED`.
 * VDBFusion writes `output/vdbfusion_metadata.json`. NKSR metadata is never written
   for a VDBFusion job, and the two engines use separate managed processes, so neither
   can overwrite the other.
@@ -487,6 +514,18 @@ command shape, `scripts/benchmark_vdbfusion.sh`, one run at a time):
 The edit filter retained 86.68 % of the ROI observations in both resolutions
 (1,717,122 → 1,488,392), with 228,730 observations dropped as unsupported and **0**
 dropped as removed-dominated, which matches the earlier measurement.
+
+End-to-end publication check on the real 20 mm edited ROI, output mode `both`
+(`tools/vdbfusion_worker.py` directly, one run):
+
+| Measurement | Value |
+| --- | --- |
+| Observations / triangles | 1,488,392 / 3,824,200 (30,300 masked) |
+| Merged PLY | 80,217,785 bytes (20.98 bytes per triangle) |
+| Chunk set | 80,346,854 bytes in 8 cells (21.01 bytes per triangle) |
+| Manifest | records both artifacts, sizes match what `validate_completed` re-measures |
+| Attempt id | manifest and metadata agree, so only this run's set can validate |
+| Disk prediction vs actual | 256.7 MiB predicted, 153.1 MiB written (1.68x conservative) |
 
 Mesh geometry audit on those four saved meshes (10 mm/20 mm, plain/edited):
 

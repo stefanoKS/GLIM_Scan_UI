@@ -21,6 +21,7 @@ Bug index from the audit specification:
 import asyncio
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -794,15 +795,17 @@ def test_publish_replaces_a_previous_valid_target_without_unlinking_it_first(tmp
 
 
 def test_publish_keeps_the_previous_target_when_the_rename_fails(tmp_path, monkeypatch):
-    """A failing swap must leave the previous valid output exactly as it was."""
+    """A failing forward swap must leave the previous valid output exactly as it was."""
     staging, destination = tmp_path/'staging', tmp_path/'output'
     destination.mkdir()
     (destination/'mesh.ply').write_bytes(b'previous valid mesh')
     staged_mesh(staging)
     real = os.replace
+    calls = {'count': 0}
 
     def failing_replace(source, target, *args, **kwargs):
-        if Path(target).name == 'mesh.ply':
+        if Path(target).name == 'mesh.ply' and calls['count'] == 0:
+            calls['count'] += 1
             raise OSError(28, 'No space left on device')
         return real(source, target, *args, **kwargs)
 
@@ -811,6 +814,30 @@ def test_publish_keeps_the_previous_target_when_the_rename_fails(tmp_path, monke
         V.publish_output_set(staging, destination, 'merged')
     assert (destination/'mesh.ply').read_bytes() == b'previous valid mesh'
     assert (staging/'mesh.ply').exists(), 'the staged mesh is kept for a retry'
+    assert not list(destination.glob('*.previous-*')), 'a completed rollback leaves no backup'
+
+
+def test_publish_reports_a_backup_it_could_not_restore(tmp_path, monkeypatch):
+    """When even the restore rename fails, the failure names the backup rather than losing
+    the artifact silently - the documented degraded case of the swap."""
+    staging, destination = tmp_path/'staging', tmp_path/'output'
+    destination.mkdir()
+    (destination/'mesh.ply').write_bytes(b'previous valid mesh')
+    staged_mesh(staging)
+
+    real = os.replace
+
+    def always_failing_replace(source, target, *args, **kwargs):
+        if Path(target).name == 'mesh.ply':
+            raise OSError(30, 'Read-only file system')
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(V.os, 'replace', always_failing_replace)
+    with pytest.raises(OSError, match='could not be restored from'):
+        V.publish_output_set(staging, destination, 'merged')
+    backups = list(destination.glob('mesh.ply.previous-*'))
+    assert len(backups) == 1, 'the previous output must still exist on disk'
+    assert backups[0].read_bytes() == b'previous valid mesh'
 
 
 def test_publish_restores_a_previous_chunk_directory_when_the_swap_fails(tmp_path, monkeypatch):
@@ -913,3 +940,319 @@ def test_a_zero_supervisor_limit_can_never_escalate(tmp_path):
     # Every path that builds a limit goes through the normaliser, which never yields zero.
     for payload in ({}, None, {'memory_budget_gib': None}, {'memory_budget_bytes': None}):
         assert jobs.supervisor_limit_bytes(payload) == V.DEFAULT_MEMORY_BUDGET_BYTES
+
+
+# ============================================================ ROUND 3 (final)
+# GATE 1: the output transaction under injected faults
+# ---------------------------------------------------------------------------------
+def snapshot_tree(directory):
+    """Every path under ``directory`` with its bytes, for exact before/after comparison."""
+    directory = Path(directory)
+    return {str(path.relative_to(directory)): (path.read_bytes() if path.is_file() else None)
+            for path in sorted(directory.rglob('*'))}
+
+
+def published_set(destination, mode='both', cells=2, tag=b'initial'):
+    """Create a real previous output set through the publisher itself."""
+    staging = destination.parent/f'staging-{tag.decode()}-{mode}'
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    metadata = None
+    if mode != 'merged':
+        _, metadata = staged_chunks(staging, cells=cells)
+    if mode != 'chunks':
+        staged_mesh(staging)
+    manifest = V.publish_output_set(staging, destination, mode, metadata=metadata)
+    return manifest
+
+
+def test_manifest_write_failure_preserves_the_previous_output_set(tmp_path):
+    """Reproduce: the backups were deleted *before* the completion manifest was written, so
+    a failure writing the manifest destroyed the previous valid output set and left no
+    completion marker. The manifest write is made to fail with a real filesystem error."""
+    destination = tmp_path/'output'
+    published_set(destination, mode='both', cells=2, tag=b'first')
+    before = snapshot_tree(destination)
+    staging = tmp_path/'staging'
+    staged_mesh(staging)
+    _, metadata = staged_chunks(staging, cells=3)
+    # A directory where the manifest's temporary file must be created makes the write fail
+    # with a real OSError, with no monkeypatching of the manifest code path.
+    (destination/f'.{V.PUBLISH_MANIFEST}.partial').mkdir()
+    with pytest.raises(OSError):
+        V.publish_output_set(staging, destination, 'both', metadata=metadata)
+    after = snapshot_tree(destination)
+    assert {key: value for key, value in after.items() if not key.startswith('.')} == before, \
+        'a failed manifest write must restore the previous output set exactly'
+    assert staging.exists(), 'the staged set is kept so the publish can be retried'
+
+
+def test_manifest_commit_failure_preserves_the_previous_output_set(tmp_path, monkeypatch):
+    """The same guarantee when only the manifest's atomic commit rename fails."""
+    destination = tmp_path/'output'
+    published_set(destination, mode='merged', tag=b'first')
+    before = snapshot_tree(destination)
+    staging = tmp_path/'staging'
+    staged_mesh(staging)
+    real = os.replace
+    calls = {'count': 0}
+
+    def failing_replace(source, target, *args, **kwargs):
+        if Path(target).name == V.PUBLISH_MANIFEST and calls['count'] == 0:
+            calls['count'] += 1
+            raise OSError(28, 'No space left on device')
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(V.os, 'replace', failing_replace)
+    with pytest.raises(OSError):
+        V.publish_output_set(staging, destination, 'merged')
+    assert snapshot_tree(destination) == before
+    assert staging.exists()
+
+
+def test_failure_between_artifacts_leaves_no_partial_set(tmp_path, monkeypatch):
+    """Reproduce: a file artifact was replaced in place with no backup, so a failure after
+    the chunk directory was published could not restore the previous merged mesh."""
+    destination = tmp_path/'output'
+    published_set(destination, mode='both', cells=2, tag=b'first')
+    before = snapshot_tree(destination)
+    staging = tmp_path/'staging'
+    staged_mesh(staging)
+    _, metadata = staged_chunks(staging, cells=4)
+    real = os.replace
+    calls = {'count': 0}
+
+    def failing_replace(source, target, *args, **kwargs):
+        # mesh.ply is published second in 'both' mode: the chunk directory is already in place.
+        if Path(target).name == 'mesh.ply' and calls['count'] == 0:
+            calls['count'] += 1
+            raise OSError(5, 'Input/output error')
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(V.os, 'replace', failing_replace)
+    with pytest.raises(OSError):
+        V.publish_output_set(staging, destination, 'both', metadata=metadata)
+    assert snapshot_tree(destination) == before, 'the chunk swap must be rolled back with the mesh swap'
+    assert not list(destination.glob('*.previous-*')), 'no backup may be left behind after a rollback'
+    assert staging.exists()
+
+
+def test_failure_with_no_previous_output_leaves_nothing_published(tmp_path, monkeypatch):
+    """Initially absent artifacts: a failure must not leave a half-published set."""
+    destination = tmp_path/'output'
+    destination.mkdir()
+    staging = tmp_path/'staging'
+    staged_mesh(staging)
+    _, metadata = staged_chunks(staging, cells=1)
+    real = os.replace
+    calls = {'count': 0}
+
+    def failing_replace(source, target, *args, **kwargs):
+        if Path(target).name == 'mesh.ply' and calls['count'] == 0:
+            calls['count'] += 1
+            raise OSError(28, 'No space left on device')
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(V.os, 'replace', failing_replace)
+    with pytest.raises(OSError):
+        V.publish_output_set(staging, destination, 'both', metadata=metadata)
+    assert snapshot_tree(destination) == {}, 'nothing may be published when the set is incomplete'
+    assert staging.exists()
+
+
+def test_successful_publish_leaves_no_backups_or_staging(tmp_path):
+    destination = tmp_path/'output'
+    published_set(destination, mode='both', cells=2, tag=b'first')
+    staging = tmp_path/'staging'
+    staged_mesh(staging)
+    _, metadata = staged_chunks(staging, cells=1)
+    manifest = V.publish_output_set(staging, destination, 'both', metadata=metadata)
+    assert sorted(manifest['artifacts']) == ['mesh.ply', 'mesh_chunks']
+    assert not list(destination.glob('*.previous-*'))
+    assert not staging.exists()
+    assert not (destination/f'.{V.PUBLISH_MANIFEST}.partial').exists()
+
+
+# ---------------------------------------------------------------------------------
+# GATE 2: disk resource preflight
+# ---------------------------------------------------------------------------------
+def disk_preflight(tmp_path, monkeypatch, mode, free_bytes, triangles=10_000_000):
+    import psutil
+
+    class Usage:
+        total, used, free = 10 ** 12, 10 ** 12 - free_bytes, free_bytes
+
+    monkeypatch.setattr(psutil, 'disk_usage', lambda path: Usage())
+    settings = dict(V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06)), mesh_output_mode=mode,
+                    memory_budget_gib=8)
+    report = V.preflight(tmp_path, settings, observed_points=1_000_000,
+                         observed_bbox=([-5.0, -5.0, 0.0], [5.0, 5.0, 3.0]))
+    return report, settings
+
+
+def test_disk_estimate_accounts_for_every_output_mode_and_retry_history(tmp_path):
+    merged = V.disk_estimate(tmp_path, 'merged', 1_000_000)
+    chunks = V.disk_estimate(tmp_path, 'chunks', 1_000_000)
+    both = V.disk_estimate(tmp_path, 'both', 1_000_000)
+    assert merged['published_bytes'] == 1_000_000 * V.PLY_BYTES_PER_TRIANGLE
+    assert merged['chunks_bytes'] == 0 and merged['staging_bytes'] == merged['published_bytes']
+    assert chunks['published_bytes'] == chunks['chunks_bytes'] > 0
+    assert both['published_bytes'] == both['merged_bytes'] + both['chunks_bytes']
+    assert both['published_bytes'] > chunks['published_bytes'] > 0
+    # A previous set and the retry history are measured, not assumed.
+    (tmp_path/'output').mkdir()
+    (tmp_path/'output'/'mesh.ply').write_bytes(b'x' * 4096)
+    (tmp_path/'attempts'/'previous_1').mkdir(parents=True)
+    (tmp_path/'attempts'/'previous_1'/'mesh.ply').write_bytes(b'y' * 2048)
+    measured = V.disk_estimate(tmp_path, 'both', 1_000_000, previous_output_dir=tmp_path/'output',
+                               attempts_dir=tmp_path/'attempts')
+    assert measured['previous_set_bytes'] == 4096
+    assert measured['archived_bytes'] == 2048
+    assert measured['starts_from_scratch'] is False
+    assert measured['required_bytes'] == measured['published_bytes'] + 4096 + measured['reserve_bytes']
+    assert measured['reserve_bytes'] >= V.DISK_MIN_RESERVE_BYTES
+    # Zero triangles is still a well-defined requirement, and the uncertainty is documented.
+    empty = V.disk_estimate(tmp_path, 'merged', 0)
+    assert empty['published_bytes'] == 0 and empty['required_bytes'] >= V.DISK_MIN_RESERVE_BYTES
+    assert 'heuristic' in measured['uncertainty'] and 'not as a precise prediction' in measured['uncertainty']
+    assert any('never changed automatically' in note for note in measured['notes'])
+
+
+def test_preflight_refuses_clearly_insufficient_disk_space(tmp_path, monkeypatch):
+    """A disk that cannot hold the set plus the previous set plus the reserve is refused."""
+    report, settings = disk_preflight(tmp_path, monkeypatch, 'both', free_bytes=64 * 1024 ** 2)
+    assert report['ok'] is False and report['code'] == 'RESOURCE_PREFLIGHT_FAILED'
+    assert report['estimated_disk_requirement_bytes'] > report['free_disk_bytes']
+    assert any('disk requirement' in failure for failure in report['failures'])
+    assert any('Free about' in suggestion for suggestion in report['suggestions'])
+    # The requested resolution is untouched - no automatic downgrade.
+    assert report['voxel_size_m'] == settings['voxel_size_m'] == 0.02
+
+
+def test_disk_shortfall_suggestions_follow_the_output_mode(tmp_path, monkeypatch):
+    both, _ = disk_preflight(tmp_path, monkeypatch, 'both', free_bytes=64 * 1024 ** 2)
+    assert any('instead of both' in suggestion for suggestion in both['suggestions'])
+    chunks, _ = disk_preflight(tmp_path, monkeypatch, 'chunks', free_bytes=64 * 1024 ** 2)
+    assert any('ROI' in suggestion for suggestion in chunks['suggestions'])
+
+
+def test_preflight_passes_with_ample_disk_and_reports_the_requirement(tmp_path, monkeypatch):
+    report, _ = disk_preflight(tmp_path, monkeypatch, 'merged', free_bytes=100 * 1024 ** 3)
+    assert report['ok'] is True
+    plan = report['disk_estimate']
+    assert plan['required_bytes'] > 0 and plan['mode'] == 'merged'
+    assert report['free_disk_bytes'] == 100 * 1024 ** 3
+    assert plan['required_bytes'] < report['free_disk_bytes']
+
+
+def test_an_existing_previous_set_raises_the_disk_requirement(tmp_path, monkeypatch):
+    plain, _ = disk_preflight(tmp_path, monkeypatch, 'merged', free_bytes=100 * 1024 ** 3)
+    (tmp_path/'output').mkdir()
+    (tmp_path/'output'/'mesh.ply').write_bytes(b'x' * 200_000_000)
+    with_previous, _ = disk_preflight(tmp_path, monkeypatch, 'merged', free_bytes=100 * 1024 ** 3)
+    assert with_previous['disk_estimate']['previous_set_bytes'] == 200_000_000
+    assert with_previous['estimated_disk_requirement_bytes'] == \
+        plain['estimated_disk_requirement_bytes'] + 200_000_000
+
+
+def test_disk_requirement_gap_is_reproduced(tmp_path, monkeypatch):
+    """OLD: the only disk check was a fixed 2 GiB minimum, so a disk with 3 GiB free passed
+    a run whose own output set plus reserve needs more than 4 GiB."""
+    import psutil
+
+    class Usage:
+        total, used, free = 10 ** 12, 10 ** 12 - 3 * 1024 ** 3, 3 * 1024 ** 3
+
+    monkeypatch.setattr(psutil, 'disk_usage', lambda path: Usage())
+    settings = dict(V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06)), mesh_output_mode='both')
+    report = V.preflight(tmp_path, settings, observed_points=100_000_000,
+                         observed_bbox=([-25.0, -25.0, 0.0], [25.0, 25.0, 6.0]))
+    # 3 GiB would have passed the old fixed minimum, but not the predicted requirement.
+    assert report['free_disk_bytes'] == 3 * 1024 ** 3
+    assert report['estimated_disk_requirement_bytes'] > report['free_disk_bytes']
+    assert report['ok'] is False and report['code'] == 'RESOURCE_PREFLIGHT_FAILED'
+    assert report['disk_estimate']['published_bytes'] > 1024 ** 3, 'the set alone exceeds a gigabyte here'
+
+
+# ---------------------------------------------------------------------------------
+# GATE 3: memory limit, zero usable RAM, sampled-memory limits
+# ---------------------------------------------------------------------------------
+def test_supervisor_receives_the_ui_budget_as_bytes(tmp_path):
+    """Recheck the whole path: a GiB value becomes the byte limit the supervisor samples."""
+    for gib in (0.5, 2, 8, 24):
+        limit = jobs.supervisor_limit_bytes({'memory_budget_gib': gib})
+        assert limit == int(gib * 1024 ** 3)
+        supervisor = jobs.MemorySupervisor(tmp_path, 4242, limit, read_rss=lambda: 1024,
+                                           read_stage=lambda: 'INTEGRATING')
+        supervisor.sample()
+        assert supervisor.summary()['limit_bytes'] == int(gib * 1024 ** 3)
+    assert jobs.supervisor_limit_bytes({}) == V.DEFAULT_MEMORY_BUDGET_BYTES
+    assert jobs.supervisor_limit_bytes({'memory_budget_bytes': 4096}) == 4096
+    with pytest.raises(ValueError):
+        jobs.supervisor_limit_bytes({'memory_budget_gib': -1})
+
+
+def test_preflight_with_zero_usable_ram_and_zero_available(tmp_path, monkeypatch):
+    """Zero usable RAM (free RAM below the reserve) fails closed for any positive estimate,
+    and an exactly zero available figure cannot divide or compare incorrectly."""
+    for available in (0, 1024 ** 3):
+        _mock_memory(monkeypatch, total=64 * 1024 ** 3, available=available)
+        settings = V.resolve_settings(dict(voxel_size_m=0.02, sdf_trunc_m=0.06))
+        report = V.preflight(tmp_path, settings, observed_points=1_000_000,
+                             observed_bbox=([-5.0, -5.0, 0.0], [5.0, 5.0, 3.0]))
+        assert report['usable_bytes'] == 0, available
+        assert report['ok'] is False and report['code'] == 'RESOURCE_PREFLIGHT_FAILED'
+        assert report['estimated_peak_bytes'] > 0
+        assert any('does not even cover the reserve' in failure for failure in report['failures'])
+        # The disk verdict is still computed from real measurements.
+        assert report['free_disk_bytes'] > 0
+        assert report['disk_estimate']['required_bytes'] > 0
+
+
+def test_pressure_action_and_final_job_state_are_recorded_together(tmp_path):
+    """The 95 % pressure action and the job state it leads to, end to end at the supervisor
+    boundary: one escalation, then the cancelled state the backend records."""
+    limit = 4 * 1024 ** 3
+    requested = []
+
+    async def on_pressure(event):
+        requested.append(event)
+
+    async def scenario():
+        supervisor = jobs.MemorySupervisor(tmp_path, 7, limit, interval=0.0, on_pressure=on_pressure,
+                                          read_rss=lambda: limit * 95 // 100 + 1,
+                                          read_stage=lambda: 'INTEGRATING', max_samples=3)
+        await supervisor.run()
+        return supervisor
+
+    summary = asyncio.run(scenario()).summary()
+    assert len(summary['pressure_events']) == 1
+    assert summary['pressure_events'][0]['action'] == 'requested cooperative cancellation'
+    assert summary['note'].startswith('Sampled from the backend'), \
+        'the sampled-memory limitation must be stated in the summary itself'
+    assert 'lower bound' in summary['note']
+    assert summary['samples_by_stage'] == {'INTEGRATING': 3}
+    assert summary['elapsed_seconds_by_stage']['INTEGRATING'] == 0.0
+
+
+# ---------------------------------------------------------------------------------
+# GATE 4: the engine choice is still presented first and both engines stay selectable
+# ---------------------------------------------------------------------------------
+def test_ui_still_offers_both_engines_with_vdbfusion_selected_first():
+    """Static guard on the reconstruction control: the algorithm radios come first, VDBFusion
+    is the default of a new job, NKSR stays selectable, and no run is silently reinterpreted."""
+    root = Path(__file__).resolve().parents[1]
+    markup = (root/'ui/frontend/index.html').read_text()
+    script = (root/'ui/frontend/app.js').read_text()
+    vdb = markup.index('id="algorithm-vdbfusion"')
+    nksr = markup.index('id="algorithm-nksr"')
+    assert vdb < nksr, 'VDBFusion must stay the first engine offered'
+    assert 'checked id="algorithm-vdbfusion"' in markup
+    assert "function algorithm(){return $('algorithm-nksr').checked?'nksr':'vdbfusion'}" in script
+    # A run keeps the engine it was prepared with, and unknown metadata stays NKSR.
+    assert "engineJob=meta?.algorithm||job?.algorithm||'nksr'" in script
+    from factory_mapping import engines
+    assert engines.DEFAULT_ALGORITHM == engines.NKSR
+    assert engines.normalize_algorithm(None) == engines.NKSR
+    assert engines.normalize_algorithm('vdbfusion') == engines.VDBFUSION

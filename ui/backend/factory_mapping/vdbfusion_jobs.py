@@ -370,7 +370,8 @@ def validate_completed(output, returncode):
     # When the worker recorded a publish manifest, the artifacts it lists must be the ones on
     # disk: that is what makes a partially published output set detectable.
     if metadata.get('publish_manifest'):
-        from .vdbfusion import PUBLISH_MANIFEST, artifact_size_bytes, output_artifact_names
+        from .vdbfusion import (PUBLISH_BACKUP_SUFFIX, PUBLISH_MANIFEST, artifact_size_bytes,
+                                output_artifact_names)
         manifest = read_json(output/PUBLISH_MANIFEST, None)
         if not manifest:
             raise ValueError('Worker reported a publish manifest but it is missing')
@@ -378,6 +379,17 @@ def validate_completed(output, returncode):
         recorded = sorted(manifest.get('artifacts') or {})
         if recorded != expected_artifacts or sorted(manifest.get('published') or []) != expected_artifacts:
             raise ValueError(f'Publish manifest records {recorded}, expected {expected_artifacts}')
+        # The manifest is the completion marker of *this* attempt: a manifest left behind by an
+        # earlier or interrupted publish can never validate a later, partial set.
+        recorded_attempt = manifest.get('attempt_id')
+        announced_attempt = metadata.get('publish_attempt_id')
+        if announced_attempt and recorded_attempt != announced_attempt:
+            raise ValueError('Publish manifest belongs to a different attempt, so this output set is not the one '
+                             'the worker completed')
+        leftovers = sorted(path.name for path in output.glob(f'*{PUBLISH_BACKUP_SUFFIX}*'))
+        if leftovers:
+            raise ValueError(f'The output directory still holds an unfinished publish backup ({leftovers[0]}), '
+                             'so the output set was not published completely')
         for name, entry in (manifest.get('artifacts') or {}).items():
             path = output/name
             if not path.exists():
