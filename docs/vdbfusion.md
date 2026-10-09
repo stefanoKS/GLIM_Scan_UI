@@ -410,6 +410,22 @@ settings the run will actually execute:
   runs with, and `mesh_job.json` records both the effective settings and the requested
   ones.
 
+### Request shape
+
+`mesh_output_mode` and `chunk_size` are **top-level** fields of the mesh request; the
+nested `vdbfusion` object carries TSDF settings only. Both request models validate that
+object with `extra='forbid'`, so a nested execution-only field is refused with HTTP 422
+rather than ignored, and the mesh route reads the output mode from the top level and
+passes it to the disk preflight together with the rest of the effective settings (a
+`chunks` or `both` publication therefore reserves its chunk set before the native run
+starts). Preparation's own preflight plans the minimal `merged` set, because preparation
+writes no mesh. For edited preparation the NKSR proximity tolerance is not sent for
+VDBFusion, which derives its association radius from the measured cleanup geometry.
+
+The browser renders a 422 body as `field.path: message` for each entry
+(`ui/frontend/api-errors.js`), so a rejected control names itself; unknown error shapes
+fall back to the HTTP status instead of printing a placeholder.
+
 A run whose metadata is unreadable still reads as its historical engine (NKSR), so old
 runs keep working; a VDBFusion run is never executed by the NKSR path and a missing
 VDBFusion installation is always a clear error, never a silent fallback.
@@ -448,7 +464,10 @@ source scripts/env.sh
 
 # Engine, edit and orchestration tests (native tests skip without an installation)
 .venv/bin/python -m pytest tests/test_vdbfusion.py tests/test_vdbfusion_edit.py \
-    tests/test_vdbfusion_jobs.py -q
+    tests/test_vdbfusion_jobs.py tests/test_vdbfusion_payloads.py -q
+
+# Browser-side error rendering (no browser or server needed)
+node tests/test_api_errors.mjs
 ```
 
 Stage D processes the whole recording and refuses to run without `--allow-full`.

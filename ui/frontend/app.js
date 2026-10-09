@@ -2,9 +2,10 @@ import * as THREE from 'three';
 import {setupCamera,refreshCamera} from '/camera.js';
 import {setupCapture,refreshCapture,showPage} from '/capture.js';
 import {OrbitControls} from '/vendor/OrbitControls.js';
+import {apiErrorMessage} from '/api-errors.js';
 const $=id=>document.getElementById(id);let selected=null,sessionData=[],previewWS,logWS,logKey='',configured=false,live=true,latestStatus=null,editLoadedId=null;
 function error(e){$('error').hidden=false;$('error').textContent=String(e.message||e)}
-async function api(path,body,method){const r=await fetch('/api/'+path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw Error(e.detail||r.statusText)}return r}
+async function api(path,body,method){const r=await fetch('/api/'+path,{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const payload=await r.json().catch(()=>null);throw Error(apiErrorMessage(payload,`Request failed (${r.status}${r.statusText?' '+r.statusText:''})`))}return r}
 async function json(path,body,method){return(await api(path,body,method)).json()}
 const bytes=n=>n==null?'—':n>1e9?(n/1e9).toFixed(2)+' GB':(n/1e6).toFixed(1)+' MB';const hz=n=>n==null?'—':n.toFixed(1)+' Hz';const sec=n=>n==null?'—':Math.round(n)+' s';
 function el(tag,text){const e=document.createElement(tag);e.textContent=text;return e}
@@ -35,7 +36,7 @@ $('project-import').onclick=async()=>{
   const imported=await new Promise((resolve,reject)=>{
    const upload=new XMLHttpRequest();upload.open('POST','/api/projects/import');upload.setRequestHeader('Content-Type','application/zip');
    upload.upload.onprogress=event=>{if(event.lengthComputable)status.textContent=`Uploading ${Math.round(100*event.loaded/event.total)}%`};
-   upload.onload=()=>{let result;try{result=JSON.parse(upload.responseText)}catch{reject(Error('Invalid import response'));return}if(upload.status>=200&&upload.status<300)resolve(result);else reject(Error(result.detail||'Import failed'))};
+   upload.onload=()=>{let result;try{result=JSON.parse(upload.responseText)}catch{reject(Error('Invalid import response'));return}if(upload.status>=200&&upload.status<300)resolve(result);else reject(Error(apiErrorMessage(result,'Import failed')))};
    upload.onerror=()=>reject(Error('Project upload failed'));upload.send(file);
   });
   selected=imported.id;logKey='';$('project-file').value='';status.textContent='Project imported';await refresh();
@@ -108,8 +109,10 @@ function vdbfusionSettings(){
  if(trunc<voxel)throw Error('TSDF truncation distance must be at least the voxel size');
  const optional=(id)=>{const raw=$(id).value.trim();if(!raw)return null;const value=Number(raw);if(!Number.isFinite(value))throw Error('Enter a finite number or leave the field empty');return value};
  const preset=$('vdbfusion-preset').value;
+ // The TSDF settings object only. Mesh output mode is a top-level execution-only field
+ // of the mesh request, and the API schema forbids unknown nested fields.
  return {preset:preset||null,voxel_size_m:voxel,sdf_trunc_m:trunc,space_carving:$('vdbfusion-space-carving').checked,
-  mesh_output_mode:$('vdbfusion-output-mode').value,...roiValues(),
+  ...roiValues(),
   origin_error_budget_m:optional('vdbfusion-origin-budget'),
   association_spacing_multiplier:optional('vdbfusion-association-multiplier'),
   boundary_margin_m:optional('vdbfusion-boundary-margin'),
@@ -317,8 +320,11 @@ $('reconstruction-form').onsubmit=async event=>{
  let vdbfusion=null;
  try{vdbfusion=engine==='vdbfusion'?vdbfusionSettings():null}catch(e){error(e);return}
  reconstructionPending=true;$('prepare-reconstruction').disabled=true;
+ // The NKSR-only tolerance is not sent for VDBFusion, where the backend derives its own
+ // association radius and a hidden field must not read as an invalid value.
  const body={trajectory:$('reconstruction-trajectory').value,algorithm:engine,voxel_size_m:cm/100.0,
-  filter_edited_geometry:filtering,...(filtering?{edit_id:$('edited-source').value,filter_tolerance_m:tolerance}:{}),
+  filter_edited_geometry:filtering,...(filtering?{edit_id:$('edited-source').value}:{}),
+  ...(filtering&&engine==='nksr'?{filter_tolerance_m:tolerance}:{}),
   ...(vdbfusion?{vdbfusion}:{})};
  try{await json(`sessions/${selected}/reconstruction`,body);reconstructionSession=null;await refresh()}catch(e){error(e)}finally{reconstructionPending=false;await reconstructionPanel()}
 };

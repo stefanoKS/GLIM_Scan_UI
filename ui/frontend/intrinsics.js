@@ -1,8 +1,9 @@
+import {apiErrorMessage} from './api-errors.js';
 const $=id=>document.getElementById(id);
 let views=0,required=4,cameraReady=false,cameraRunning=false,saved=false,busy=false,previewURL=null,loading=false;
 async function request(path,method='GET'){
  const response=await fetch('/api/'+path,{method,cache:'no-store'});
- if(!response.ok){const error=await response.json().catch(()=>({}));throw Error(error.detail||`Request failed (${response.status})`)}
+ if(!response.ok){const payload=await response.json().catch(()=>null);throw Error(apiErrorMessage(payload,`Request failed (${response.status})`))}
  return response.json();
 }
 function message(text){$('intrinsics-error').textContent=text;$('intrinsics-error').hidden=!text}
